@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
 import math
 import os
 import re
@@ -16,7 +18,7 @@ from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 
@@ -26,12 +28,21 @@ CONFIG_FILE = DATA_DIR / "config.json"
 LOG_FILE = DATA_DIR / "events.jsonl"
 BYREAL_URL = "https://api2.byreal.io/byreal/api/dex/v2/position/list"
 HYP_INFO_URL = "https://api.hyperliquid.xyz/info"
+SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+RAYDIUM_MINT_URL = "https://api-v3.raydium.io/mint/ids"
+RAYDIUM_CLMM_PROGRAM = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
 DEFAULT_SOLANA_WALLET = "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw"
 DEFAULT_HYP_ACCOUNT = "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF"
 SOLANA_PATTERN = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 EVM_PATTERN = re.compile(r"^0x[0-9a-fA-F]{40}$")
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{1,15}$")
 STABLE_SYMBOLS = {"USD", "USDC", "USDT", "USDS", "PYUSD"}
+SYMBOL_ALIASES = {"AAPLX": "AAPL", "CRCLX": "CRCL"}
+KNOWN_MINTS = {
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
+    "XsueG8BtpquVJX9LVLLEGuViXUungE6WmK5YZ3p3bd1": "CRCLX",
+}
+BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
 class NeutralisError(Exception):
@@ -77,11 +88,176 @@ def json_request(url: str, payload: dict[str, Any] | None = None) -> Any:
 
 def hyp_symbol(lp_symbol: str) -> str:
     symbol = str(lp_symbol or "").strip().upper()
-    if symbol.endswith("X") and len(symbol) > 2:
-        symbol = symbol[:-1]
+    symbol = SYMBOL_ALIASES.get(symbol, symbol)
     if not SYMBOL_PATTERN.fullmatch(symbol):
         raise NeutralisError("Símbolo incompatível com a Hyperliquid")
     return symbol
+
+
+def base58_decode(value: str) -> bytes:
+    number = 0
+    for character in value:
+        try:
+            digit = BASE58_ALPHABET.index(character)
+        except ValueError as error:
+            raise NeutralisError("Endereço Solana inválido") from error
+        number = number * 58 + digit
+    payload = number.to_bytes((number.bit_length() + 7) // 8, "big") if number else b""
+    return b"\0" * (len(value) - len(value.lstrip("1"))) + payload
+
+
+def base58_encode(value: bytes) -> str:
+    number = int.from_bytes(value, "big")
+    encoded = ""
+    while number:
+        number, remainder = divmod(number, 58)
+        encoded = BASE58_ALPHABET[remainder] + encoded
+    return "1" * (len(value) - len(value.lstrip(b"\0"))) + (encoded or "")
+
+
+def is_ed25519_point(value: bytes) -> bool:
+    if len(value) != 32:
+        return False
+    prime = 2**255 - 19
+    y = int.from_bytes(value, "little") & ((1 << 255) - 1)
+    if y >= prime:
+        return False
+    y_squared = y * y % prime
+    d = -121665 * pow(121666, prime - 2, prime) % prime
+    denominator = (d * y_squared + 1) % prime
+    if denominator == 0:
+        return False
+    x_squared = (y_squared - 1) * pow(denominator, prime - 2, prime) % prime
+    return x_squared == 0 or pow(x_squared, (prime - 1) // 2, prime) == 1
+
+
+def raydium_position_pda(nft_mint: str) -> str:
+    mint = base58_decode(nft_mint)
+    program = base58_decode(RAYDIUM_CLMM_PROGRAM)
+    if len(mint) != 32 or len(program) != 32:
+        raise NeutralisError("NFT da posição Raydium inválido")
+    for bump in range(255, -1, -1):
+        digest = hashlib.sha256(b"position" + mint + bytes([bump]) + program + b"ProgramDerivedAddress").digest()
+        if not is_ed25519_point(digest):
+            return base58_encode(digest)
+    raise NeutralisError("Não foi possível derivar a posição Raydium")
+
+
+def solana_account(address: str) -> bytes:
+    response = json_request(SOLANA_RPC_URL, {
+        "jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
+        "params": [address, {"encoding": "base64", "commitment": "confirmed"}],
+    })
+    value = response.get("result", {}).get("value") if isinstance(response, dict) else None
+    if not isinstance(value, dict) or not isinstance(value.get("data"), list):
+        raise NeutralisError("Conta da posição Raydium não encontrada")
+    try:
+        return base64.b64decode(value["data"][0], validate=True)
+    except Exception as error:
+        raise NeutralisError("Resposta inválida da rede Solana") from error
+
+
+def public_key_at(data: bytes, offset: int) -> str:
+    value = data[offset : offset + 32]
+    if len(value) != 32:
+        raise NeutralisError("Conta Raydium incompleta")
+    return base58_encode(value)
+
+
+def raydium_symbols(mints: list[str]) -> dict[str, str]:
+    symbols = {mint: KNOWN_MINTS[mint] for mint in mints if mint in KNOWN_MINTS}
+    missing = [mint for mint in mints if mint not in symbols]
+    if not missing:
+        return symbols
+    try:
+        root = json_request(RAYDIUM_MINT_URL + "?" + urlencode({"mints": ",".join(missing)}))
+        rows = root.get("data", root) if isinstance(root, dict) else root
+        if isinstance(rows, dict):
+            rows = list(rows.values())
+        for row in rows if isinstance(rows, list) else []:
+            if isinstance(row, dict):
+                address = str(row.get("address") or row.get("mint") or "")
+                symbol = str(row.get("symbol") or "").upper()
+                if address in missing and symbol:
+                    symbols[address] = symbol
+    except NeutralisError:
+        pass
+    return symbols
+
+
+def raydium_position(nft_mint: str) -> dict[str, Any]:
+    if not SOLANA_PATTERN.fullmatch(nft_mint):
+        raise NeutralisError("NFT da posição Raydium inválido")
+    position_address = raydium_position_pda(nft_mint)
+    position_data = solana_account(position_address)
+    if len(position_data) < 97:
+        raise NeutralisError("Conta da posição Raydium incompleta")
+    stored_nft = public_key_at(position_data, 9)
+    if stored_nft != nft_mint:
+        raise NeutralisError("O NFT não corresponde à posição Raydium")
+    pool_address = public_key_at(position_data, 41)
+    tick_lower = int.from_bytes(position_data[73:77], "little", signed=True)
+    tick_upper = int.from_bytes(position_data[77:81], "little", signed=True)
+    raw_liquidity = int.from_bytes(position_data[81:97], "little")
+
+    pool_data = solana_account(pool_address)
+    if len(pool_data) < 273:
+        raise NeutralisError("Conta do pool Raydium incompleta")
+    mint_a, mint_b = public_key_at(pool_data, 73), public_key_at(pool_data, 105)
+    decimals_a, decimals_b = pool_data[233], pool_data[234]
+    sqrt_price_x64 = int.from_bytes(pool_data[253:269], "little")
+    symbols = raydium_symbols([mint_a, mint_b])
+    symbol_a, symbol_b = symbols.get(mint_a, ""), symbols.get(mint_b, "")
+    stable_a, stable_b = symbol_a in STABLE_SYMBOLS, symbol_b in STABLE_SYMBOLS
+    if stable_a == stable_b:
+        raise NeutralisError("A LP Raydium precisa ter um ativo e uma cotação estável reconhecida")
+
+    scale = 10 ** (decimals_a - decimals_b)
+    raw_price = (sqrt_price_x64 / 2**64) ** 2
+    price_b_per_a = raw_price * scale
+    tick_lower_price = (1.0001**tick_lower) * scale
+    tick_upper_price = (1.0001**tick_upper) * scale
+    sqrt_current, sqrt_lower, sqrt_upper = math.sqrt(raw_price), math.sqrt((1.0001**tick_lower)), math.sqrt((1.0001**tick_upper))
+    if sqrt_current <= sqrt_lower:
+        amount_a_raw = raw_liquidity * (sqrt_upper - sqrt_lower) / (sqrt_lower * sqrt_upper)
+        amount_b_raw = 0.0
+    elif sqrt_current >= sqrt_upper:
+        amount_a_raw = 0.0
+        amount_b_raw = raw_liquidity * (sqrt_upper - sqrt_lower)
+    else:
+        amount_a_raw = raw_liquidity * (sqrt_upper - sqrt_current) / (sqrt_current * sqrt_upper)
+        amount_b_raw = raw_liquidity * (sqrt_current - sqrt_lower)
+    amount_a, amount_b = amount_a_raw / 10**decimals_a, amount_b_raw / 10**decimals_b
+
+    if stable_b:
+        asset_symbol, quote_symbol = symbol_a, symbol_b
+        lower_price, upper_price, current_price = tick_lower_price, tick_upper_price, price_b_per_a
+        asset_amount, quote_amount = amount_a, amount_b
+    else:
+        asset_symbol, quote_symbol = symbol_b, symbol_a
+        lower_price, upper_price, current_price = 1 / tick_upper_price, 1 / tick_lower_price, 1 / price_b_per_a
+        asset_amount, quote_amount = amount_b, amount_a
+    liquidity_usd = asset_amount * current_price + quote_amount
+    normalized_liquidity = raw_liquidity / (10 ** ((decimals_a + decimals_b) / 2))
+    return {
+        "source": "raydium",
+        "positionAddress": nft_mint,
+        "personalPositionAddress": position_address,
+        "poolAddress": pool_address,
+        "pair": f"{asset_symbol} / {quote_symbol}",
+        "assetSymbol": asset_symbol,
+        "hedgeSymbol": hyp_symbol(asset_symbol),
+        "quoteSymbol": quote_symbol,
+        "liquidityUsd": liquidity_usd,
+        "lowerPrice": lower_price,
+        "upperPrice": upper_price,
+        "currentPrice": current_price,
+        "assetAmount": asset_amount,
+        "quoteAmount": quote_amount,
+        "normalizedLiquidity": normalized_liquidity,
+        "basisWarning": asset_symbol != hyp_symbol(asset_symbol),
+        "importable": bool(asset_symbol and 0 < lower_price < upper_price and raw_liquidity > 0),
+    }
 
 
 def token_metadata(pool: dict[str, Any], side: str) -> dict[str, Any]:
@@ -253,6 +429,7 @@ class NeutralisMonitor:
 
     def _load_config(self) -> dict[str, str]:
         defaults = {
+            "source": "byreal",
             "solanaWallet": DEFAULT_SOLANA_WALLET,
             "hyperliquidAccount": DEFAULT_HYP_ACCOUNT,
             "positionAddress": "",
@@ -266,9 +443,12 @@ class NeutralisMonitor:
         return defaults
 
     def save_config(self, incoming: dict[str, Any]) -> dict[str, str]:
+        source = str(incoming.get("source", self.config["source"])).lower()
         wallet = str(incoming.get("solanaWallet", self.config["solanaWallet"]))
         account = str(incoming.get("hyperliquidAccount", self.config["hyperliquidAccount"]))
         position = str(incoming.get("positionAddress", self.config["positionAddress"]))
+        if source not in {"byreal", "raydium"}:
+            raise NeutralisError("Fonte de liquidez inválida")
         if not SOLANA_PATTERN.fullmatch(wallet):
             raise NeutralisError("Carteira Solana inválida")
         if not EVM_PATTERN.fullmatch(account):
@@ -278,12 +458,17 @@ class NeutralisMonitor:
         with self.lock:
             if self.state["mode"] == "running":
                 raise NeutralisError("Pare o monitor antes de alterar a configuração")
-            self.config = {"solanaWallet": wallet, "hyperliquidAccount": account, "positionAddress": position}
+            self.config = {"source": source, "solanaWallet": wallet, "hyperliquidAccount": account, "positionAddress": position}
             CONFIG_FILE.write_text(json.dumps(self.config, indent=2), encoding="utf-8")
             os.chmod(CONFIG_FILE, 0o600)
             return dict(self.config)
 
     def positions(self) -> list[dict[str, Any]]:
+        if self.config["source"] == "raydium":
+            position = self.config["positionAddress"]
+            if not position:
+                return []
+            return [raydium_position(position)]
         return byreal_positions(self.config["solanaWallet"])
 
     def _selected_position(self) -> dict[str, Any]:
@@ -296,16 +481,19 @@ class NeutralisMonitor:
         if not position:
             raise NeutralisError("A posição selecionada não está aberta ou não pode ser calculada")
         if not position["importable"]:
-            raise NeutralisError("A Byreal não forneceu dados suficientes para calcular esta LP")
+            raise NeutralisError("A fonte não forneceu dados suficientes para calcular esta LP")
         return position
 
     def _live_snapshot(self) -> tuple[dict[str, Any], HypState, Decimal, Decimal, Decimal, Decimal]:
         position = self._selected_position()
         hyp = hyp_state(self.config["hyperliquidAccount"], position["hedgeSymbol"])
-        value = decimal(position["liquidityUsd"], "Byreal liquidityUsd")
-        lower = decimal(position["lowerPrice"], "Byreal lowerPrice")
-        upper = decimal(position["upperPrice"], "Byreal upperPrice")
-        liquidity = lp_liquidity(value, hyp.mark, lower, upper)
+        value = decimal(position["liquidityUsd"], "liquidityUsd")
+        lower = decimal(position["lowerPrice"], "lowerPrice")
+        upper = decimal(position["upperPrice"], "upperPrice")
+        if position.get("normalizedLiquidity") is not None:
+            liquidity = decimal(position["normalizedLiquidity"], "normalizedLiquidity")
+        else:
+            liquidity = lp_liquidity(value, hyp.mark, lower, upper)
         target = base_target(liquidity, hyp.mark, lower, upper)
         return position, hyp, lower, upper, liquidity, target
 
@@ -354,6 +542,9 @@ class NeutralisMonitor:
                 raise NeutralisError("Existem ordens abertas neste mercado")
             if hyp.oracle <= 0 or abs(hyp.mark - hyp.oracle) / hyp.oracle > divergence_limit:
                 raise NeutralisError("Mark e oráculo divergiram mais de 0,75%")
+            lp_price = decimal(position.get("currentPrice", hyp.mark), "preço da LP")
+            if abs(lp_price - hyp.mark) / hyp.mark > divergence_limit:
+                raise NeutralisError("Preço da LP e Hyperliquid divergiram mais de 0,75%")
             initial_signed = hyp.signed_position
             virtual_short = abs(min(initial_signed, Decimal("0")))
             quantum = Decimal(1).scaleb(-hyp.decimals)
@@ -368,6 +559,8 @@ class NeutralisMonitor:
                 "market": hyp.market,
                 "mark": hyp.mark,
                 "oracle": hyp.oracle,
+                "lpPrice": lp_price,
+                "basisPercent": abs(lp_price - hyp.mark) / hyp.mark * 100,
                 "realShort": abs(min(hyp.signed_position, Decimal("0"))),
                 "virtualShort": virtual_short,
                 "targetShort": target,
@@ -392,6 +585,9 @@ class NeutralisMonitor:
                     return self._pause("O preço saiu da faixa da LP")
                 if hyp_now.oracle <= 0 or abs(hyp_now.mark - hyp_now.oracle) / hyp_now.oracle > divergence_limit:
                     return self._pause("Mark e oráculo divergiram mais de 0,75%")
+                lp_price = decimal(position_now.get("currentPrice", hyp_now.mark), "preço da LP")
+                if abs(lp_price - hyp_now.mark) / hyp_now.mark > divergence_limit:
+                    return self._pause("Preço da LP e Hyperliquid divergiram mais de 0,75%")
 
                 movement = hyp_now.mark / anchor - Decimal("1")
                 if abs(movement) >= step:
@@ -409,6 +605,8 @@ class NeutralisMonitor:
                     "market": hyp_now.market,
                     "mark": hyp_now.mark,
                     "oracle": hyp_now.oracle,
+                    "lpPrice": lp_price,
+                    "basisPercent": abs(lp_price - hyp_now.mark) / hyp_now.mark * 100,
                     "realShort": abs(min(hyp_now.signed_position, Decimal("0"))),
                     "virtualShort": virtual_short,
                     "targetShort": target,
