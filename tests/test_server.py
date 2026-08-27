@@ -21,7 +21,38 @@ SPEC.loader.exec_module(server)
 class NeutralisTests(unittest.TestCase):
     def test_xstock_symbol_maps_to_hyperliquid(self):
         self.assertEqual(server.hyp_symbol("AAPLX"), "AAPL")
+        self.assertEqual(server.hyp_symbol("CRCLX"), "CRCL")
+        self.assertEqual(server.hyp_symbol("SPCX"), "SPCX")
         self.assertEqual(server.hyp_symbol("crcl"), "CRCL")
+
+    def test_raydium_position_pda_from_nft(self):
+        self.assertEqual(
+            server.raydium_position_pda("6cHCWbDnkHehmYh8LcfwKTDdq9ncHGnVuTAVNAQ5kPEw"),
+            "AJWBXiEjp7GMokcurVK4uknufBHqoVnESbrrmwCmNH2p",
+        )
+
+    def test_raydium_position_is_decoded_on_chain(self):
+        nft = "6cHCWbDnkHehmYh8LcfwKTDdq9ncHGnVuTAVNAQ5kPEw"
+        pool = "GYqHjuDzTiw7i52Xv1qohDE6eJr6eSZpsrBVikGZyaFV"
+        mint_a = "XsueG8BtpquVJX9LVLLEGuViXUungE6WmK5YZ3p3bd1"
+        mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        position_data = bytearray(300)
+        position_data[9:41] = server.base58_decode(nft)
+        position_data[41:73] = server.base58_decode(pool)
+        position_data[73:77] = (44480).to_bytes(4, "little", signed=True)
+        position_data[77:81] = (46480).to_bytes(4, "little", signed=True)
+        position_data[81:97] = (10**12).to_bytes(16, "little")
+        pool_data = bytearray(300)
+        pool_data[73:105] = server.base58_decode(mint_a)
+        pool_data[105:137] = server.base58_decode(mint_b)
+        pool_data[233], pool_data[234] = 6, 6
+        pool_data[253:269] = int((95**0.5) * 2**64).to_bytes(16, "little")
+        with patch.object(server, "solana_account", side_effect=[bytes(position_data), bytes(pool_data)]):
+            result = server.raydium_position(nft)
+        self.assertEqual(result["pair"], "CRCLX / USDC")
+        self.assertEqual(result["hedgeSymbol"], "CRCL")
+        self.assertTrue(result["basisWarning"])
+        self.assertTrue(result["importable"])
 
     def test_byreal_position_normalization(self):
         position = {
