@@ -1,6 +1,6 @@
 # Neutralis Hedge para Umbrel
 
-Monitor local em **dry-run** para uma LP RWA/USD na Byreal protegida por um
+Monitor local em **dry-run** para uma LP RWA/USD na Byreal ou Raydium protegida por um
 perpétuo HIP-3 na Hyperliquid.
 
 Esta versão não contém chave privada, biblioteca de assinatura ou chamada ao
@@ -32,11 +32,12 @@ Não encaminhe a porta `8787` no roteador e não exponha este painel diretamente
 
 ## Operação
 
-1. Confirme as duas carteiras públicas mostradas no painel.
-2. Clique em **Buscar LPs**.
-3. Selecione a posição desejada.
-4. Clique em **Iniciar dry-run**.
-5. Acompanhe os ajustes virtuais no registro.
+1. Escolha Byreal ou Raydium e confirme as contas públicas mostradas no painel.
+2. Na Raydium, cole o endereço do NFT da posição; na Byreal, informe a carteira Solana.
+3. Clique em **Buscar LPs**.
+4. Selecione a posição desejada.
+5. Clique em **Iniciar dry-run**.
+6. Acompanhe os ajustes virtuais no registro.
 
 O container volta automaticamente após uma reinicialização do Umbrel.
 
@@ -61,10 +62,12 @@ docker compose -f compose.yaml stop neutralis
 - Configuração e eventos públicos persistem em `./data`.
 - O monitor pausa se houver posição long, ordens abertas, alteração da posição
   real, saída da faixa ou divergência de mark/oráculo superior a 0,75%.
+- Para wrappers como CRCLx, o monitor também pausa se o preço da LP divergir
+  mais de 0,75% do perp correspondente na Hyperliquid.
 
 ## Community App Store
 
 `umbrel-app.yml` e `docker-compose.yml` são um esqueleto para a instalação
 nativa. Antes de adicioná-lo a uma loja, é necessário publicar a imagem
-`neutralis-umbrel:0.1.0` para ARM64 e AMD64 em um registry e substituir a
+`neutralis-umbrel:0.2.0` para ARM64 e AMD64 em um registry e substituir a
 diretiva `build` por esse endereço de imagem.
