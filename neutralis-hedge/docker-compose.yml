@@ -1,12 +1,11 @@
 services:
   app_proxy:
     environment:
-      APP_HOST: neutralis_hedge_server_1
+      APP_HOST: neutralis-hedge_server_1
       APP_PORT: 8787
 
   server:
     image: ghcr.io/rhstuff01/neutralis-umbrel:0.1.0
-    container_name: neutralis_hedge_server_1
     restart: on-failure
     stop_grace_period: 15s
     volumes:
