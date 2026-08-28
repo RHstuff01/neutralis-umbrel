@@ -9,6 +9,7 @@ import hashlib
 import math
 import os
 import re
+import secrets
 import threading
 import time
 import traceback
@@ -441,6 +442,7 @@ class NeutralisMonitor:
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
+        self.pending_order: dict[str, Any] | None = None
         self.config = self._load_config()
         self.state: dict[str, Any] = {
             "mode": "stopped",
@@ -529,12 +531,27 @@ class NeutralisMonitor:
             raise NeutralisError("A ordem calculada é menor que o mínimo de US$ 10 da Hyperliquid")
         action = "COMPRAR" if is_buy else "VENDER"
         confirmation = f"CONFIRMO {action} {size} CRCL ATE {limit_price}"
-        return json_safe({"market": LIVE_MARKET, "action": action, "isBuy": is_buy, "size": size, "mark": hyp.mark, "limitPrice": limit_price, "notional": notional, "reduceOnly": is_buy, "confirmation": confirmation, "maxNotional": MAX_LIVE_NOTIONAL})
+        preview = json_safe({"market": LIVE_MARKET, "action": action, "isBuy": is_buy, "size": size, "mark": hyp.mark, "limitPrice": limit_price, "notional": notional, "reduceOnly": is_buy, "confirmation": confirmation, "maxNotional": MAX_LIVE_NOTIONAL, "currentPosition": hyp.signed_position, "token": secrets.token_hex(16), "expiresAt": time.time() + 30})
+        with self.lock:
+            self.pending_order = dict(preview)
+        return preview
 
     def execute_test_order(self, incoming: dict[str, Any]) -> dict[str, Any]:
-        preview = self.order_preview()
+        with self.lock:
+            preview = dict(self.pending_order) if self.pending_order else None
+        if not preview or str(incoming.get("token", "")) != preview["token"] or time.time() > float(preview["expiresAt"]):
+            raise NeutralisError("Prévia expirada; calcule a ordem novamente")
         if str(incoming.get("confirmation", "")).strip() != preview["confirmation"]:
             raise NeutralisError("Confirmação não corresponde exatamente à prévia atual")
+        current = hyp_state(self.config["hyperliquidAccount"], LIVE_SYMBOL)
+        if current.open_orders or Decimal(str(current.signed_position)) != Decimal(str(preview["currentPosition"])):
+            raise NeutralisError("A posição ou as ordens mudaram; calcule novamente")
+        if abs(current.mark - Decimal(str(preview["mark"]))) / Decimal(str(preview["mark"])) > Decimal("0.005"):
+            raise NeutralisError("O preço mudou mais de 0,5%; calcule novamente")
+        if Decimal(str(preview["size"])) * current.mark > MAX_LIVE_NOTIONAL:
+            raise NeutralisError("A ordem ultrapassaria o limite atual de US$ 20")
+        with self.lock:
+            self.pending_order = None
         try:
             from eth_account import Account
             from hyperliquid.exchange import Exchange
