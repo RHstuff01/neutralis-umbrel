@@ -758,7 +758,7 @@ class NeutralisMonitor:
                 raise NeutralisError("Mark e oráculo divergiram mais de 0,75%")
             if live and position.get("currentPrice") is None:
                 raise NeutralisError("A Byreal não forneceu preço independente da LP; modo real bloqueado")
-            lp_price = decimal(position.get("currentPrice", hyp.mark), "preço da LP")
+            lp_price = decimal(position.get("currentPrice") or hyp.mark, "preço da LP")
             if abs(lp_price - hyp.mark) / hyp.mark > divergence_limit:
                 raise NeutralisError("Preço da LP e Hyperliquid divergiram mais de 0,75%")
             initial_signed = hyp.signed_position
@@ -805,7 +805,7 @@ class NeutralisMonitor:
                     return self._pause("Mark e oráculo divergiram mais de 0,75%")
                 if live and position_now.get("currentPrice") is None:
                     return self._pause("A fonte deixou de fornecer o preço independente da LP")
-                lp_price = decimal(position_now.get("currentPrice", hyp_now.mark), "preço da LP")
+                lp_price = decimal(position_now.get("currentPrice") or hyp_now.mark, "preço da LP")
                 if abs(lp_price - hyp_now.mark) / hyp_now.mark > divergence_limit:
                     return self._pause("Preço da LP e Hyperliquid divergiram mais de 0,75%")
 
