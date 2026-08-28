@@ -22,6 +22,7 @@ class NeutralisTests(unittest.TestCase):
     def test_xstock_symbol_maps_to_hyperliquid(self):
         self.assertEqual(server.hyp_symbol("AAPLX"), "AAPL")
         self.assertEqual(server.hyp_symbol("CRCLX"), "CRCL")
+        self.assertEqual(server.hyp_symbol("COINX"), "COIN")
         self.assertEqual(server.hyp_symbol("SPCX"), "SPCX")
         self.assertEqual(server.hyp_symbol("crcl"), "CRCL")
 
