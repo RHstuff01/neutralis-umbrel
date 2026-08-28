@@ -54,6 +54,17 @@ class NeutralisTests(unittest.TestCase):
         self.assertTrue(result["basisWarning"])
         self.assertTrue(result["importable"])
 
+    def test_raydium_position_rejects_empty_liquidity(self):
+        nft = "6cHCWbDnkHehmYh8LcfwKTDdq9ncHGnVuTAVNAQ5kPEw"
+        position_data = bytearray(300)
+        position_data[9:41] = server.base58_decode(nft)
+        position_data[41:73] = server.base58_decode("GYqHjuDzTiw7i52Xv1qohDE6eJr6eSZpsrBVikGZyaFV")
+        position_data[73:77] = (44480).to_bytes(4, "little", signed=True)
+        position_data[77:81] = (46480).to_bytes(4, "little", signed=True)
+        with patch.object(server, "solana_account", return_value=bytes(position_data)):
+            with self.assertRaisesRegex(server.NeutralisError, "sem liquidez"):
+                server.raydium_position(nft)
+
     def test_byreal_position_normalization(self):
         position = {
             "positionAddress": "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw",
