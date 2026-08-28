@@ -2,7 +2,7 @@ services:
   neutralis:
     build:
       context: .
-    image: neutralis-umbrel:0.3.2
+    image: neutralis-umbrel:0.3.3
     user: "0:0"
     container_name: neutralis
     restart: unless-stopped
