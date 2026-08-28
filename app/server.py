@@ -11,6 +11,7 @@ import os
 import re
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
@@ -199,6 +200,10 @@ def raydium_position(nft_mint: str) -> dict[str, Any]:
     tick_lower = int.from_bytes(position_data[73:77], "little", signed=True)
     tick_upper = int.from_bytes(position_data[77:81], "little", signed=True)
     raw_liquidity = int.from_bytes(position_data[81:97], "little")
+    if not (-887272 <= tick_lower < tick_upper <= 887272):
+        raise NeutralisError("Faixa de ticks inválida na posição Raydium")
+    if raw_liquidity <= 0:
+        raise NeutralisError("A posição Raydium está sem liquidez")
 
     pool_data = solana_account(pool_address)
     if len(pool_data) < 273:
@@ -206,6 +211,8 @@ def raydium_position(nft_mint: str) -> dict[str, Any]:
     mint_a, mint_b = public_key_at(pool_data, 73), public_key_at(pool_data, 105)
     decimals_a, decimals_b = pool_data[233], pool_data[234]
     sqrt_price_x64 = int.from_bytes(pool_data[253:269], "little")
+    if sqrt_price_x64 <= 0:
+        raise NeutralisError("Preço inválido no pool Raydium")
     symbols = raydium_symbols([mint_a, mint_b])
     symbol_a, symbol_b = symbols.get(mint_a, ""), symbols.get(mint_b, "")
     stable_a, stable_b = symbol_a in STABLE_SYMBOLS, symbol_b in STABLE_SYMBOLS
@@ -672,6 +679,12 @@ class Handler(SimpleHTTPRequestHandler):
             return super().do_GET()
         except (NeutralisError, ValueError, json.JSONDecodeError) as error:
             return self.send_json({"error": str(error)}, HTTPStatus.BAD_GATEWAY)
+        except Exception as error:
+            traceback.print_exc()
+            return self.send_json(
+                {"error": f"Falha interna ao consultar a posição ({type(error).__name__}): {error}"},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
@@ -687,6 +700,12 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json({"error": "Endpoint não encontrado"}, HTTPStatus.NOT_FOUND)
         except (NeutralisError, ValueError, json.JSONDecodeError) as error:
             return self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+        except Exception as error:
+            traceback.print_exc()
+            return self.send_json(
+                {"error": f"Falha interna ao salvar a configuração ({type(error).__name__}): {error}"},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
 
 def main() -> None:
