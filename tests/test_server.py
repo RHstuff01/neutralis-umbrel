@@ -101,6 +101,11 @@ class NeutralisTests(unittest.TestCase):
         result = server.normalize_position(position, pool)
         self.assertAlmostEqual(result["currentPrice"], 1.0001**52000)
 
+    def test_missing_byreal_price_can_fall_back_to_mark_in_dry_run(self):
+        position = {"currentPrice": None}
+        mark = Decimal("176.79")
+        self.assertEqual(server.decimal(position.get("currentPrice") or mark, "preço da LP"), mark)
+
     def test_byreal_envelope_is_unwrapped(self):
         payload = {
             "result": {
