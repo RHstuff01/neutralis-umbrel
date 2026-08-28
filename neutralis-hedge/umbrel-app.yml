@@ -4,7 +4,7 @@ name: Neutralis Hedge
 tagline: Monitor dry-run para hedge dinâmico de LPs RWA
 icon: https://neutralis-rwa-hedge.rafaelherzer.chatgpt.site/favicon.svg
 category: finance
-version: "0.3.0"
+version: "0.3.1"
 port: 8787
 description: >-
   Monitora uma posição de liquidez concentrada na Byreal ou Raydium e a posição
@@ -17,7 +17,7 @@ submission: https://github.com/RHstuff01/neutralis-umbrel
 repo: https://github.com/RHstuff01/neutralis-umbrel
 support: https://github.com/RHstuff01/neutralis-umbrel/issues
 gallery: []
-releaseNotes: Adiciona teste manual de uma ordem real em xyz:CRCL, com API Wallet local, confirmação exata e limite rígido de US$ 20. O monitor automático permanece em dry-run.
+releaseNotes: Mantém a prévia da ordem válida por 30 segundos e revalida posição, preço e limite antes do envio, evitando divergência causada por pequenas oscilações do mark.
 dependencies: []
 path: ""
 defaultUsername: ""
