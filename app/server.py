@@ -557,7 +557,8 @@ class NeutralisMonitor:
             from hyperliquid.exchange import Exchange
             from hyperliquid.utils.constants import MAINNET_API_URL
         except ImportError as error:
-            raise NeutralisError("SDK da Hyperliquid não está disponível") from error
+            missing = getattr(error, "name", None) or str(error)
+            raise NeutralisError(f"SDK da Hyperliquid não está disponível ({missing})") from error
         wallet = Account.from_key(self._api_key())
         exchange = Exchange(wallet, MAINNET_API_URL, account_address=self.config["hyperliquidAccount"], perp_dexs=["xyz"])
         response = exchange.order(LIVE_MARKET, bool(preview["isBuy"]), float(preview["size"]), float(preview["limitPrice"]), {"limit": {"tif": "Ioc"}}, reduce_only=bool(preview["reduceOnly"]))
