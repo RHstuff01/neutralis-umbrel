@@ -5,7 +5,7 @@ services:
       APP_PORT: 8787
 
   server:
-    image: ghcr.io/rhstuff01/neutralis-umbrel:0.2.2
+    image: ghcr.io/rhstuff01/neutralis-umbrel:0.2.3
     restart: on-failure
     stop_grace_period: 15s
     volumes:
@@ -20,5 +20,9 @@ services:
       - /tmp:size=16m,noexec,nosuid
     cap_drop:
       - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
     security_opt:
       - no-new-privileges:true
