@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 TEST_DATA = tempfile.TemporaryDirectory()
@@ -90,6 +90,17 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(result["hedgeSymbol"], "AAPL")
         self.assertLess(result["lowerPrice"], result["upperPrice"])
 
+    def test_byreal_current_tick_provides_independent_lp_price(self):
+        position = {"positionAddress": "position", "poolAddress": "pool", "lowerTick": 51000, "upperTick": 53000, "liquidityUsd": "1000"}
+        pool = {
+            "poolAddress": "pool",
+            "tickCurrent": 52000,
+            "mintA": {"symbol": "COINX", "decimals": 6},
+            "mintB": {"symbol": "USDC", "decimals": 6},
+        }
+        result = server.normalize_position(position, pool)
+        self.assertAlmostEqual(result["currentPrice"], 1.0001**52000)
+
     def test_byreal_envelope_is_unwrapped(self):
         payload = {
             "result": {
@@ -134,6 +145,52 @@ class NeutralisTests(unittest.TestCase):
             preview = server.MONITOR.order_preview()
         self.assertLessEqual(Decimal(str(preview["notional"])), Decimal("20"))
         self.assertEqual(preview["market"], "xyz:CRCL")
+
+    def test_auto_adjustment_waits_below_hyperliquid_minimum(self):
+        position = {"hedgeSymbol": "COIN"}
+        hyp = server.HypState("xyz:COIN", 3, Decimal("176"), Decimal("176"), Decimal("-2.740"), 0)
+        with patch.object(server.MONITOR, "_exchange") as exchange:
+            result = server.MONITOR._execute_auto_adjustment(position, hyp, Decimal("2.749"))
+        self.assertIsNone(result)
+        exchange.assert_not_called()
+
+    def test_auto_buy_is_reduce_only_and_never_crosses_zero(self):
+        position = {"hedgeSymbol": "COIN"}
+        hyp = server.HypState("xyz:COIN", 3, Decimal("176"), Decimal("176"), Decimal("-2.740"), 0)
+        response = {"status": "ok", "response": {"data": {"statuses": [{"filled": {"totalSz": "0.140"}}]}}}
+        exchange = Mock()
+        exchange.order.return_value = response
+        with patch.object(server, "hyp_state", return_value=hyp), patch.object(server.MONITOR, "_exchange", return_value=exchange), patch.object(server.MONITOR, "_event"):
+            result = server.MONITOR._execute_auto_adjustment(position, hyp, Decimal("2.600"))
+        self.assertTrue(result["isBuy"])
+        self.assertEqual(exchange.order.call_args.kwargs["reduce_only"], True)
+        self.assertEqual(exchange.order.call_args.args[2], 0.14)
+
+    def test_auto_sell_pauses_above_six_hundred_total_notional(self):
+        position = {"hedgeSymbol": "COIN"}
+        hyp = server.HypState("xyz:COIN", 3, Decimal("176"), Decimal("176"), Decimal("-2.740"), 0)
+        with self.assertRaisesRegex(server.NeutralisError, "US\$ 600"):
+            server.MONITOR._execute_auto_adjustment(position, hyp, Decimal("3.500"))
+
+    def test_ioc_without_fill_is_rejected(self):
+        response = {"status": "ok", "response": {"data": {"statuses": [{"error": "IocCancel"}]}}}
+        with self.assertRaisesRegex(server.NeutralisError, "IocCancel"):
+            server.MONITOR._order_status(response)
+
+    def test_monitor_start_uses_anchor_without_initial_adjustment(self):
+        position = {
+            "positionAddress": "position",
+            "hedgeSymbol": "COIN",
+            "currentPrice": Decimal("176"),
+        }
+        hyp = server.HypState("xyz:COIN", 3, Decimal("176"), Decimal("176"), Decimal("-2.740"), 0)
+        snapshot = (position, hyp, Decimal("159"), Decimal("195"), Decimal("755"), Decimal("2.749"))
+        events = []
+        with patch.object(server.MONITOR, "_live_snapshot", return_value=snapshot), patch.object(server.MONITOR.stop_event, "wait", return_value=True), patch.object(server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)):
+            server.MONITOR._run(live=False)
+        self.assertEqual(events, ["start"])
+        self.assertEqual(server.MONITOR.state["snapshot"]["anchor"], 176.0)
+        self.assertEqual(server.MONITOR.state["snapshot"]["virtualShort"], 2.74)
 
 
 if __name__ == "__main__":
