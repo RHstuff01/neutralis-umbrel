@@ -1,11 +1,10 @@
 # Neutralis Hedge para Umbrel
 
-Monitor local em **dry-run** para uma LP RWA/USD na Byreal ou Raydium protegida por um
-perpétuo HIP-3 na Hyperliquid.
+Monitor local em **dry-run ou modo real opcional** para uma LP RWA/USD na Byreal
+ou Raydium protegida por um perpétuo HIP-3 na Hyperliquid.
 
-Esta versão não contém chave privada, biblioteca de assinatura ou chamada ao
-endpoint de negociação. Ela apenas lê dados públicos e registra as operações
-que simularia.
+O modo real fica desligado após cada inicialização e exige API Wallet armazenada
+localmente e confirmação textual exata. Nenhuma ordem é enviada ao iniciar.
 
 ## Instalação inicial por SSH
 
@@ -38,6 +37,8 @@ Não encaminhe a porta `8787` no roteador e não exponha este painel diretamente
 4. Selecione a posição desejada.
 5. Clique em **Iniciar dry-run**.
 6. Acompanhe os ajustes virtuais no registro.
+7. Somente depois de validar o mercado e os valores, informe a confirmação
+   mostrada pelo painel para ativar o monitor real.
 
 O container volta automaticamente após uma reinicialização do Umbrel.
 
@@ -54,9 +55,12 @@ docker compose -f compose.yaml stop neutralis
 
 ## Proteções
 
-- `ordersEnabled` permanece sempre `false`.
-- Nenhuma chave privada é aceita pelo painel.
-- Nenhuma chamada é feita ao endpoint de negociação da Hyperliquid.
+- O modo real inicia sempre desligado e exige confirmação manual exata.
+- A chave privada da API Wallet fica somente no volume local `/data`.
+- O preço inicial vira âncora; nenhuma ordem inicial é enviada.
+- Ajustes ocorrem somente depois de um movimento de 0,5% desde a âncora.
+- Compras são `reduce-only` e nunca podem abrir uma posição long.
+- Ordens automáticas são IOC e o short total é limitado a US$ 600.
 - O processo roda sem privilégios, sem capabilities Linux e com sistema de
   arquivos somente leitura, exceto `/data`.
 - Configuração e eventos públicos persistem em `./data`.
@@ -69,5 +73,5 @@ docker compose -f compose.yaml stop neutralis
 
 `umbrel-app.yml` e `docker-compose.yml` são um esqueleto para a instalação
 nativa. Antes de adicioná-lo a uma loja, é necessário publicar a imagem
-`neutralis-umbrel:0.3.3` para ARM64 e AMD64 em um registry e substituir a
+`neutralis-umbrel:0.4.0` para ARM64 e AMD64 em um registry e substituir a
 diretiva `build` por esse endereço de imagem.
