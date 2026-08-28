@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Neutralis Umbrel: monitor de hedge exclusivamente em dry-run."""
+"""Neutralis Umbrel: monitor de hedge dinâmico em dry-run ou modo real."""
 
 from __future__ import annotations
 
@@ -40,6 +40,10 @@ LIVE_MARKET = "xyz:CRCL"
 LIVE_SYMBOL = "CRCL"
 MAX_LIVE_NOTIONAL = Decimal("20")
 LIVE_SLIPPAGE = Decimal("0.003")
+AUTO_STEP = Decimal("0.005")
+AUTO_MAX_POSITION_NOTIONAL = Decimal("600")
+AUTO_MIN_ORDER_NOTIONAL = Decimal("10")
+AUTO_DIVERGENCE_LIMIT = Decimal("0.0075")
 PRIVATE_KEY_PATTERN = re.compile(r"^(?:0x)?[0-9a-fA-F]{64}$")
 SOLANA_PATTERN = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 EVM_PATTERN = re.compile(r"^0x[0-9a-fA-F]{40}$")
@@ -291,6 +295,7 @@ def token_metadata(pool: dict[str, Any], side: str) -> dict[str, Any]:
         "address": direct if isinstance(direct, str) else str(value.get("address") or value.get("mintAddress") or value.get("mint") or ""),
         "symbol": str(value.get("symbol") or value.get("ticker") or "").upper(),
         "decimals": optional_float(value.get("decimals", value.get("decimal"))),
+        "priceUsd": optional_float(value.get("priceUsd", value.get("usdPrice"))),
     }
 
 
@@ -306,14 +311,23 @@ def normalize_position(position: dict[str, Any], pool: dict[str, Any]) -> dict[s
     value_usd = optional_float(position.get("liquidityUsd", position.get("positionValueUsd", position.get("valueUsd"))))
     lower_price = None
     upper_price = None
+    current_price = None
     if stable_a != stable_b and token_a["decimals"] is not None and token_b["decimals"] is not None and lower_tick is not None and upper_tick is not None:
         scale = 10 ** (token_a["decimals"] - token_b["decimals"])
         tick_lower_price = (1.0001**lower_tick) * scale
         tick_upper_price = (1.0001**upper_tick) * scale
+        current_tick = optional_float(pool.get("tickCurrent", pool.get("currentTick")))
+        tick_current_price = (1.0001**current_tick) * scale if current_tick is not None else None
         if stable_b:
             lower_price, upper_price = tick_lower_price, tick_upper_price
+            current_price = tick_current_price
         else:
             lower_price, upper_price = 1 / tick_upper_price, 1 / tick_lower_price
+            current_price = 1 / tick_current_price if tick_current_price else None
+    if current_price is None and asset.get("priceUsd") is not None:
+        quote_usd = quote.get("priceUsd") or 1.0
+        if quote_usd > 0:
+            current_price = asset["priceUsd"] / quote_usd
     importable = bool(
         asset["symbol"]
         and quote["symbol"]
@@ -335,6 +349,7 @@ def normalize_position(position: dict[str, Any], pool: dict[str, Any]) -> dict[s
         "liquidityUsd": value_usd,
         "lowerPrice": lower_price,
         "upperPrice": upper_price,
+        "currentPrice": current_price,
         "earnedUsd": optional_float(position.get("earnedUsd")),
         "apr": optional_float(position.get("apr")),
         "importable": importable,
@@ -443,10 +458,11 @@ class NeutralisMonitor:
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.pending_order: dict[str, Any] | None = None
+        self.execution_lock = threading.Lock()
         self.config = self._load_config()
         self.state: dict[str, Any] = {
             "mode": "stopped",
-            "message": "Pronto para iniciar o dry-run",
+            "message": "Pronto para iniciar",
             "updatedAt": now_iso(),
             "snapshot": None,
         }
@@ -565,6 +581,91 @@ class NeutralisMonitor:
         self._event("live-order", f"ORDEM REAL {preview['action']} {preview['size']} CRCL", response=response)
         return {"preview": preview, "response": response}
 
+    def _exchange(self):
+        try:
+            from eth_account import Account
+            from hyperliquid.exchange import Exchange
+            from hyperliquid.utils.constants import MAINNET_API_URL
+        except ImportError as error:
+            missing = getattr(error, "name", None) or str(error)
+            raise NeutralisError(f"SDK da Hyperliquid não está disponível ({missing})") from error
+        wallet = Account.from_key(self._api_key())
+        return Exchange(
+            wallet,
+            MAINNET_API_URL,
+            account_address=self.config["hyperliquidAccount"],
+            perp_dexs=["xyz"],
+        )
+
+    @staticmethod
+    def _order_status(response: Any) -> dict[str, Any]:
+        if not isinstance(response, dict) or response.get("status") != "ok":
+            raise NeutralisError("A Hyperliquid rejeitou a ordem automática")
+        statuses = response.get("response", {}).get("data", {}).get("statuses", [])
+        if not statuses or not isinstance(statuses[0], dict):
+            raise NeutralisError("Resposta inesperada ao enviar a ordem automática")
+        status = statuses[0]
+        if "error" in status:
+            raise NeutralisError(f"Ordem automática rejeitada: {status['error']}")
+        if "filled" not in status:
+            raise NeutralisError("A ordem IOC não foi executada; monitor pausado")
+        return status["filled"]
+
+    def _execute_auto_adjustment(
+        self,
+        position: dict[str, Any],
+        hyp: HypState,
+        target: Decimal,
+    ) -> dict[str, Any] | None:
+        if hyp.open_orders:
+            raise NeutralisError("Existem ordens abertas neste mercado")
+        if hyp.signed_position > 0:
+            raise NeutralisError("A conta ficou long; monitor pausado")
+        current_short = abs(min(hyp.signed_position, Decimal("0")))
+        quantum = Decimal(1).scaleb(-hyp.decimals)
+        difference = target - current_short
+        size = abs(difference).quantize(quantum, rounding=ROUND_DOWN)
+        if size <= 0:
+            return None
+        is_buy = difference < 0
+        if is_buy:
+            size = min(size, current_short)
+        else:
+            resulting_notional = (current_short + size) * hyp.mark
+            if resulting_notional > AUTO_MAX_POSITION_NOTIONAL:
+                raise NeutralisError("Short-alvo ultrapassaria o limite total de US$ 600")
+        notional = size * hyp.mark
+        if notional < AUTO_MIN_ORDER_NOTIONAL:
+            return None
+        limit_price = hyp.mark * (Decimal("1") + LIVE_SLIPPAGE if is_buy else Decimal("1") - LIVE_SLIPPAGE)
+        limit_price = Decimal(f"{limit_price:.5g}")
+        with self.execution_lock:
+            current = hyp_state(self.config["hyperliquidAccount"], position["hedgeSymbol"])
+            if current.open_orders or current.signed_position != hyp.signed_position:
+                raise NeutralisError("A posição ou as ordens mudaram durante a validação")
+            if abs(current.mark - hyp.mark) / hyp.mark > AUTO_STEP:
+                raise NeutralisError("O preço mudou mais de 0,5% durante a validação")
+            response = self._exchange().order(
+                hyp.market,
+                is_buy,
+                float(size),
+                float(limit_price),
+                {"limit": {"tif": "Ioc"}},
+                reduce_only=is_buy,
+            )
+        filled = self._order_status(response)
+        action = "COMPRAR / reduzir short" if is_buy else "VENDER / aumentar short"
+        self._event(
+            "live-adjustment",
+            f"ORDEM REAL {action} {size} {position['hedgeSymbol']}",
+            size=size,
+            target=target,
+            mark=hyp.mark,
+            reduceOnly=is_buy,
+            filled=filled,
+        )
+        return {"size": size, "notional": notional, "isBuy": is_buy, "filled": filled}
+
     def positions(self) -> list[dict[str, Any]]:
         if self.config["source"] == "raydium":
             position = self.config["positionAddress"]
@@ -613,19 +714,28 @@ class NeutralisMonitor:
         except (OSError, json.JSONDecodeError):
             return []
 
-    def start(self) -> None:
+    def start(self, live: bool = False, confirmation: str = "") -> None:
         with self.lock:
             if self.thread and self.thread.is_alive():
                 raise NeutralisError("O monitor já está em execução")
+            if live:
+                position, hyp, _, _, _, _ = self._live_snapshot()
+                expected = f"ATIVAR HEDGE REAL {hyp.market.upper()} MAX US$ 600"
+                if confirmation.strip().upper() != expected:
+                    raise NeutralisError(f"Confirmação incorreta. Digite exatamente: {expected}")
+                if not API_KEY_FILE.exists():
+                    raise NeutralisError("Cadastre a chave da API Wallet antes de ativar o modo real")
+                if position["hedgeSymbol"] != hyp_symbol(position["assetSymbol"]):
+                    raise NeutralisError("Mapeamento do contrato não pôde ser validado")
             self.stop_event.clear()
             self.state.update({"mode": "starting", "message": "Validando fontes de dados", "updatedAt": now_iso()})
-            self.thread = threading.Thread(target=self._run, name="neutralis-dry-run", daemon=True)
+            self.thread = threading.Thread(target=self._run, args=(live,), name="neutralis-live" if live else "neutralis-dry-run", daemon=True)
             self.thread.start()
 
     def stop(self) -> None:
         self.stop_event.set()
         with self.lock:
-            self.state.update({"mode": "stopped", "message": "Dry-run interrompido pelo usuário", "updatedAt": now_iso()})
+            self.state.update({"mode": "stopped", "message": "Monitor interrompido pelo usuário", "updatedAt": now_iso()})
         self._event("stop", "Monitor interrompido pelo usuário")
 
     def _pause(self, message: str) -> None:
@@ -633,28 +743,27 @@ class NeutralisMonitor:
             self.state.update({"mode": "paused", "message": message, "updatedAt": now_iso()})
         self._event("pause", message)
 
-    def _run(self) -> None:
-        step = Decimal("0.005")
-        divergence_limit = Decimal("0.0075")
+    def _run(self, live: bool = False) -> None:
+        step = AUTO_STEP
+        divergence_limit = AUTO_DIVERGENCE_LIMIT
         try:
             position, hyp, lower, upper, liquidity, target = self._live_snapshot()
             if hyp.signed_position > 0:
                 raise NeutralisError("A conta está long; o monitor exige posição zero ou short")
+            if live and abs(hyp.signed_position) * hyp.mark > AUTO_MAX_POSITION_NOTIONAL:
+                raise NeutralisError("O short real já ultrapassa o limite total de US$ 600")
             if hyp.open_orders:
                 raise NeutralisError("Existem ordens abertas neste mercado")
             if hyp.oracle <= 0 or abs(hyp.mark - hyp.oracle) / hyp.oracle > divergence_limit:
                 raise NeutralisError("Mark e oráculo divergiram mais de 0,75%")
+            if live and position.get("currentPrice") is None:
+                raise NeutralisError("A Byreal não forneceu preço independente da LP; modo real bloqueado")
             lp_price = decimal(position.get("currentPrice", hyp.mark), "preço da LP")
             if abs(lp_price - hyp.mark) / hyp.mark > divergence_limit:
                 raise NeutralisError("Preço da LP e Hyperliquid divergiram mais de 0,75%")
             initial_signed = hyp.signed_position
             virtual_short = abs(min(initial_signed, Decimal("0")))
             quantum = Decimal(1).scaleb(-hyp.decimals)
-            initial_size = abs(target - virtual_short).quantize(quantum, rounding=ROUND_DOWN)
-            if initial_size > 0:
-                action = "VENDER" if target > virtual_short else "COMPRAR"
-                virtual_short = virtual_short + initial_size if target > virtual_short else max(Decimal("0"), virtual_short - initial_size)
-                self._event("adjustment", f"SIMULAR {action} {initial_size} {position['hedgeSymbol']}", size=initial_size, target=target, mark=hyp.mark)
             anchor = hyp.mark
             initial_snapshot = {
                 "position": position,
@@ -670,10 +779,13 @@ class NeutralisMonitor:
                 "lower": lower,
                 "upper": upper,
                 "stepPercent": 0.5,
+                "live": live,
+                "pendingNotional": abs(target - virtual_short) * hyp.mark,
             }
             with self.lock:
-                self.state.update({"mode": "running", "message": "Monitorando níveis de 0,5%", "snapshot": json_safe(initial_snapshot), "updatedAt": now_iso()})
-            self._event("start", f"Dry-run iniciado em {hyp.market}", mark=hyp.mark, lower=lower, upper=upper)
+                label = "MODO REAL ativo" if live else "Dry-run ativo"
+                self.state.update({"mode": "running", "message": f"{label} · aguardando nível de 0,5%", "snapshot": json_safe(initial_snapshot), "updatedAt": now_iso()})
+            self._event("start-live" if live else "start", f"{'MODO REAL' if live else 'Dry-run'} iniciado em {hyp.market}; nenhuma ordem inicial", mark=hyp.mark, lower=lower, upper=upper, anchor=anchor)
 
             while not self.stop_event.wait(5):
                 position_now, hyp_now, lower, upper, liquidity, target = self._live_snapshot()
@@ -681,26 +793,41 @@ class NeutralisMonitor:
                     return self._pause("A posição selecionada mudou")
                 if hyp_now.decimals != hyp.decimals:
                     return self._pause("A precisão do contrato mudou")
-                if hyp_now.signed_position != initial_signed or hyp_now.open_orders:
+                if not live and (hyp_now.signed_position != initial_signed or hyp_now.open_orders):
                     return self._pause("A posição ou as ordens reais mudaram")
+                if live and hyp_now.open_orders:
+                    return self._pause("Foram detectadas ordens abertas neste mercado")
+                if live and abs(min(hyp_now.signed_position, Decimal("0"))) * hyp_now.mark > AUTO_MAX_POSITION_NOTIONAL:
+                    return self._pause("O short real ultrapassou o limite total de US$ 600")
                 if hyp_now.mark <= lower or hyp_now.mark >= upper:
                     return self._pause("O preço saiu da faixa da LP")
                 if hyp_now.oracle <= 0 or abs(hyp_now.mark - hyp_now.oracle) / hyp_now.oracle > divergence_limit:
                     return self._pause("Mark e oráculo divergiram mais de 0,75%")
+                if live and position_now.get("currentPrice") is None:
+                    return self._pause("A fonte deixou de fornecer o preço independente da LP")
                 lp_price = decimal(position_now.get("currentPrice", hyp_now.mark), "preço da LP")
                 if abs(lp_price - hyp_now.mark) / hyp_now.mark > divergence_limit:
                     return self._pause("Preço da LP e Hyperliquid divergiram mais de 0,75%")
 
                 movement = hyp_now.mark / anchor - Decimal("1")
                 if abs(movement) >= step:
-                    difference = target - virtual_short
+                    current_short = abs(min(hyp_now.signed_position, Decimal("0")))
+                    difference = target - (current_short if live else virtual_short)
                     size = abs(difference).quantize(quantum, rounding=ROUND_DOWN)
-                    if size > 0:
-                        action = "VENDER" if difference > 0 else "COMPRAR"
-                        before = virtual_short
-                        virtual_short = virtual_short + size if difference > 0 else max(Decimal("0"), virtual_short - size)
-                        self._event("adjustment", f"SIMULAR {action} {size} {position['hedgeSymbol']}", size=size, before=before, after=virtual_short, target=target, mark=hyp_now.mark)
-                    anchor = hyp_now.mark
+                    notional = size * hyp_now.mark
+                    if size > 0 and notional >= AUTO_MIN_ORDER_NOTIONAL:
+                        if live:
+                            self._execute_auto_adjustment(position_now, hyp_now, target)
+                            refreshed = hyp_state(self.config["hyperliquidAccount"], position_now["hedgeSymbol"])
+                            virtual_short = abs(min(refreshed.signed_position, Decimal("0")))
+                        else:
+                            action = "VENDER" if difference > 0 else "COMPRAR"
+                            before = virtual_short
+                            virtual_short = virtual_short + size if difference > 0 else max(Decimal("0"), virtual_short - size)
+                            self._event("adjustment", f"SIMULAR {action} {size} {position['hedgeSymbol']}", size=size, before=before, after=virtual_short, target=target, mark=hyp_now.mark)
+                        anchor = hyp_now.mark
+                    elif size > 0:
+                        self._event("below-minimum", f"Ajuste de US$ {notional:.2f} aguardando próximo nível", size=size, target=target, mark=hyp_now.mark)
 
                 snapshot = {
                     "position": position_now,
@@ -716,6 +843,8 @@ class NeutralisMonitor:
                     "lower": lower,
                     "upper": upper,
                     "stepPercent": 0.5,
+                    "live": live,
+                    "pendingNotional": abs(target - (abs(min(hyp_now.signed_position, Decimal('0'))) if live else virtual_short)) * hyp_now.mark,
                 }
                 with self.lock:
                     self.state.update({"snapshot": json_safe(snapshot), "updatedAt": now_iso()})
@@ -726,7 +855,7 @@ class NeutralisMonitor:
 
     def public_state(self) -> dict[str, Any]:
         with self.lock:
-            return {"config": dict(self.config), "monitor": json_safe(dict(self.state)), "events": self.events(50), "dryRun": True, "ordersEnabled": True, "apiWalletConfigured": API_KEY_FILE.exists(), "liveLimits": {"market": LIVE_MARKET, "maxNotional": 20}}
+            return {"config": dict(self.config), "monitor": json_safe(dict(self.state)), "events": self.events(50), "dryRun": not bool((self.state.get("snapshot") or {}).get("live")), "ordersEnabled": True, "apiWalletConfigured": API_KEY_FILE.exists(), "autoLimits": {"stepPercent": 0.5, "maxPositionNotional": 600, "minOrderNotional": 10}, "liveLimits": {"market": LIVE_MARKET, "maxNotional": 20}}
 
 
 MONITOR = NeutralisMonitor()
@@ -795,6 +924,10 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/monitor/start":
                 MONITOR.start()
                 return self.send_json({"ok": True}, HTTPStatus.ACCEPTED)
+            if path == "/api/monitor/start-live":
+                incoming = self.read_json()
+                MONITOR.start(live=True, confirmation=str(incoming.get("confirmation", "")))
+                return self.send_json({"ok": True}, HTTPStatus.ACCEPTED)
             if path == "/api/monitor/stop":
                 MONITOR.stop()
                 return self.send_json({"ok": True})
@@ -813,7 +946,7 @@ def main() -> None:
     prepare_data_permissions()
     port = int(os.environ.get("PORT", "8787"))
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
-    print(f"Neutralis Umbrel dry-run ouvindo na porta {port}")
+    print(f"Neutralis Umbrel ouvindo na porta {port}")
     server.serve_forever()
 
 

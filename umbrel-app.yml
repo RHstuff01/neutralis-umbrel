@@ -1,15 +1,15 @@
 manifestVersion: 1
 id: neutralis-hedge
 name: Neutralis Hedge
-tagline: Monitor dry-run para hedge dinâmico de LPs RWA
+tagline: Hedge dinâmico protegido para LPs RWA
 icon: https://neutralis-rwa-hedge.rafaelherzer.chatgpt.site/favicon.svg
 category: finance
-version: "0.3.3"
+version: "0.4.0"
 port: 8787
 description: >-
   Monitora uma posição de liquidez concentrada na Byreal ou Raydium e a posição
-  correspondente na Hyperliquid. Calcula ajustes virtuais a cada 0,5%,
-  registra eventos e nunca assina ou envia ordens.
+  correspondente na Hyperliquid. Simula ou executa ajustes protegidos a cada
+  0,5%, com redução reduce-only e limite total configurado.
 developer: Neutralis
 website: https://neutralis-rwa-hedge.rafaelherzer.chatgpt.site
 submitter: Neutralis
@@ -17,7 +17,7 @@ submission: https://github.com/getumbrel/umbrel-community-app-store
 repo: https://github.com/getumbrel/umbrel-community-app-store
 support: https://github.com/getumbrel/umbrel-community-app-store/issues
 gallery: []
-releaseNotes: Mantém a prévia da ordem válida por 30 segundos e revalida posição, preço e limite antes do envio, evitando divergência causada por pequenas oscilações do mark.
+releaseNotes: Adiciona monitor real opcional para COINX/COIN, sem ordem inicial, com gatilhos de 0,5%, IOC, compras reduce-only, confirmação manual e limite total de short de US$ 600.
 dependencies: []
 path: ""
 defaultUsername: ""
