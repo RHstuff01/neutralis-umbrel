@@ -45,7 +45,7 @@ SOLANA_PATTERN = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 EVM_PATTERN = re.compile(r"^0x[0-9a-fA-F]{40}$")
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{1,15}$")
 STABLE_SYMBOLS = {"USD", "USDC", "USDT", "USDS", "PYUSD"}
-SYMBOL_ALIASES = {"AAPLX": "AAPL", "CRCLX": "CRCL"}
+SYMBOL_ALIASES = {"AAPLX": "AAPL", "CRCLX": "CRCL", "COINX": "COIN"}
 KNOWN_MINTS = {
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
     "XsueG8BtpquVJX9LVLLEGuViXUungE6WmK5YZ3p3bd1": "CRCLX",
