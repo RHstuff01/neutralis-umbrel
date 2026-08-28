@@ -115,10 +115,24 @@ class NeutralisTests(unittest.TestCase):
         self.assertGreater(below, center)
         self.assertGreater(center, above)
 
-    def test_service_contains_no_trading_endpoint(self):
-        source = SERVER_PATH.read_text(encoding="utf-8")
-        self.assertNotIn("/exchange", source)
-        self.assertNotIn("private_key", source.lower())
+    def test_api_wallet_key_is_never_returned(self):
+        key = "11" * 32
+        result = server.MONITOR.save_api_key({"privateKey": key})
+        self.assertEqual(result, {"configured": True})
+        self.assertNotIn(key, str(server.MONITOR.public_state()))
+
+    def test_api_wallet_rejects_invalid_key(self):
+        with self.assertRaisesRegex(server.NeutralisError, "inválida"):
+            server.MONITOR.save_api_key({"privateKey": "segredo"})
+
+    def test_live_preview_never_exceeds_twenty_dollars(self):
+        position = {"hedgeSymbol": "CRCL"}
+        hyp = server.HypState("xyz:CRCL", 3, Decimal("100"), Decimal("100"), Decimal("0"), 0)
+        snapshot = (position, hyp, Decimal("90"), Decimal("110"), Decimal("1"), Decimal("1"))
+        with patch.object(server.MONITOR, "_live_snapshot", return_value=snapshot):
+            preview = server.MONITOR.order_preview()
+        self.assertLessEqual(Decimal(str(preview["notional"])), Decimal("20"))
+        self.assertEqual(preview["market"], "xyz:CRCL")
 
 
 if __name__ == "__main__":
