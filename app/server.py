@@ -54,6 +54,24 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def prepare_data_permissions() -> None:
+    """Prepara o volume criado pelo Umbrel e abandona privilégios de root."""
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return
+    runtime_uid = int(os.environ.get("NEUTRALIS_UID", "1000"))
+    runtime_gid = int(os.environ.get("NEUTRALIS_GID", "1000"))
+    DATA_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chown(DATA_DIR, runtime_uid, runtime_gid)
+    os.chmod(DATA_DIR, 0o700)
+    for path in (CONFIG_FILE, LOG_FILE):
+        if path.exists():
+            os.chown(path, runtime_uid, runtime_gid)
+            os.chmod(path, 0o600)
+    os.setgroups([])
+    os.setgid(runtime_gid)
+    os.setuid(runtime_uid)
+
+
 def decimal(value: Any, field: str) -> Decimal:
     try:
         result = Decimal(str(value))
@@ -709,6 +727,7 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 def main() -> None:
+    prepare_data_permissions()
     port = int(os.environ.get("PORT", "8787"))
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print(f"Neutralis Umbrel dry-run ouvindo na porta {port}")
