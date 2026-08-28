@@ -2,7 +2,8 @@ services:
   neutralis:
     build:
       context: .
-    image: neutralis-umbrel:0.2.1
+    image: neutralis-umbrel:0.2.5
+    user: "0:0"
     container_name: neutralis
     restart: unless-stopped
     stop_grace_period: 15s
@@ -13,10 +14,10 @@ services:
     environment:
       PORT: "8787"
       NEUTRALIS_DATA_DIR: /data
+      NEUTRALIS_UID: "1000"
+      NEUTRALIS_GID: "1000"
     read_only: true
     tmpfs:
       - /tmp:size=16m,noexec,nosuid
-    cap_drop:
-      - ALL
     security_opt:
       - no-new-privileges:true
