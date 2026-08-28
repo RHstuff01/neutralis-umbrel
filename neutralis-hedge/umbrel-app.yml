@@ -4,7 +4,7 @@ name: Neutralis Hedge
 tagline: Monitor dry-run para hedge dinâmico de LPs RWA
 icon: https://neutralis-rwa-hedge.rafaelherzer.chatgpt.site/favicon.svg
 category: finance
-version: "0.3.1"
+version: "0.3.2"
 port: 8787
 description: >-
   Monitora uma posição de liquidez concentrada na Byreal ou Raydium e a posição
