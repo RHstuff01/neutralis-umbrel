@@ -27,6 +27,7 @@ DATA_DIR = Path(os.environ.get("NEUTRALIS_DATA_DIR", "/data"))
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 CONFIG_FILE = DATA_DIR / "config.json"
 LOG_FILE = DATA_DIR / "events.jsonl"
+API_KEY_FILE = DATA_DIR / "hyperliquid-api-wallet.key"
 BYREAL_URL = "https://api2.byreal.io/byreal/api/dex/v2/position/list"
 HYP_INFO_URL = "https://api.hyperliquid.xyz/info"
 SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -34,6 +35,11 @@ RAYDIUM_MINT_URL = "https://api-v3.raydium.io/mint/ids"
 RAYDIUM_CLMM_PROGRAM = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
 DEFAULT_SOLANA_WALLET = "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw"
 DEFAULT_HYP_ACCOUNT = "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF"
+LIVE_MARKET = "xyz:CRCL"
+LIVE_SYMBOL = "CRCL"
+MAX_LIVE_NOTIONAL = Decimal("20")
+LIVE_SLIPPAGE = Decimal("0.003")
+PRIVATE_KEY_PATTERN = re.compile(r"^(?:0x)?[0-9a-fA-F]{64}$")
 SOLANA_PATTERN = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 EVM_PATTERN = re.compile(r"^0x[0-9a-fA-F]{40}$")
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{1,15}$")
@@ -479,6 +485,68 @@ class NeutralisMonitor:
             os.chmod(CONFIG_FILE, 0o600)
             return dict(self.config)
 
+    def save_api_key(self, incoming: dict[str, Any]) -> dict[str, Any]:
+        key = str(incoming.get("privateKey", "")).strip()
+        if not PRIVATE_KEY_PATTERN.fullmatch(key):
+            raise NeutralisError("Chave privada da API Wallet inválida")
+        normalized = key if key.startswith("0x") else f"0x{key}"
+        API_KEY_FILE.write_text(normalized, encoding="ascii")
+        os.chmod(API_KEY_FILE, 0o600)
+        return {"configured": True}
+
+    def _api_key(self) -> str:
+        try:
+            key = API_KEY_FILE.read_text(encoding="ascii").strip()
+        except OSError as error:
+            raise NeutralisError("Cadastre a chave da API Wallet no Umbrel") from error
+        if not PRIVATE_KEY_PATTERN.fullmatch(key):
+            raise NeutralisError("Chave da API Wallet armazenada é inválida")
+        return key if key.startswith("0x") else f"0x{key}"
+
+    def order_preview(self) -> dict[str, Any]:
+        position, hyp, lower, upper, liquidity, target = self._live_snapshot()
+        if position["hedgeSymbol"] != LIVE_SYMBOL or hyp.market.lower() != LIVE_MARKET.lower():
+            raise NeutralisError(f"Execução permitida somente em {LIVE_MARKET}")
+        if hyp.open_orders:
+            raise NeutralisError("Cancele as ordens abertas antes do teste")
+        if hyp.signed_position > 0:
+            raise NeutralisError("A conta está long; o teste foi bloqueado")
+        current_short = abs(min(hyp.signed_position, Decimal("0")))
+        maximum_short = (MAX_LIVE_NOTIONAL / hyp.mark).quantize(Decimal(1).scaleb(-hyp.decimals), rounding=ROUND_DOWN)
+        desired_short = min(target, maximum_short)
+        difference = desired_short - current_short
+        size = abs(difference).quantize(Decimal(1).scaleb(-hyp.decimals), rounding=ROUND_DOWN)
+        if size <= 0:
+            raise NeutralisError("Nenhum ajuste é necessário dentro do limite de US$ 20")
+        is_buy = difference < 0
+        size = min(size, maximum_short)
+        if is_buy:
+            size = min(size, current_short)
+        limit_price = hyp.mark * (Decimal("1") + LIVE_SLIPPAGE if is_buy else Decimal("1") - LIVE_SLIPPAGE)
+        limit_price = Decimal(f"{limit_price:.5g}")
+        notional = size * hyp.mark
+        if notional < Decimal("10"):
+            raise NeutralisError("A ordem calculada é menor que o mínimo de US$ 10 da Hyperliquid")
+        action = "COMPRAR" if is_buy else "VENDER"
+        confirmation = f"CONFIRMO {action} {size} CRCL ATE {limit_price}"
+        return json_safe({"market": LIVE_MARKET, "action": action, "isBuy": is_buy, "size": size, "mark": hyp.mark, "limitPrice": limit_price, "notional": notional, "reduceOnly": is_buy, "confirmation": confirmation, "maxNotional": MAX_LIVE_NOTIONAL})
+
+    def execute_test_order(self, incoming: dict[str, Any]) -> dict[str, Any]:
+        preview = self.order_preview()
+        if str(incoming.get("confirmation", "")).strip() != preview["confirmation"]:
+            raise NeutralisError("Confirmação não corresponde exatamente à prévia atual")
+        try:
+            from eth_account import Account
+            from hyperliquid.exchange import Exchange
+            from hyperliquid.utils.constants import MAINNET_API_URL
+        except ImportError as error:
+            raise NeutralisError("SDK da Hyperliquid não está disponível") from error
+        wallet = Account.from_key(self._api_key())
+        exchange = Exchange(wallet, MAINNET_API_URL, account_address=self.config["hyperliquidAccount"], perp_dexs=["xyz"])
+        response = exchange.order(LIVE_MARKET, bool(preview["isBuy"]), float(preview["size"]), float(preview["limitPrice"]), {"limit": {"tif": "Ioc"}}, reduce_only=bool(preview["reduceOnly"]))
+        self._event("live-order", f"ORDEM REAL {preview['action']} {preview['size']} CRCL", response=response)
+        return {"preview": preview, "response": response}
+
     def positions(self) -> list[dict[str, Any]]:
         if self.config["source"] == "raydium":
             position = self.config["positionAddress"]
@@ -640,7 +708,7 @@ class NeutralisMonitor:
 
     def public_state(self) -> dict[str, Any]:
         with self.lock:
-            return {"config": dict(self.config), "monitor": json_safe(dict(self.state)), "events": self.events(50), "dryRun": True, "ordersEnabled": False}
+            return {"config": dict(self.config), "monitor": json_safe(dict(self.state)), "events": self.events(50), "dryRun": True, "ordersEnabled": True, "apiWalletConfigured": API_KEY_FILE.exists(), "liveLimits": {"market": LIVE_MARKET, "maxNotional": 20}}
 
 
 MONITOR = NeutralisMonitor()
@@ -680,6 +748,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(MONITOR.public_state())
             if path == "/api/positions":
                 return self.send_json({"positions": MONITOR.positions(), "updatedAt": now_iso()})
+            if path == "/api/trading/preview":
+                return self.send_json({"order": MONITOR.order_preview()})
             if path == "/api/events":
                 limit = int(parse_qs(urlparse(self.path).query).get("limit", ["100"])[0])
                 return self.send_json({"events": MONITOR.events(limit)})
@@ -700,6 +770,10 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             if path == "/api/config":
                 return self.send_json({"config": MONITOR.save_config(self.read_json())})
+            if path == "/api/trading/key":
+                return self.send_json(MONITOR.save_api_key(self.read_json()))
+            if path == "/api/trading/execute-test":
+                return self.send_json(MONITOR.execute_test_order(self.read_json()), HTTPStatus.ACCEPTED)
             if path == "/api/monitor/start":
                 MONITOR.start()
                 return self.send_json({"ok": True}, HTTPStatus.ACCEPTED)
