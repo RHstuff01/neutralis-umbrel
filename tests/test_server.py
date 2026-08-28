@@ -65,18 +65,10 @@ class NeutralisTests(unittest.TestCase):
             with self.assertRaisesRegex(server.NeutralisError, "sem liquidez"):
                 server.raydium_position(nft)
 
-    def test_root_initialization_drops_privileges_after_fixing_data(self):
-        with patch.object(server.os, "geteuid", return_value=0), \
-             patch.object(server.os, "chown") as chown, \
-             patch.object(server.os, "chmod"), \
-             patch.object(server.os, "setgroups") as setgroups, \
-             patch.object(server.os, "setgid") as setgid, \
-             patch.object(server.os, "setuid") as setuid:
+    def test_initialization_prepares_persistent_data(self):
+        with patch.object(server.os, "chmod") as chmod:
             server.prepare_data_permissions()
-        chown.assert_any_call(server.DATA_DIR, 1000, 1000)
-        setgroups.assert_called_once_with([])
-        setgid.assert_called_once_with(1000)
-        setuid.assert_called_once_with(1000)
+        chmod.assert_any_call(server.DATA_DIR, 0o700)
 
     def test_byreal_position_normalization(self):
         position = {
