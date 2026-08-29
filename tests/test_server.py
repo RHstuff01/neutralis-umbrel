@@ -66,6 +66,40 @@ class NeutralisTests(unittest.TestCase):
             with self.assertRaisesRegex(server.NeutralisError, "sem liquidez"):
                 server.raydium_position(nft)
 
+    def test_orca_position_is_decoded_from_official_layout(self):
+        nft = "6cHCWbDnkHehmYh8LcfwKTDdq9ncHGnVuTAVNAQ5kPEw"
+        pool = "GYqHjuDzTiw7i52Xv1qohDE6eJr6eSZpsrBVikGZyaFV"
+        mint_a = "XsueG8BtpquVJX9LVLLEGuViXUungE6WmK5YZ3p3bd1"
+        mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        position_data = bytearray(216)
+        position_data[:8] = server.ORCA_POSITION_DISCRIMINATOR
+        position_data[8:40] = server.base58_decode(pool)
+        position_data[40:72] = server.base58_decode(nft)
+        position_data[72:88] = (10**12).to_bytes(16, "little")
+        position_data[88:92] = (44480).to_bytes(4, "little", signed=True)
+        position_data[92:96] = (46480).to_bytes(4, "little", signed=True)
+        pool_data = bytearray(653)
+        pool_data[65:81] = int((95**0.5) * 2**64).to_bytes(16, "little")
+        pool_data[101:133] = server.base58_decode(mint_a)
+        pool_data[181:213] = server.base58_decode(mint_b)
+        mint_a_data, mint_b_data = bytearray(82), bytearray(82)
+        mint_a_data[44] = mint_b_data[44] = 6
+        with patch.object(server, "solana_account", side_effect=[bytes(pool_data), bytes(mint_a_data), bytes(mint_b_data)]):
+            result = server.orca_position(nft, bytes(position_data))
+        self.assertEqual(result["source"], "orca")
+        self.assertEqual(result["pair"], "CRCLX / USDC")
+        self.assertEqual(result["hedgeSymbol"], "CRCL")
+        self.assertTrue(result["importable"])
+
+    def test_orca_discovers_classic_and_token_2022_position_nfts(self):
+        wallet = "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw"
+        classic = "6cHCWbDnkHehmYh8LcfwKTDdq9ncHGnVuTAVNAQ5kPEw"
+        token_2022 = "CNJt5jfTNps9HxE6CRgefvFCTrNdYAcetJSEosaLHzq4"
+        def payload(mint):
+            return {"result": {"value": [{"account": {"data": {"parsed": {"info": {"mint": mint, "tokenAmount": {"amount": "1", "decimals": 0}}}}}}]}}
+        with patch.object(server, "json_request", side_effect=[payload(classic), payload(token_2022)]):
+            self.assertEqual(server.solana_nft_mints(wallet), sorted([classic, token_2022]))
+
     def test_initialization_prepares_persistent_data(self):
         with patch.object(server.os, "chmod") as chmod:
             server.prepare_data_permissions()
@@ -163,15 +197,6 @@ class NeutralisTests(unittest.TestCase):
         with self.assertRaisesRegex(server.NeutralisError, "inválida"):
             server.MONITOR.save_api_key({"privateKey": "segredo"})
 
-    def test_live_preview_never_exceeds_twenty_dollars(self):
-        position = {"hedgeSymbol": "CRCL"}
-        hyp = server.HypState("xyz:CRCL", 3, Decimal("100"), Decimal("100"), Decimal("0"), 0)
-        snapshot = (position, hyp, Decimal("90"), Decimal("110"), Decimal("1"), Decimal("1"))
-        with patch.object(server.MONITOR, "_live_snapshot", return_value=snapshot):
-            preview = server.MONITOR.order_preview()
-        self.assertLessEqual(Decimal(str(preview["notional"])), Decimal("20"))
-        self.assertEqual(preview["market"], "xyz:CRCL")
-
     def test_auto_adjustment_waits_below_hyperliquid_minimum(self):
         position = {"hedgeSymbol": "COIN"}
         hyp = server.HypState("xyz:COIN", 3, Decimal("176"), Decimal("176"), Decimal("-2.740"), 0)
@@ -253,6 +278,26 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(events, ["start"])
         self.assertEqual(server.MONITOR.state["snapshot"]["anchor"], 176.0)
         self.assertEqual(server.MONITOR.state["snapshot"]["virtualShort"], 2.74)
+
+    def test_live_monitor_reconciles_initial_delta_before_setting_anchor(self):
+        position = {
+            "positionAddress": "position",
+            "assetSymbol": "COINX",
+            "hedgeSymbol": "COIN",
+            "currentPrice": Decimal("176"),
+        }
+        initial = server.HypState("xyz:COIN", 3, Decimal("176"), Decimal("176"), Decimal("-2.740"), 0)
+        corrected = server.HypState("xyz:COIN", 3, Decimal("176.1"), Decimal("176.1"), Decimal("-2.600"), 0)
+        before = (position, initial, Decimal("159"), Decimal("195"), Decimal("755"), Decimal("2.600"))
+        after = (position, corrected, Decimal("159"), Decimal("195"), Decimal("755"), Decimal("2.600"))
+        result = {"currentShort": Decimal("2.600"), "anchor": Decimal("176.1")}
+        events = []
+        with patch.object(server.MONITOR, "_live_snapshot", side_effect=[before, after]), patch.object(server.MONITOR, "_execute_auto_adjustment", return_value=result) as adjustment, patch.object(server.MONITOR.stop_event, "wait", return_value=True), patch.object(server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)):
+            server.MONITOR._run(live=True)
+        adjustment.assert_called_once_with(position, initial, Decimal("2.600"))
+        self.assertEqual(events, ["initial-reconciliation", "start-live"])
+        self.assertEqual(server.MONITOR.state["snapshot"]["anchor"], 176.1)
+        self.assertEqual(server.MONITOR.state["snapshot"]["realShort"], 2.6)
 
 
 if __name__ == "__main__":

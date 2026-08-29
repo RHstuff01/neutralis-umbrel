@@ -9,9 +9,7 @@ import hashlib
 import math
 import os
 import re
-import secrets
 import threading
-import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -34,12 +32,14 @@ BYREAL_MINT_LIST_URL = "https://api2.byreal.io/byreal/api/dex/v2/mint/list"
 HYP_INFO_URL = "https://api.hyperliquid.xyz/info"
 SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 RAYDIUM_MINT_URL = "https://api-v3.raydium.io/mint/ids"
+ORCA_TOKEN_URL = "https://api.orca.so/v2/solana/tokens"
 RAYDIUM_CLMM_PROGRAM = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+ORCA_WHIRLPOOL_PROGRAM = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+SPL_TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+ORCA_POSITION_DISCRIMINATOR = bytes.fromhex("aabc8fe47a40f7d0")
 DEFAULT_SOLANA_WALLET = "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw"
 DEFAULT_HYP_ACCOUNT = "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF"
-LIVE_MARKET = "xyz:CRCL"
-LIVE_SYMBOL = "CRCL"
-MAX_LIVE_NOTIONAL = Decimal("20")
 LIVE_SLIPPAGE = Decimal("0.003")
 AUTO_STEP = Decimal("0.005")
 AUTO_MAX_POSITION_NOTIONAL = Decimal("600")
@@ -157,26 +157,36 @@ def is_ed25519_point(value: bytes) -> bool:
     return x_squared == 0 or pow(x_squared, (prime - 1) // 2, prime) == 1
 
 
-def raydium_position_pda(nft_mint: str) -> str:
+def position_pda(nft_mint: str, program_id: str) -> str:
     mint = base58_decode(nft_mint)
-    program = base58_decode(RAYDIUM_CLMM_PROGRAM)
+    program = base58_decode(program_id)
     if len(mint) != 32 or len(program) != 32:
-        raise NeutralisError("NFT da posição Raydium inválido")
+        raise NeutralisError("NFT da posição inválido")
     for bump in range(255, -1, -1):
         digest = hashlib.sha256(b"position" + mint + bytes([bump]) + program + b"ProgramDerivedAddress").digest()
         if not is_ed25519_point(digest):
             return base58_encode(digest)
-    raise NeutralisError("Não foi possível derivar a posição Raydium")
+    raise NeutralisError("Não foi possível derivar a posição")
 
 
-def solana_account(address: str) -> bytes:
+def raydium_position_pda(nft_mint: str) -> str:
+    return position_pda(nft_mint, RAYDIUM_CLMM_PROGRAM)
+
+
+def orca_position_pda(nft_mint: str) -> str:
+    return position_pda(nft_mint, ORCA_WHIRLPOOL_PROGRAM)
+
+
+def solana_account(address: str, expected_owner: str | None = None) -> bytes:
     response = json_request(SOLANA_RPC_URL, {
         "jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
         "params": [address, {"encoding": "base64", "commitment": "confirmed"}],
     })
     value = response.get("result", {}).get("value") if isinstance(response, dict) else None
     if not isinstance(value, dict) or not isinstance(value.get("data"), list):
-        raise NeutralisError("Conta da posição Raydium não encontrada")
+        raise NeutralisError("Conta Solana não encontrada")
+    if expected_owner and value.get("owner") != expected_owner:
+        raise NeutralisError("Conta Solana pertence a um programa inesperado")
     try:
         return base64.b64decode(value["data"][0], validate=True)
     except Exception as error:
@@ -186,8 +196,31 @@ def solana_account(address: str) -> bytes:
 def public_key_at(data: bytes, offset: int) -> str:
     value = data[offset : offset + 32]
     if len(value) != 32:
-        raise NeutralisError("Conta Raydium incompleta")
+        raise NeutralisError("Conta Solana incompleta")
     return base58_encode(value)
+
+
+def solana_accounts(addresses: list[str], expected_owner: str | None = None) -> dict[str, bytes]:
+    result: dict[str, bytes] = {}
+    for start in range(0, len(addresses), 100):
+        chunk = addresses[start : start + 100]
+        response = json_request(SOLANA_RPC_URL, {
+            "jsonrpc": "2.0", "id": 1, "method": "getMultipleAccounts",
+            "params": [chunk, {"encoding": "base64", "commitment": "confirmed"}],
+        })
+        values = response.get("result", {}).get("value") if isinstance(response, dict) else None
+        if not isinstance(values, list) or len(values) != len(chunk):
+            raise NeutralisError("Resposta incompleta da rede Solana")
+        for address, value in zip(chunk, values):
+            if not isinstance(value, dict) or not isinstance(value.get("data"), list):
+                continue
+            if expected_owner and value.get("owner") != expected_owner:
+                continue
+            try:
+                result[address] = base64.b64decode(value["data"][0], validate=True)
+            except Exception as error:
+                raise NeutralisError("Resposta inválida da rede Solana") from error
+    return result
 
 
 def raydium_symbols(mints: list[str]) -> dict[str, str]:
@@ -208,6 +241,26 @@ def raydium_symbols(mints: list[str]) -> dict[str, str]:
                     symbols[address] = symbol
     except NeutralisError:
         pass
+    return symbols
+
+
+def orca_symbols(mints: list[str]) -> dict[str, str]:
+    symbols = {mint: KNOWN_MINTS[mint] for mint in mints if mint in KNOWN_MINTS}
+    missing = [mint for mint in mints if mint not in symbols]
+    if missing:
+        try:
+            root = json_request(ORCA_TOKEN_URL + "?" + urlencode({"tokens": ",".join(missing), "size": len(missing)}))
+            rows = root.get("data", []) if isinstance(root, dict) else []
+            for row in rows if isinstance(rows, list) else []:
+                address = str(row.get("address") or "") if isinstance(row, dict) else ""
+                symbol = str(row.get("symbol") or "").upper() if isinstance(row, dict) else ""
+                if address in missing and symbol:
+                    symbols[address] = symbol
+        except NeutralisError:
+            pass
+    unresolved = [mint for mint in mints if mint not in symbols]
+    if unresolved:
+        symbols.update(raydium_symbols(unresolved))
     return symbols
 
 
@@ -290,6 +343,131 @@ def raydium_position(nft_mint: str) -> dict[str, Any]:
         "basisWarning": asset_symbol != hyp_symbol(asset_symbol),
         "importable": bool(asset_symbol and 0 < lower_price < upper_price and raw_liquidity > 0),
     }
+
+
+def solana_nft_mints(wallet: str) -> list[str]:
+    if not SOLANA_PATTERN.fullmatch(wallet):
+        raise NeutralisError("Carteira Solana inválida")
+    mints: set[str] = set()
+    successful_queries = 0
+    for program_id in (SPL_TOKEN_PROGRAM, TOKEN_2022_PROGRAM):
+        try:
+            response = json_request(SOLANA_RPC_URL, {
+                "jsonrpc": "2.0", "id": 1, "method": "getTokenAccountsByOwner",
+                "params": [wallet, {"programId": program_id}, {"encoding": "jsonParsed", "commitment": "confirmed"}],
+            })
+        except NeutralisError:
+            continue
+        successful_queries += 1
+        rows = response.get("result", {}).get("value") if isinstance(response, dict) else None
+        for row in rows if isinstance(rows, list) else []:
+            info = row.get("account", {}).get("data", {}).get("parsed", {}).get("info", {}) if isinstance(row, dict) else {}
+            amount = info.get("tokenAmount", {}) if isinstance(info, dict) else {}
+            mint = str(info.get("mint") or "") if isinstance(info, dict) else ""
+            if amount.get("decimals") == 0 and str(amount.get("amount")) == "1" and SOLANA_PATTERN.fullmatch(mint):
+                mints.add(mint)
+    if not successful_queries:
+        raise NeutralisError("Falha ao consultar os NFTs da carteira Solana")
+    return sorted(mints)
+
+
+def orca_position(nft_mint: str, position_data: bytes | None = None) -> dict[str, Any]:
+    if not SOLANA_PATTERN.fullmatch(nft_mint):
+        raise NeutralisError("NFT da posição Orca inválido")
+    position_address = orca_position_pda(nft_mint)
+    data = position_data if position_data is not None else solana_account(position_address, ORCA_WHIRLPOOL_PROGRAM)
+    if len(data) < 96 or data[:8] != ORCA_POSITION_DISCRIMINATOR:
+        raise NeutralisError("Conta da posição Orca inválida")
+    pool_address = public_key_at(data, 8)
+    stored_nft = public_key_at(data, 40)
+    raw_liquidity = int.from_bytes(data[72:88], "little")
+    tick_lower = int.from_bytes(data[88:92], "little", signed=True)
+    tick_upper = int.from_bytes(data[92:96], "little", signed=True)
+    if stored_nft != nft_mint:
+        raise NeutralisError("O NFT não corresponde à posição Orca")
+    if not (-443636 <= tick_lower < tick_upper <= 443636):
+        raise NeutralisError("Faixa de ticks inválida na posição Orca")
+    if raw_liquidity <= 0:
+        raise NeutralisError("A posição Orca está sem liquidez")
+
+    pool_data = solana_account(pool_address, ORCA_WHIRLPOOL_PROGRAM)
+    if len(pool_data) < 213:
+        raise NeutralisError("Conta do Whirlpool Orca incompleta")
+    sqrt_price_x64 = int.from_bytes(pool_data[65:81], "little")
+    mint_a, mint_b = public_key_at(pool_data, 101), public_key_at(pool_data, 181)
+    if sqrt_price_x64 <= 0:
+        raise NeutralisError("Preço inválido no Whirlpool Orca")
+    mint_a_data, mint_b_data = solana_account(mint_a), solana_account(mint_b)
+    if len(mint_a_data) < 45 or len(mint_b_data) < 45:
+        raise NeutralisError("Mint da posição Orca incompleto")
+    decimals_a, decimals_b = mint_a_data[44], mint_b_data[44]
+    symbols = orca_symbols([mint_a, mint_b])
+    symbol_a, symbol_b = symbols.get(mint_a, ""), symbols.get(mint_b, "")
+    stable_a, stable_b = symbol_a in STABLE_SYMBOLS, symbol_b in STABLE_SYMBOLS
+    if stable_a == stable_b:
+        raise NeutralisError("A LP Orca precisa ter um ativo e uma cotação estável reconhecida")
+
+    scale = 10 ** (decimals_a - decimals_b)
+    raw_price = (sqrt_price_x64 / 2**64) ** 2
+    price_b_per_a = raw_price * scale
+    tick_lower_price = (1.0001**tick_lower) * scale
+    tick_upper_price = (1.0001**tick_upper) * scale
+    sqrt_current, sqrt_lower, sqrt_upper = math.sqrt(raw_price), math.sqrt(1.0001**tick_lower), math.sqrt(1.0001**tick_upper)
+    if sqrt_current <= sqrt_lower:
+        amount_a_raw = raw_liquidity * (sqrt_upper - sqrt_lower) / (sqrt_lower * sqrt_upper)
+        amount_b_raw = 0.0
+    elif sqrt_current >= sqrt_upper:
+        amount_a_raw = 0.0
+        amount_b_raw = raw_liquidity * (sqrt_upper - sqrt_lower)
+    else:
+        amount_a_raw = raw_liquidity * (sqrt_upper - sqrt_current) / (sqrt_current * sqrt_upper)
+        amount_b_raw = raw_liquidity * (sqrt_current - sqrt_lower)
+    amount_a, amount_b = amount_a_raw / 10**decimals_a, amount_b_raw / 10**decimals_b
+
+    if stable_b:
+        asset_symbol, quote_symbol = symbol_a, symbol_b
+        lower_price, upper_price, current_price = tick_lower_price, tick_upper_price, price_b_per_a
+        asset_amount, quote_amount = amount_a, amount_b
+    else:
+        asset_symbol, quote_symbol = symbol_b, symbol_a
+        lower_price, upper_price, current_price = 1 / tick_upper_price, 1 / tick_lower_price, 1 / price_b_per_a
+        asset_amount, quote_amount = amount_b, amount_a
+    liquidity_usd = asset_amount * current_price + quote_amount
+    normalized_liquidity = raw_liquidity / (10 ** ((decimals_a + decimals_b) / 2))
+    return {
+        "source": "orca",
+        "positionAddress": nft_mint,
+        "personalPositionAddress": position_address,
+        "poolAddress": pool_address,
+        "pair": f"{asset_symbol} / {quote_symbol}",
+        "assetSymbol": asset_symbol,
+        "hedgeSymbol": hyp_symbol(asset_symbol),
+        "quoteSymbol": quote_symbol,
+        "liquidityUsd": liquidity_usd,
+        "lowerPrice": lower_price,
+        "upperPrice": upper_price,
+        "currentPrice": current_price,
+        "assetAmount": asset_amount,
+        "quoteAmount": quote_amount,
+        "normalizedLiquidity": normalized_liquidity,
+        "basisWarning": asset_symbol != hyp_symbol(asset_symbol),
+        "importable": bool(asset_symbol and 0 < lower_price < upper_price and raw_liquidity > 0),
+    }
+
+
+def orca_positions(wallet: str) -> list[dict[str, Any]]:
+    nft_mints = solana_nft_mints(wallet)
+    derived = {orca_position_pda(mint): mint for mint in nft_mints}
+    accounts = solana_accounts(list(derived), ORCA_WHIRLPOOL_PROGRAM)
+    positions = []
+    for address, data in accounts.items():
+        if len(data) < 96 or data[:8] != ORCA_POSITION_DISCRIMINATOR:
+            continue
+        try:
+            positions.append(orca_position(derived[address], data))
+        except NeutralisError:
+            continue
+    return positions
 
 
 def token_metadata(pool: dict[str, Any], side: str) -> dict[str, Any]:
@@ -506,7 +684,6 @@ class NeutralisMonitor:
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
-        self.pending_order: dict[str, Any] | None = None
         self.execution_lock = threading.Lock()
         self.config = self._load_config()
         self.state: dict[str, Any] = {
@@ -536,7 +713,7 @@ class NeutralisMonitor:
         wallet = str(incoming.get("solanaWallet", self.config["solanaWallet"]))
         account = str(incoming.get("hyperliquidAccount", self.config["hyperliquidAccount"]))
         position = str(incoming.get("positionAddress", self.config["positionAddress"]))
-        if source not in {"byreal", "raydium"}:
+        if source not in {"byreal", "raydium", "orca"}:
             raise NeutralisError("Fonte de liquidez inválida")
         if not SOLANA_PATTERN.fullmatch(wallet):
             raise NeutralisError("Carteira Solana inválida")
@@ -569,66 +746,6 @@ class NeutralisMonitor:
         if not PRIVATE_KEY_PATTERN.fullmatch(key):
             raise NeutralisError("Chave da API Wallet armazenada é inválida")
         return key if key.startswith("0x") else f"0x{key}"
-
-    def order_preview(self) -> dict[str, Any]:
-        position, hyp, lower, upper, liquidity, target = self._live_snapshot()
-        if position["hedgeSymbol"] != LIVE_SYMBOL or hyp.market.lower() != LIVE_MARKET.lower():
-            raise NeutralisError(f"Execução permitida somente em {LIVE_MARKET}")
-        if hyp.open_orders:
-            raise NeutralisError("Cancele as ordens abertas antes do teste")
-        if hyp.signed_position > 0:
-            raise NeutralisError("A conta está long; o teste foi bloqueado")
-        current_short = abs(min(hyp.signed_position, Decimal("0")))
-        maximum_short = (MAX_LIVE_NOTIONAL / hyp.mark).quantize(Decimal(1).scaleb(-hyp.decimals), rounding=ROUND_DOWN)
-        desired_short = min(target, maximum_short)
-        difference = desired_short - current_short
-        size = abs(difference).quantize(Decimal(1).scaleb(-hyp.decimals), rounding=ROUND_DOWN)
-        if size <= 0:
-            raise NeutralisError("Nenhum ajuste é necessário dentro do limite de US$ 20")
-        is_buy = difference < 0
-        size = min(size, maximum_short)
-        if is_buy:
-            size = min(size, current_short)
-        limit_price = hyp.mark * (Decimal("1") + LIVE_SLIPPAGE if is_buy else Decimal("1") - LIVE_SLIPPAGE)
-        limit_price = Decimal(f"{limit_price:.5g}")
-        notional = size * hyp.mark
-        if notional < Decimal("10"):
-            raise NeutralisError("A ordem calculada é menor que o mínimo de US$ 10 da Hyperliquid")
-        action = "COMPRAR" if is_buy else "VENDER"
-        confirmation = f"CONFIRMO {action} {size} CRCL ATE {limit_price}"
-        preview = json_safe({"market": LIVE_MARKET, "action": action, "isBuy": is_buy, "size": size, "mark": hyp.mark, "limitPrice": limit_price, "notional": notional, "reduceOnly": is_buy, "confirmation": confirmation, "maxNotional": MAX_LIVE_NOTIONAL, "currentPosition": hyp.signed_position, "token": secrets.token_hex(16), "expiresAt": time.time() + 30})
-        with self.lock:
-            self.pending_order = dict(preview)
-        return preview
-
-    def execute_test_order(self, incoming: dict[str, Any]) -> dict[str, Any]:
-        with self.lock:
-            preview = dict(self.pending_order) if self.pending_order else None
-        if not preview or str(incoming.get("token", "")) != preview["token"] or time.time() > float(preview["expiresAt"]):
-            raise NeutralisError("Prévia expirada; calcule a ordem novamente")
-        if str(incoming.get("confirmation", "")).strip() != preview["confirmation"]:
-            raise NeutralisError("Confirmação não corresponde exatamente à prévia atual")
-        current = hyp_state(self.config["hyperliquidAccount"], LIVE_SYMBOL)
-        if current.open_orders or Decimal(str(current.signed_position)) != Decimal(str(preview["currentPosition"])):
-            raise NeutralisError("A posição ou as ordens mudaram; calcule novamente")
-        if abs(current.mark - Decimal(str(preview["mark"]))) / Decimal(str(preview["mark"])) > Decimal("0.005"):
-            raise NeutralisError("O preço mudou mais de 0,5%; calcule novamente")
-        if Decimal(str(preview["size"])) * current.mark > MAX_LIVE_NOTIONAL:
-            raise NeutralisError("A ordem ultrapassaria o limite atual de US$ 20")
-        with self.lock:
-            self.pending_order = None
-        try:
-            from eth_account import Account
-            from hyperliquid.exchange import Exchange
-            from hyperliquid.utils.constants import MAINNET_API_URL
-        except ImportError as error:
-            missing = getattr(error, "name", None) or str(error)
-            raise NeutralisError(f"SDK da Hyperliquid não está disponível ({missing})") from error
-        wallet = Account.from_key(self._api_key())
-        exchange = Exchange(wallet, MAINNET_API_URL, account_address=self.config["hyperliquidAccount"], perp_dexs=["xyz"])
-        response = exchange.order(LIVE_MARKET, bool(preview["isBuy"]), float(preview["size"]), float(preview["limitPrice"]), {"limit": {"tif": "Ioc"}}, reduce_only=bool(preview["reduceOnly"]))
-        self._event("live-order", f"ORDEM REAL {preview['action']} {preview['size']} CRCL", response=response)
-        return {"preview": preview, "response": response}
 
     def _exchange(self):
         try:
@@ -801,6 +918,8 @@ class NeutralisMonitor:
             if not position:
                 return []
             return [raydium_position(position)]
+        if self.config["source"] == "orca":
+            return orca_positions(self.config["solanaWallet"])
         return byreal_positions(self.config["solanaWallet"])
 
     def _selected_position(self) -> dict[str, Any]:
@@ -886,10 +1005,25 @@ class NeutralisMonitor:
             if hyp.oracle <= 0 or abs(hyp.mark - hyp.oracle) / hyp.oracle > divergence_limit:
                 raise NeutralisError("Mark e oráculo divergiram mais de 0,75%")
             if live and position.get("currentPrice") is None:
-                raise NeutralisError("A Byreal não forneceu preço independente da LP; modo real bloqueado")
+                raise NeutralisError("A fonte não forneceu preço independente da LP; modo real bloqueado")
             lp_price = decimal(position.get("currentPrice") or hyp.mark, "preço da LP")
             if abs(lp_price - hyp.mark) / hyp.mark > divergence_limit:
                 raise NeutralisError("Preço da LP e Hyperliquid divergiram mais de 0,75%")
+            initial_adjusted = False
+            current_short = abs(min(hyp.signed_position, Decimal("0")))
+            initial_residual = abs(target - current_short) * hyp.mark
+            if live and initial_residual >= AUTO_MIN_ORDER_NOTIONAL:
+                self._event(
+                    "initial-reconciliation",
+                    f"CORRIGIR DELTA INICIAL · residual US$ {initial_residual:.2f}",
+                    currentShort=current_short,
+                    target=target,
+                    mark=hyp.mark,
+                )
+                result = self._execute_auto_adjustment(position, hyp, target)
+                initial_adjusted = bool(result)
+                position, hyp, lower, upper, liquidity, target = self._live_snapshot()
+                lp_price = decimal(position.get("currentPrice"), "preço da LP")
             initial_signed = hyp.signed_position
             virtual_short = abs(min(initial_signed, Decimal("0")))
             quantum = Decimal(1).scaleb(-hyp.decimals)
@@ -914,7 +1048,14 @@ class NeutralisMonitor:
             with self.lock:
                 label = "MODO REAL ativo" if live else "Dry-run ativo"
                 self.state.update({"mode": "running", "message": f"{label} · aguardando nível de 0,5%", "snapshot": json_safe(initial_snapshot), "updatedAt": now_iso()})
-            self._event("start-live" if live else "start", f"{'MODO REAL' if live else 'Dry-run'} iniciado em {hyp.market}; nenhuma ordem inicial", mark=hyp.mark, lower=lower, upper=upper, anchor=anchor)
+            start_message = (
+                f"MODO REAL iniciado em {hyp.market}; delta inicial corrigido"
+                if live and initial_adjusted
+                else f"{'MODO REAL' if live else 'Dry-run'} iniciado em {hyp.market}; delta inicial dentro do mínimo negociável"
+                if live
+                else f"Dry-run iniciado em {hyp.market}; nenhuma ordem inicial"
+            )
+            self._event("start-live" if live else "start", start_message, mark=hyp.mark, lower=lower, upper=upper, anchor=anchor)
 
             while not self.stop_event.wait(AUTO_POLL_SECONDS):
                 position_now, hyp_now, lower, upper, liquidity, target = self._live_snapshot()
@@ -985,7 +1126,7 @@ class NeutralisMonitor:
 
     def public_state(self) -> dict[str, Any]:
         with self.lock:
-            return {"config": dict(self.config), "monitor": json_safe(dict(self.state)), "events": self.events(50), "dryRun": not bool((self.state.get("snapshot") or {}).get("live")), "ordersEnabled": True, "apiWalletConfigured": API_KEY_FILE.exists(), "autoLimits": {"stepPercent": 0.5, "pollSeconds": AUTO_POLL_SECONDS, "maxExecutionAttempts": AUTO_MAX_EXECUTION_ATTEMPTS, "maxPositionNotional": 600, "minOrderNotional": 10}, "liveLimits": {"market": LIVE_MARKET, "maxNotional": 20}}
+            return {"config": dict(self.config), "monitor": json_safe(dict(self.state)), "events": self.events(50), "dryRun": not bool((self.state.get("snapshot") or {}).get("live")), "ordersEnabled": True, "apiWalletConfigured": API_KEY_FILE.exists(), "autoLimits": {"stepPercent": 0.5, "pollSeconds": AUTO_POLL_SECONDS, "maxExecutionAttempts": AUTO_MAX_EXECUTION_ATTEMPTS, "maxPositionNotional": 600, "minOrderNotional": 10}}
 
 
 MONITOR = NeutralisMonitor()
@@ -1025,8 +1166,6 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(MONITOR.public_state())
             if path == "/api/positions":
                 return self.send_json({"positions": MONITOR.positions(), "updatedAt": now_iso()})
-            if path == "/api/trading/preview":
-                return self.send_json({"order": MONITOR.order_preview()})
             if path == "/api/events":
                 limit = int(parse_qs(urlparse(self.path).query).get("limit", ["100"])[0])
                 return self.send_json({"events": MONITOR.events(limit)})
@@ -1049,8 +1188,6 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"config": MONITOR.save_config(self.read_json())})
             if path == "/api/trading/key":
                 return self.send_json(MONITOR.save_api_key(self.read_json()))
-            if path == "/api/trading/execute-test":
-                return self.send_json(MONITOR.execute_test_order(self.read_json()), HTTPStatus.ACCEPTED)
             if path == "/api/monitor/start":
                 MONITOR.start()
                 return self.send_json({"ok": True}, HTTPStatus.ACCEPTED)
