@@ -5,7 +5,7 @@ services:
       APP_PORT: 8787
 
   server:
-    image: ghcr.io/rhstuff01/neutralis-umbrel:0.5.0
+    image: ghcr.io/rhstuff01/neutralis-umbrel:0.5.1
     user: "0:0"
     restart: on-failure
     stop_grace_period: 15s

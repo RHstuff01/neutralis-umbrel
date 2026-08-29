@@ -100,6 +100,36 @@ class NeutralisTests(unittest.TestCase):
         with patch.object(server, "json_request", side_effect=[payload(classic), payload(token_2022)]):
             self.assertEqual(server.solana_nft_mints(wallet), sorted([classic, token_2022]))
 
+    def test_orca_accepts_personal_position_account(self):
+        position_address = "3obGz9gF9MTcvyebAofE1bS21fTA1sfV9KFBJMsfvfTK"
+        nft = "6cHCWbDnkHehmYh8LcfwKTDdq9ncHGnVuTAVNAQ5kPEw"
+        data = bytearray(216)
+        data[:8] = server.ORCA_POSITION_DISCRIMINATOR
+        data[40:72] = server.base58_decode(nft)
+        decoded = {"positionAddress": nft, "personalPositionAddress": "derived"}
+        with patch.object(server, "solana_account", return_value=bytes(data)), patch.object(
+            server, "orca_position", return_value=decoded
+        ) as decode:
+            result = server.orca_position_from_address(position_address)
+        decode.assert_called_once_with(nft, bytes(data))
+        self.assertEqual(result["positionAddress"], nft)
+        self.assertEqual(result["personalPositionAddress"], position_address)
+
+    def test_selected_orca_position_matches_personal_position_account(self):
+        address = "3obGz9gF9MTcvyebAofE1bS21fTA1sfV9KFBJMsfvfTK"
+        position = {
+            "positionAddress": "6cHCWbDnkHehmYh8LcfwKTDdq9ncHGnVuTAVNAQ5kPEw",
+            "personalPositionAddress": address,
+            "importable": True,
+        }
+        original = server.MONITOR.config
+        server.MONITOR.config = {**original, "positionAddress": address}
+        try:
+            with patch.object(server.MONITOR, "positions", return_value=[position]):
+                self.assertIs(server.MONITOR._selected_position(), position)
+        finally:
+            server.MONITOR.config = original
+
     def test_initialization_prepares_persistent_data(self):
         with patch.object(server.os, "chmod") as chmod:
             server.prepare_data_permissions()

@@ -455,6 +455,19 @@ def orca_position(nft_mint: str, position_data: bytes | None = None) -> dict[str
     }
 
 
+def orca_position_from_address(address: str) -> dict[str, Any]:
+    """Aceita tanto o mint do NFT quanto a conta Position do Whirlpool."""
+    if not SOLANA_PATTERN.fullmatch(address):
+        raise NeutralisError("Endereço da posição Orca inválido")
+    account_data = solana_account(address)
+    if len(account_data) >= 96 and account_data[:8] == ORCA_POSITION_DISCRIMINATOR:
+        nft_mint = public_key_at(account_data, 40)
+        result = orca_position(nft_mint, account_data)
+        result["personalPositionAddress"] = address
+        return result
+    return orca_position(address)
+
+
 def orca_positions(wallet: str) -> list[dict[str, Any]]:
     nft_mints = solana_nft_mints(wallet)
     derived = {orca_position_pda(mint): mint for mint in nft_mints}
@@ -647,6 +660,8 @@ def hyp_state(account: str, symbol: str) -> HypState:
         signed_position=signed,
         open_orders=open_orders,
     )
+
+
 
 
 def lp_liquidity(value: Decimal, price: Decimal, lower: Decimal, upper: Decimal) -> Decimal:
@@ -919,14 +934,30 @@ class NeutralisMonitor:
                 return []
             return [raydium_position(position)]
         if self.config["source"] == "orca":
-            return orca_positions(self.config["solanaWallet"])
+            selected = self.config["positionAddress"]
+            direct = None
+            if selected:
+                try:
+                    direct = orca_position_from_address(selected)
+                except NeutralisError:
+                    pass
+            discovered = orca_positions(self.config["solanaWallet"])
+            if direct and all(item["positionAddress"] != direct["positionAddress"] for item in discovered):
+                discovered.insert(0, direct)
+            return discovered
         return byreal_positions(self.config["solanaWallet"])
 
     def _selected_position(self) -> dict[str, Any]:
         positions = self.positions()
         selected = self.config["positionAddress"]
         if selected:
-            position = next((item for item in positions if item["positionAddress"] == selected), None)
+            position = next(
+                (
+                    item for item in positions
+                    if selected in {item["positionAddress"], item.get("personalPositionAddress")}
+                ),
+                None,
+            )
         else:
             position = next((item for item in positions if item["importable"]), None)
         if not position:
