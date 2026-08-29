@@ -103,6 +103,32 @@ class NeutralisTests(unittest.TestCase):
         with patch.object(server, "json_request", side_effect=[payload(classic), payload(token_2022)]):
             self.assertEqual(server.solana_nft_mints(wallet), sorted([classic, token_2022]))
 
+    def test_orca_bundle_pdas_match_official_sdk_vectors(self):
+        mint = "6sf6fSK6tTubFA2LMCeTzt4c6DeNVyA6WpDDgtWs7a5p"
+        bundle = server.orca_position_bundle_pda(mint)
+        self.assertEqual(bundle, "At1QvbnANV6imkdNkfB4h1XsY4jbTzPAmScgjLCnM7jy")
+        self.assertEqual(
+            server.orca_bundled_position_pda(bundle, 0),
+            "4GRbpiDX46zi2AdZ2b9Ho4zfpLXhpsYBhRzkp2AeZej3",
+        )
+
+    def test_orca_discovers_positions_inside_bundle(self):
+        wallet = "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw"
+        mint = "6sf6fSK6tTubFA2LMCeTzt4c6DeNVyA6WpDDgtWs7a5p"
+        bundle = server.orca_position_bundle_pda(mint)
+        bundled_position = server.orca_bundled_position_pda(bundle, 0)
+        bundle_data = server.ORCA_POSITION_BUNDLE_DISCRIMINATOR + server.base58_decode(mint) + bytes([1]) + bytes(31)
+        position_data = server.ORCA_POSITION_DISCRIMINATOR + bytes(88)
+        decoded = {"source": "orca", "positionAddress": mint, "poolAddress": "pool", "importable": True}
+        with patch.object(server, "solana_nft_mints", return_value=[mint]), patch.object(
+            server, "solana_accounts", side_effect=[{bundle: bundle_data}, {bundled_position: position_data}]
+        ), patch.object(server, "orca_position", return_value=decoded):
+            positions = server.orca_positions(wallet)
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(positions[0]["positionAddress"], bundled_position)
+        self.assertEqual(positions[0]["positionNftMint"], mint)
+        self.assertEqual(positions[0]["bundleIndex"], 0)
+
     def test_orca_ignores_non_nft_token_accounts(self):
         wallet = "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw"
         mint = "3obGz9gF9MTcvyebAofE1bS21fTA1sfV9KFBJMsfvfTK"

@@ -39,6 +39,7 @@ SPL_TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 ORCA_POSITION_DISCRIMINATOR = bytes.fromhex("aabc8fe47a40f7d0")
 ORCA_WHIRLPOOL_DISCRIMINATOR = bytes.fromhex("3f95d10ce1806309")
+ORCA_POSITION_BUNDLE_DISCRIMINATOR = bytes([129, 169, 175, 65, 185, 95, 32, 100])
 DEFAULT_SOLANA_WALLET = "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw"
 DEFAULT_HYP_ACCOUNT = "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF"
 LIVE_SLIPPAGE = Decimal("0.003")
@@ -162,16 +163,22 @@ def is_ed25519_point(value: bytes) -> bool:
     return x_squared == 0 or pow(x_squared, (prime - 1) // 2, prime) == 1
 
 
-def position_pda(nft_mint: str, program_id: str) -> str:
-    mint = base58_decode(nft_mint)
+def program_pda(seeds: list[bytes], program_id: str) -> str:
     program = base58_decode(program_id)
-    if len(mint) != 32 or len(program) != 32:
-        raise NeutralisError("NFT da posição inválido")
+    if len(program) != 32 or any(len(seed) > 32 for seed in seeds):
+        raise NeutralisError("Seeds inválidas para derivar a posição")
     for bump in range(255, -1, -1):
-        digest = hashlib.sha256(b"position" + mint + bytes([bump]) + program + b"ProgramDerivedAddress").digest()
+        digest = hashlib.sha256(b"".join(seeds) + bytes([bump]) + program + b"ProgramDerivedAddress").digest()
         if not is_ed25519_point(digest):
             return base58_encode(digest)
     raise NeutralisError("Não foi possível derivar a posição")
+
+
+def position_pda(nft_mint: str, program_id: str) -> str:
+    mint = base58_decode(nft_mint)
+    if len(mint) != 32:
+        raise NeutralisError("NFT da posição inválido")
+    return program_pda([b"position", mint], program_id)
 
 
 def raydium_position_pda(nft_mint: str) -> str:
@@ -180,6 +187,20 @@ def raydium_position_pda(nft_mint: str) -> str:
 
 def orca_position_pda(nft_mint: str) -> str:
     return position_pda(nft_mint, ORCA_WHIRLPOOL_PROGRAM)
+
+
+def orca_position_bundle_pda(nft_mint: str) -> str:
+    mint = base58_decode(nft_mint)
+    if len(mint) != 32:
+        raise NeutralisError("NFT do bundle Orca inválido")
+    return program_pda([b"position_bundle", mint], ORCA_WHIRLPOOL_PROGRAM)
+
+
+def orca_bundled_position_pda(bundle_address: str, bundle_index: int) -> str:
+    bundle = base58_decode(bundle_address)
+    if len(bundle) != 32 or not 0 <= bundle_index < 256:
+        raise NeutralisError("Bundle Orca inválido")
+    return program_pda([b"bundled_position", bundle, str(bundle_index).encode("ascii")], ORCA_WHIRLPOOL_PROGRAM)
 
 
 def solana_account(address: str, expected_owner: str | None = None) -> bytes:
@@ -490,13 +511,45 @@ def orca_position_from_address(address: str) -> dict[str, Any] | None:
 def orca_positions(wallet: str) -> list[dict[str, Any]]:
     nft_mints = solana_nft_mints(wallet)
     derived = {orca_position_pda(mint): mint for mint in nft_mints}
-    accounts = solana_accounts(list(derived), ORCA_WHIRLPOOL_PROGRAM)
+    bundle_derived = {orca_position_bundle_pda(mint): mint for mint in nft_mints}
+    accounts = solana_accounts(list(derived) + list(bundle_derived), ORCA_WHIRLPOOL_PROGRAM)
     positions = []
-    for address, data in accounts.items():
+    for address, mint in derived.items():
+        data = accounts.get(address)
+        if data is None:
+            continue
         if len(data) < 96 or data[:8] != ORCA_POSITION_DISCRIMINATOR:
             continue
         try:
-            positions.append(orca_position(derived[address], data))
+            positions.append(orca_position(mint, data))
+        except NeutralisError:
+            continue
+    bundled: dict[str, tuple[str, str, int]] = {}
+    for bundle_address, mint in bundle_derived.items():
+        data = accounts.get(bundle_address)
+        if data is None or len(data) < 72 or data[:8] != ORCA_POSITION_BUNDLE_DISCRIMINATOR:
+            continue
+        if public_key_at(data, 8) != mint:
+            continue
+        for index in range(256):
+            if data[40 + index // 8] & (1 << (index % 8)):
+                position_address = orca_bundled_position_pda(bundle_address, index)
+                bundled[position_address] = (mint, bundle_address, index)
+    bundled_accounts = solana_accounts(list(bundled), ORCA_WHIRLPOOL_PROGRAM) if bundled else {}
+    for address, data in bundled_accounts.items():
+        mint, bundle_address, index = bundled[address]
+        if len(data) < 96 or data[:8] != ORCA_POSITION_DISCRIMINATOR:
+            continue
+        try:
+            position = orca_position(mint, data)
+            position.update({
+                "positionAddress": address,
+                "positionNftMint": mint,
+                "personalPositionAddress": address,
+                "positionBundleAddress": bundle_address,
+                "bundleIndex": index,
+            })
+            positions.append(position)
         except NeutralisError:
             continue
     return positions
