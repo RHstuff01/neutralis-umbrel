@@ -98,19 +98,19 @@ class NeutralisTests(unittest.TestCase):
         classic = "6cHCWbDnkHehmYh8LcfwKTDdq9ncHGnVuTAVNAQ5kPEw"
         token_2022 = "CNJt5jfTNps9HxE6CRgefvFCTrNdYAcetJSEosaLHzq4"
         def payload(mint):
-            return {"result": {"value": [{"account": {"data": {"parsed": {"info": {"mint": mint, "tokenAmount": {"amount": "1", "decimals": 0}}}}}}]}}
+            account = server.base58_decode(mint) + bytes(32) + (1).to_bytes(8, "little") + bytes(93)
+            return {"result": {"value": [{"account": {"data": [server.base64.b64encode(account).decode(), "base64"]}}]}}
         with patch.object(server, "json_request", side_effect=[payload(classic), payload(token_2022)]):
             self.assertEqual(server.solana_nft_mints(wallet), sorted([classic, token_2022]))
 
-    def test_orca_discovers_token_2022_position_when_decimals_are_omitted(self):
+    def test_orca_ignores_non_nft_token_accounts(self):
         wallet = "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw"
         mint = "3obGz9gF9MTcvyebAofE1bS21fTA1sfV9KFBJMsfvfTK"
         empty = {"result": {"value": []}}
-        token_2022 = {"result": {"value": [{"account": {"data": {"parsed": {"info": {
-            "mint": mint, "tokenAmount": {"amount": "1", "uiAmount": 1}
-        }}}}}]}}
+        account = server.base58_decode(mint) + bytes(32) + (2).to_bytes(8, "little") + bytes(93)
+        token_2022 = {"result": {"value": [{"account": {"data": [server.base64.b64encode(account).decode(), "base64"]}}]}}
         with patch.object(server, "json_request", side_effect=[empty, token_2022]):
-            self.assertEqual(server.solana_nft_mints(wallet), [mint])
+            self.assertEqual(server.solana_nft_mints(wallet), [])
 
     def test_orca_accepts_personal_position_account(self):
         position_address = "3obGz9gF9MTcvyebAofE1bS21fTA1sfV9KFBJMsfvfTK"

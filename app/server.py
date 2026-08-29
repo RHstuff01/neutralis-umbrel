@@ -360,21 +360,27 @@ def solana_nft_mints(wallet: str) -> list[str]:
         try:
             response = json_request(SOLANA_RPC_URL, {
                 "jsonrpc": "2.0", "id": 1, "method": "getTokenAccountsByOwner",
-                "params": [wallet, {"programId": program_id}, {"encoding": "jsonParsed", "commitment": "confirmed"}],
+                "params": [wallet, {"programId": program_id}, {"encoding": "base64", "commitment": "confirmed"}],
             })
         except NeutralisError:
             continue
         successful_queries += 1
         rows = response.get("result", {}).get("value") if isinstance(response, dict) else None
         for row in rows if isinstance(rows, list) else []:
-            info = row.get("account", {}).get("data", {}).get("parsed", {}).get("info", {}) if isinstance(row, dict) else {}
-            amount = info.get("tokenAmount", {}) if isinstance(info, dict) else {}
-            mint = str(info.get("mint") or "") if isinstance(info, dict) else ""
-            # Algumas contas Token-2022 de posições Orca são retornadas pelo
-            # RPC público sem `decimals`, embora o saldo bruto do NFT seja 1.
-            # A derivação e o discriminator da conta Position abaixo fazem a
-            # validação definitiva, então não dependemos desse campo opcional.
-            if str(amount.get("amount")) == "1" and SOLANA_PATTERN.fullmatch(mint):
+            encoded = row.get("account", {}).get("data") if isinstance(row, dict) else None
+            if not isinstance(encoded, list) or not encoded:
+                continue
+            try:
+                token_account = base64.b64decode(encoded[0], validate=True)
+            except Exception:
+                continue
+            # O layout-base é idêntico nos programas SPL Token e Token-2022:
+            # mint [0:32], owner [32:64] e amount u64 [64:72]. Extensões vêm
+            # depois desse cabeçalho. É também o método usado pelo SDK da Orca.
+            if len(token_account) < 72 or int.from_bytes(token_account[64:72], "little") != 1:
+                continue
+            mint = base58_encode(token_account[:32])
+            if SOLANA_PATTERN.fullmatch(mint):
                 mints.add(mint)
     if not successful_queries:
         raise NeutralisError("Falha ao consultar os NFTs da carteira Solana")
