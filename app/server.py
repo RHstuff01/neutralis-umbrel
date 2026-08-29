@@ -30,6 +30,7 @@ CONFIG_FILE = DATA_DIR / "config.json"
 LOG_FILE = DATA_DIR / "events.jsonl"
 API_KEY_FILE = DATA_DIR / "hyperliquid-api-wallet.key"
 BYREAL_URL = "https://api2.byreal.io/byreal/api/dex/v2/position/list"
+BYREAL_MINT_LIST_URL = "https://api2.byreal.io/byreal/api/dex/v2/mint/list"
 HYP_INFO_URL = "https://api.hyperliquid.xyz/info"
 SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 RAYDIUM_MINT_URL = "https://api-v3.raydium.io/mint/ids"
@@ -344,8 +345,10 @@ def normalize_position(position: dict[str, Any], pool: dict[str, Any]) -> dict[s
         "poolAddress": str(position.get("poolAddress") or pool.get("poolAddress") or ""),
         "pair": f'{asset["symbol"]} / {quote["symbol"]}' if asset["symbol"] and quote["symbol"] else "Pool Byreal",
         "assetSymbol": asset["symbol"],
+        "assetMint": asset["address"],
         "hedgeSymbol": hyp_symbol(asset["symbol"]) if asset["symbol"] else "",
         "quoteSymbol": quote["symbol"],
+        "quoteMint": quote["address"],
         "liquidityUsd": value_usd,
         "lowerPrice": lower_price,
         "upperPrice": upper_price,
@@ -354,6 +357,37 @@ def normalize_position(position: dict[str, Any], pool: dict[str, Any]) -> dict[s
         "apr": optional_float(position.get("apr")),
         "importable": importable,
     }
+
+
+def byreal_mint_price(mint: str) -> float | None:
+    """Obtém preço USD apenas quando a resposta corresponde ao mint solicitado."""
+    if not SOLANA_PATTERN.fullmatch(mint):
+        return None
+    root = json_request(BYREAL_MINT_LIST_URL + "?" + urlencode({
+        "page": 1,
+        "pageSize": 10,
+        "search": mint,
+    }))
+
+    def visit(value: Any) -> float | None:
+        if isinstance(value, dict):
+            address = str(value.get("mintAddress") or value.get("address") or value.get("mint") or "")
+            if address == mint:
+                price = optional_float(value.get("priceUsd", value.get("usdPrice")))
+                if price is not None and price > 0:
+                    return price
+            for nested in value.values():
+                found = visit(nested)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for nested in value:
+                found = visit(nested)
+                if found is not None:
+                    return found
+        return None
+
+    return visit(root)
 
 
 def byreal_positions(wallet: str) -> list[dict[str, Any]]:
@@ -378,7 +412,18 @@ def byreal_positions(wallet: str) -> list[dict[str, Any]]:
             pool = pool_map[address]
         else:
             pool = next((item for item in pools if isinstance(item, dict) and str(item.get("poolAddress") or item.get("address") or "") == address), {})
-        result.append(normalize_position(position, pool))
+        normalized = normalize_position(position, pool)
+        if normalized["currentPrice"] is None and normalized["assetMint"]:
+            try:
+                asset_usd = byreal_mint_price(normalized["assetMint"])
+                quote_usd = 1.0 if normalized["quoteSymbol"] in STABLE_SYMBOLS else byreal_mint_price(normalized["quoteMint"])
+                if asset_usd is not None and quote_usd is not None and quote_usd > 0:
+                    normalized["currentPrice"] = asset_usd / quote_usd
+            except NeutralisError:
+                # A listagem da posição ainda pode ser usada em dry-run; o modo
+                # real permanece bloqueado sem uma cotação independente válida.
+                pass
+        result.append(normalized)
     return result
 
 
