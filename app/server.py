@@ -38,6 +38,7 @@ ORCA_WHIRLPOOL_PROGRAM = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
 SPL_TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 ORCA_POSITION_DISCRIMINATOR = bytes.fromhex("aabc8fe47a40f7d0")
+ORCA_WHIRLPOOL_DISCRIMINATOR = bytes.fromhex("3f95d10ce1806309")
 DEFAULT_SOLANA_WALLET = "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw"
 DEFAULT_HYP_ACCOUNT = "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF"
 LIVE_SLIPPAGE = Decimal("0.003")
@@ -455,7 +456,7 @@ def orca_position(nft_mint: str, position_data: bytes | None = None) -> dict[str
     }
 
 
-def orca_position_from_address(address: str) -> dict[str, Any]:
+def orca_position_from_address(address: str) -> dict[str, Any] | None:
     """Aceita tanto o mint do NFT quanto a conta Position do Whirlpool."""
     if not SOLANA_PATTERN.fullmatch(address):
         raise NeutralisError("Endereço da posição Orca inválido")
@@ -465,6 +466,8 @@ def orca_position_from_address(address: str) -> dict[str, Any]:
         result = orca_position(nft_mint, account_data)
         result["personalPositionAddress"] = address
         return result
+    if len(account_data) >= 8 and account_data[:8] == ORCA_WHIRLPOOL_DISCRIMINATOR:
+        return None
     return orca_position(address)
 
 
@@ -936,14 +939,24 @@ class NeutralisMonitor:
         if self.config["source"] == "orca":
             selected = self.config["positionAddress"]
             direct = None
+            direct_error = None
+            selected_pool = None
             if selected:
                 try:
                     direct = orca_position_from_address(selected)
-                except NeutralisError:
-                    pass
+                    if direct is None:
+                        selected_pool = selected
+                except NeutralisError as error:
+                    direct_error = error
             discovered = orca_positions(self.config["solanaWallet"])
+            if selected_pool:
+                discovered = [item for item in discovered if item.get("poolAddress") == selected_pool]
             if direct and all(item["positionAddress"] != direct["positionAddress"] for item in discovered):
                 discovered.insert(0, direct)
+            if selected and not discovered and direct_error:
+                raise direct_error
+            if selected_pool and not discovered:
+                raise NeutralisError("Nenhuma posição aberta desta pool Orca foi encontrada na carteira configurada")
             return discovered
         return byreal_positions(self.config["solanaWallet"])
 
@@ -954,7 +967,9 @@ class NeutralisMonitor:
             position = next(
                 (
                     item for item in positions
-                    if selected in {item["positionAddress"], item.get("personalPositionAddress")}
+                    if selected in {
+                        item["positionAddress"], item.get("personalPositionAddress"), item.get("poolAddress")
+                    }
                 ),
                 None,
             )

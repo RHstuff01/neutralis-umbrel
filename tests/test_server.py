@@ -115,6 +115,12 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(result["positionAddress"], nft)
         self.assertEqual(result["personalPositionAddress"], position_address)
 
+    def test_orca_recognizes_whirlpool_address_for_wallet_filtering(self):
+        pool = "C9U2Ksk6KKWvLEeo5yUQ7Xu46X7NzeBJtd9PBfuXaUSM"
+        data = server.ORCA_WHIRLPOOL_DISCRIMINATOR + bytes(645)
+        with patch.object(server, "solana_account", return_value=data):
+            self.assertIsNone(server.orca_position_from_address(pool))
+
     def test_selected_orca_position_matches_personal_position_account(self):
         address = "3obGz9gF9MTcvyebAofE1bS21fTA1sfV9KFBJMsfvfTK"
         position = {
@@ -127,6 +133,30 @@ class NeutralisTests(unittest.TestCase):
         try:
             with patch.object(server.MONITOR, "positions", return_value=[position]):
                 self.assertIs(server.MONITOR._selected_position(), position)
+        finally:
+            server.MONITOR.config = original
+
+    def test_selected_orca_position_matches_pool_address(self):
+        pool = "C9U2Ksk6KKWvLEeo5yUQ7Xu46X7NzeBJtd9PBfuXaUSM"
+        position = {"positionAddress": "nft", "personalPositionAddress": "position", "poolAddress": pool, "importable": True}
+        original = server.MONITOR.config
+        server.MONITOR.config = {**original, "positionAddress": pool}
+        try:
+            with patch.object(server.MONITOR, "positions", return_value=[position]):
+                self.assertIs(server.MONITOR._selected_position(), position)
+        finally:
+            server.MONITOR.config = original
+
+    def test_orca_pool_reports_when_wallet_has_no_position(self):
+        pool = "C9U2Ksk6KKWvLEeo5yUQ7Xu46X7NzeBJtd9PBfuXaUSM"
+        original = server.MONITOR.config
+        server.MONITOR.config = {**original, "source": "orca", "positionAddress": pool}
+        try:
+            with patch.object(server, "orca_position_from_address", return_value=None), patch.object(
+                server, "orca_positions", return_value=[]
+            ):
+                with self.assertRaisesRegex(server.NeutralisError, "desta pool Orca"):
+                    server.MONITOR.positions()
         finally:
             server.MONITOR.config = original
 
