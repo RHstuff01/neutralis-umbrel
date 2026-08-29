@@ -106,6 +106,27 @@ class NeutralisTests(unittest.TestCase):
         mark = Decimal("176.79")
         self.assertEqual(server.decimal(position.get("currentPrice") or mark, "preço da LP"), mark)
 
+    def test_byreal_mint_price_requires_exact_mint(self):
+        mint = "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw"
+        payload = {"result": {"data": {"records": [
+            {"mintAddress": "11111111111111111111111111111111", "priceUsd": "999"},
+            {"mintAddress": mint, "priceUsd": "177.73"},
+        ]}}}
+        with patch.object(server, "json_request", return_value=payload):
+            self.assertEqual(server.byreal_mint_price(mint), 177.73)
+
+    def test_byreal_positions_enriches_price_from_mint_catalog(self):
+        wallet = "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw"
+        asset_mint = "CNJt5jfTNps9HxE6CRgefvFCTrNdYAcetJSEosaLHzq4"
+        position_payload = {"result": {"data": {
+            "positions": [{"positionAddress": "position", "poolAddress": "pool", "lowerTick": 51000, "upperTick": 53000, "liquidityUsd": "1000"}],
+            "poolMap": {"pool": {"poolAddress": "pool", "mintA": {"address": asset_mint, "symbol": "COINX", "decimals": 6}, "mintB": {"address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "symbol": "USDC", "decimals": 6}}},
+        }}}
+        price_payload = {"result": {"data": {"records": [{"mintAddress": asset_mint, "priceUsd": "177.73"}]}}}
+        with patch.object(server, "json_request", side_effect=[position_payload, price_payload]):
+            positions = server.byreal_positions(wallet)
+        self.assertEqual(positions[0]["currentPrice"], 177.73)
+
     def test_byreal_envelope_is_unwrapped(self):
         payload = {
             "result": {
