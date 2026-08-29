@@ -33,12 +33,13 @@ Não encaminhe a porta `8787` no roteador e não exponha este painel diretamente
 ## Operação
 
 1. Escolha Byreal, Raydium ou Orca e confirme as contas públicas mostradas no painel.
-2. Na Raydium, cole o endereço do NFT da posição; na Byreal ou Orca, informe a carteira Solana.
+2. Na Raydium, cole o endereço do NFT da posição; na Byreal ou Orca, informe a carteira Solana. A descoberta da Orca aceita posições clássicas e Token-2022.
 3. Clique em **Buscar LPs**.
 4. Selecione a posição desejada.
-5. Clique em **Iniciar dry-run**.
-6. Acompanhe os ajustes virtuais no registro.
-7. Somente depois de validar o mercado e os valores, informe a confirmação
+5. Defina o limite máximo em dólares para o short real. O padrão conservador é US$ 600; o aplicativo nunca aumenta esse valor sozinho.
+6. Clique em **Iniciar dry-run**.
+7. Acompanhe os ajustes virtuais, a conversão LP → HYP e a divergência no registro.
+8. Somente depois de validar o mercado e os valores, informe a confirmação
    mostrada pelo painel para ativar o monitor real.
 
 O container volta automaticamente após uma reinicialização do Umbrel.
@@ -62,18 +63,20 @@ docker compose -f compose.yaml stop neutralis
 - No dry-run, nenhuma ordem inicial ou posterior é enviada.
 - Ajustes ocorrem somente depois de um movimento de 0,5% desde a âncora.
 - Compras são `reduce-only` e nunca podem abrir uma posição long.
-- Ordens automáticas são IOC e o short total é limitado a US$ 600.
+- Ordens automáticas são IOC, têm até três tentativas para o residual e respeitam o limite total configurado pelo usuário (US$ 600 por padrão).
 - O processo roda sem privilégios, sem capabilities Linux e com sistema de
   arquivos somente leitura, exceto `/data`.
 - Configuração e eventos públicos persistem em `./data`.
 - O monitor pausa se houver posição long, ordens abertas, alteração da posição
   real, saída da faixa ou divergência de mark/oráculo superior a 0,75%.
-- Para wrappers como CRCLx, o monitor também pausa se o preço da LP divergir
-  mais de 0,75% do perp correspondente na Hyperliquid.
+- Para wrappers 1:1 como CRCLx, o monitor pausa se o preço da LP divergir mais de 0,75% do perp correspondente na Hyperliquid.
+- Para SPYx, o hedge usa `xyz:SP500` por **valor nocional**: quantidade de SPYx × preço da LP ÷ preço do SP500. O robô monitora a variação da relação entre os dois preços e pausa se ela se afastar mais de 0,75% da relação observada ao iniciar.
+- SPYx e SP500 não são o mesmo ativo. O hedge reduz o delta em dólares, mas permanece sujeito a risco de base entre o ETF/token e o índice.
+- Pares sem cotação estável reconhecida, como Fartcoin/SOL, não são elegíveis para este monitor de RWA/USD.
 
 ## Community App Store
 
 `umbrel-app.yml` e `docker-compose.yml` são um esqueleto para a instalação
 nativa. Antes de adicioná-lo a uma loja, é necessário publicar a imagem
-`neutralis-umbrel:0.5.2` para ARM64 e AMD64 em um registry e substituir a
+`neutralis-umbrel:0.5.3` para ARM64 e AMD64 em um registry e substituir a
 diretiva `build` por esse endereço de imagem.

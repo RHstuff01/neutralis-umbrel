@@ -24,6 +24,8 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(server.hyp_symbol("CRCLX"), "CRCL")
         self.assertEqual(server.hyp_symbol("COINX"), "COIN")
         self.assertEqual(server.hyp_symbol("SPCX"), "SPCX")
+        self.assertEqual(server.hyp_symbol("SPYx"), "SP500")
+        self.assertEqual(server.hedge_mode("SPYx"), "notional")
         self.assertEqual(server.hyp_symbol("crcl"), "CRCL")
 
     def test_raydium_position_pda_from_nft(self):
@@ -99,6 +101,16 @@ class NeutralisTests(unittest.TestCase):
             return {"result": {"value": [{"account": {"data": {"parsed": {"info": {"mint": mint, "tokenAmount": {"amount": "1", "decimals": 0}}}}}}]}}
         with patch.object(server, "json_request", side_effect=[payload(classic), payload(token_2022)]):
             self.assertEqual(server.solana_nft_mints(wallet), sorted([classic, token_2022]))
+
+    def test_orca_discovers_token_2022_position_when_decimals_are_omitted(self):
+        wallet = "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw"
+        mint = "3obGz9gF9MTcvyebAofE1bS21fTA1sfV9KFBJMsfvfTK"
+        empty = {"result": {"value": []}}
+        token_2022 = {"result": {"value": [{"account": {"data": {"parsed": {"info": {
+            "mint": mint, "tokenAmount": {"amount": "1", "uiAmount": 1}
+        }}}}}]}}
+        with patch.object(server, "json_request", side_effect=[empty, token_2022]):
+            self.assertEqual(server.solana_nft_mints(wallet), [mint])
 
     def test_orca_accepts_personal_position_account(self):
         position_address = "3obGz9gF9MTcvyebAofE1bS21fTA1sfV9KFBJMsfvfTK"
@@ -247,6 +259,44 @@ class NeutralisTests(unittest.TestCase):
         self.assertGreater(below, center)
         self.assertGreater(center, above)
 
+    def test_spyx_target_is_converted_to_sp500_notional(self):
+        position = {
+            "positionAddress": "position", "assetSymbol": "SPYX", "hedgeSymbol": "SP500",
+            "hedgeMode": "notional", "liquidityUsd": Decimal("10000"),
+            "normalizedLiquidity": Decimal("1000"), "currentPrice": Decimal("775"),
+            "lowerPrice": Decimal("700"), "upperPrice": Decimal("850"), "importable": True,
+        }
+        hyp = server.HypState("xyz:SP500", 3, Decimal("7675"), Decimal("7675"), Decimal("0"), 0)
+        asset_delta = server.base_target(Decimal("1000"), Decimal("775"), Decimal("700"), Decimal("850"))
+        with patch.object(server.MONITOR, "_selected_position", return_value=position), patch.object(
+            server, "hyp_state", return_value=hyp
+        ):
+            *_, target = server.MONITOR._live_snapshot()
+        self.assertEqual(target, asset_delta * Decimal("775") / Decimal("7675"))
+        self.assertNotEqual(target, asset_delta)
+
+    def test_snapshot_rejects_lp_outside_active_range(self):
+        position = {
+            "positionAddress": "position", "assetSymbol": "SPYX", "hedgeSymbol": "SP500",
+            "hedgeMode": "notional", "liquidityUsd": Decimal("10000"),
+            "normalizedLiquidity": Decimal("1000"), "currentPrice": Decimal("851"),
+            "lowerPrice": Decimal("700"), "upperPrice": Decimal("850"), "importable": True,
+        }
+        hyp = server.HypState("xyz:SP500", 3, Decimal("7675"), Decimal("7675"), Decimal("0"), 0)
+        with patch.object(server.MONITOR, "_selected_position", return_value=position), patch.object(
+            server, "hyp_state", return_value=hyp
+        ):
+            with self.assertRaisesRegex(server.NeutralisError, "fora da faixa ativa"):
+                server.MONITOR._live_snapshot()
+
+    def test_spyx_basis_tracks_ratio_drift_not_price_scale(self):
+        position = {"hedgeMode": "notional"}
+        initial_ratio = Decimal("775") / Decimal("7675")
+        self.assertEqual(server.hedge_basis(position, Decimal("775"), Decimal("7675"), initial_ratio), 0)
+        drift = server.hedge_basis(position, Decimal("780"), Decimal("7675"), initial_ratio)
+        self.assertGreater(drift, Decimal("0.006"))
+        self.assertLess(drift, Decimal("0.007"))
+
     def test_api_wallet_key_is_never_returned(self):
         key = "11" * 32
         result = server.MONITOR.save_api_key({"privateKey": key})
@@ -258,7 +308,7 @@ class NeutralisTests(unittest.TestCase):
             server.MONITOR.save_api_key({"privateKey": "segredo"})
 
     def test_auto_adjustment_waits_below_hyperliquid_minimum(self):
-        position = {"hedgeSymbol": "COIN"}
+        position = {"hedgeSymbol": "COIN", "currentPrice": Decimal("176")}
         hyp = server.HypState("xyz:COIN", 3, Decimal("176"), Decimal("176"), Decimal("-2.740"), 0)
         with patch.object(server.MONITOR, "_exchange") as exchange:
             result = server.MONITOR._execute_auto_adjustment(position, hyp, Decimal("2.749"))
@@ -314,10 +364,19 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(exchange.order.call_count, 3)
 
     def test_auto_sell_pauses_above_six_hundred_total_notional(self):
-        position = {"hedgeSymbol": "COIN"}
+        position = {"hedgeSymbol": "COIN", "currentPrice": Decimal("176")}
         hyp = server.HypState("xyz:COIN", 3, Decimal("176"), Decimal("176"), Decimal("-2.740"), 0)
         with self.assertRaisesRegex(server.NeutralisError, "US\$ 600"):
             server.MONITOR._execute_auto_adjustment(position, hyp, Decimal("3.500"))
+
+    def test_configured_notional_limit_is_used(self):
+        original = dict(server.MONITOR.config)
+        try:
+            server.MONITOR.config = {**original, "maxPositionNotional": "12000"}
+            self.assertEqual(server.MONITOR.max_position_notional(), Decimal("12000"))
+            self.assertEqual(server.MONITOR.public_state()["autoLimits"]["maxPositionNotional"], 12000.0)
+        finally:
+            server.MONITOR.config = original
 
     def test_ioc_without_fill_is_rejected(self):
         response = {"status": "ok", "response": {"data": {"statuses": [{"error": "IocCancel"}]}}}
@@ -356,7 +415,7 @@ class NeutralisTests(unittest.TestCase):
             server.MONITOR._run(live=True)
         adjustment.assert_called_once_with(position, initial, Decimal("2.600"))
         self.assertEqual(events, ["initial-reconciliation", "start-live"])
-        self.assertEqual(server.MONITOR.state["snapshot"]["anchor"], 176.1)
+        self.assertEqual(server.MONITOR.state["snapshot"]["anchor"], 176.0)
         self.assertEqual(server.MONITOR.state["snapshot"]["realShort"], 2.6)
 
 
