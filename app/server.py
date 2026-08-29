@@ -35,6 +35,8 @@ RAYDIUM_MINT_URL = "https://api-v3.raydium.io/mint/ids"
 ORCA_TOKEN_URL = "https://api.orca.so/v2/solana/tokens"
 RAYDIUM_CLMM_PROGRAM = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
 ORCA_WHIRLPOOL_PROGRAM = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+ORCA_IMMUTABLE_WHIRLPOOL_PROGRAM = "iwhrLHdsgrvmnwU8GF2FSmyabSMjfHwFGJAX2ufJ3ZN"
+ORCA_WHIRLPOOL_PROGRAMS = (ORCA_WHIRLPOOL_PROGRAM, ORCA_IMMUTABLE_WHIRLPOOL_PROGRAM)
 SPL_TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 ORCA_POSITION_DISCRIMINATOR = bytes.fromhex("aabc8fe47a40f7d0")
@@ -185,22 +187,22 @@ def raydium_position_pda(nft_mint: str) -> str:
     return position_pda(nft_mint, RAYDIUM_CLMM_PROGRAM)
 
 
-def orca_position_pda(nft_mint: str) -> str:
-    return position_pda(nft_mint, ORCA_WHIRLPOOL_PROGRAM)
+def orca_position_pda(nft_mint: str, program_id: str = ORCA_WHIRLPOOL_PROGRAM) -> str:
+    return position_pda(nft_mint, program_id)
 
 
-def orca_position_bundle_pda(nft_mint: str) -> str:
+def orca_position_bundle_pda(nft_mint: str, program_id: str = ORCA_WHIRLPOOL_PROGRAM) -> str:
     mint = base58_decode(nft_mint)
     if len(mint) != 32:
         raise NeutralisError("NFT do bundle Orca inválido")
-    return program_pda([b"position_bundle", mint], ORCA_WHIRLPOOL_PROGRAM)
+    return program_pda([b"position_bundle", mint], program_id)
 
 
-def orca_bundled_position_pda(bundle_address: str, bundle_index: int) -> str:
+def orca_bundled_position_pda(bundle_address: str, bundle_index: int, program_id: str = ORCA_WHIRLPOOL_PROGRAM) -> str:
     bundle = base58_decode(bundle_address)
     if len(bundle) != 32 or not 0 <= bundle_index < 256:
         raise NeutralisError("Bundle Orca inválido")
-    return program_pda([b"bundled_position", bundle, str(bundle_index).encode("ascii")], ORCA_WHIRLPOOL_PROGRAM)
+    return program_pda([b"bundled_position", bundle, str(bundle_index).encode("ascii")], program_id)
 
 
 def solana_account(address: str, expected_owner: str | None = None) -> bytes:
@@ -408,11 +410,15 @@ def solana_nft_mints(wallet: str) -> list[str]:
     return sorted(mints)
 
 
-def orca_position(nft_mint: str, position_data: bytes | None = None) -> dict[str, Any]:
+def orca_position(
+    nft_mint: str,
+    position_data: bytes | None = None,
+    program_id: str = ORCA_WHIRLPOOL_PROGRAM,
+) -> dict[str, Any]:
     if not SOLANA_PATTERN.fullmatch(nft_mint):
         raise NeutralisError("NFT da posição Orca inválido")
-    position_address = orca_position_pda(nft_mint)
-    data = position_data if position_data is not None else solana_account(position_address, ORCA_WHIRLPOOL_PROGRAM)
+    position_address = orca_position_pda(nft_mint, program_id)
+    data = position_data if position_data is not None else solana_account(position_address, program_id)
     if len(data) < 96 or data[:8] != ORCA_POSITION_DISCRIMINATOR:
         raise NeutralisError("Conta da posição Orca inválida")
     pool_address = public_key_at(data, 8)
@@ -427,7 +433,7 @@ def orca_position(nft_mint: str, position_data: bytes | None = None) -> dict[str
     if raw_liquidity <= 0:
         raise NeutralisError("A posição Orca está sem liquidez")
 
-    pool_data = solana_account(pool_address, ORCA_WHIRLPOOL_PROGRAM)
+    pool_data = solana_account(pool_address, program_id)
     if len(pool_data) < 213:
         raise NeutralisError("Conta do Whirlpool Orca incompleta")
     sqrt_price_x64 = int.from_bytes(pool_data[65:81], "little")
@@ -473,6 +479,7 @@ def orca_position(nft_mint: str, position_data: bytes | None = None) -> dict[str
     normalized_liquidity = raw_liquidity / (10 ** ((decimals_a + decimals_b) / 2))
     return {
         "source": "orca",
+        "programId": program_id,
         "positionAddress": nft_mint,
         "personalPositionAddress": position_address,
         "poolAddress": pool_address,
@@ -500,58 +507,66 @@ def orca_position_from_address(address: str) -> dict[str, Any] | None:
     account_data = solana_account(address)
     if len(account_data) >= 96 and account_data[:8] == ORCA_POSITION_DISCRIMINATOR:
         nft_mint = public_key_at(account_data, 40)
-        result = orca_position(nft_mint, account_data)
-        result["personalPositionAddress"] = address
-        return result
+        for program_id in ORCA_WHIRLPOOL_PROGRAMS:
+            if orca_position_pda(nft_mint, program_id) == address:
+                result = orca_position(nft_mint, account_data, program_id)
+                result["personalPositionAddress"] = address
+                return result
+        raise NeutralisError("A conta Orca pertence a um tipo de posição não reconhecido")
     if len(account_data) >= 8 and account_data[:8] == ORCA_WHIRLPOOL_DISCRIMINATOR:
         return None
-    return orca_position(address)
+    last_error = None
+    for program_id in ORCA_WHIRLPOOL_PROGRAMS:
+        try:
+            return orca_position(address, program_id=program_id)
+        except NeutralisError as error:
+            last_error = error
+    raise last_error or NeutralisError("Posição Orca não encontrada")
 
 
 def orca_positions(wallet: str) -> list[dict[str, Any]]:
     nft_mints = solana_nft_mints(wallet)
-    derived = {orca_position_pda(mint): mint for mint in nft_mints}
-    bundle_derived = {orca_position_bundle_pda(mint): mint for mint in nft_mints}
-    accounts = solana_accounts(list(derived) + list(bundle_derived), ORCA_WHIRLPOOL_PROGRAM)
     positions = []
-    for address, mint in derived.items():
-        data = accounts.get(address)
-        if data is None:
-            continue
-        if len(data) < 96 or data[:8] != ORCA_POSITION_DISCRIMINATOR:
-            continue
-        try:
-            positions.append(orca_position(mint, data))
-        except NeutralisError:
-            continue
-    bundled: dict[str, tuple[str, str, int]] = {}
-    for bundle_address, mint in bundle_derived.items():
-        data = accounts.get(bundle_address)
-        if data is None or len(data) < 72 or data[:8] != ORCA_POSITION_BUNDLE_DISCRIMINATOR:
-            continue
-        if public_key_at(data, 8) != mint:
-            continue
-        for index in range(256):
-            if data[40 + index // 8] & (1 << (index % 8)):
-                position_address = orca_bundled_position_pda(bundle_address, index)
-                bundled[position_address] = (mint, bundle_address, index)
-    bundled_accounts = solana_accounts(list(bundled), ORCA_WHIRLPOOL_PROGRAM) if bundled else {}
-    for address, data in bundled_accounts.items():
-        mint, bundle_address, index = bundled[address]
-        if len(data) < 96 or data[:8] != ORCA_POSITION_DISCRIMINATOR:
-            continue
-        try:
-            position = orca_position(mint, data)
-            position.update({
-                "positionAddress": address,
-                "positionNftMint": mint,
-                "personalPositionAddress": address,
-                "positionBundleAddress": bundle_address,
-                "bundleIndex": index,
-            })
-            positions.append(position)
-        except NeutralisError:
-            continue
+    for program_id in ORCA_WHIRLPOOL_PROGRAMS:
+        derived = {orca_position_pda(mint, program_id): mint for mint in nft_mints}
+        bundle_derived = {orca_position_bundle_pda(mint, program_id): mint for mint in nft_mints}
+        accounts = solana_accounts(list(derived) + list(bundle_derived), program_id)
+        for address, mint in derived.items():
+            data = accounts.get(address)
+            if data is None or len(data) < 96 or data[:8] != ORCA_POSITION_DISCRIMINATOR:
+                continue
+            try:
+                positions.append(orca_position(mint, data, program_id))
+            except NeutralisError:
+                continue
+        bundled: dict[str, tuple[str, str, int]] = {}
+        for bundle_address, mint in bundle_derived.items():
+            data = accounts.get(bundle_address)
+            if data is None or len(data) < 72 or data[:8] != ORCA_POSITION_BUNDLE_DISCRIMINATOR:
+                continue
+            if public_key_at(data, 8) != mint:
+                continue
+            for index in range(256):
+                if data[40 + index // 8] & (1 << (index % 8)):
+                    position_address = orca_bundled_position_pda(bundle_address, index, program_id)
+                    bundled[position_address] = (mint, bundle_address, index)
+        bundled_accounts = solana_accounts(list(bundled), program_id) if bundled else {}
+        for address, data in bundled_accounts.items():
+            mint, bundle_address, index = bundled[address]
+            if len(data) < 96 or data[:8] != ORCA_POSITION_DISCRIMINATOR:
+                continue
+            try:
+                position = orca_position(mint, data, program_id)
+                position.update({
+                    "positionAddress": address,
+                    "positionNftMint": mint,
+                    "personalPositionAddress": address,
+                    "positionBundleAddress": bundle_address,
+                    "bundleIndex": index,
+                })
+                positions.append(position)
+            except NeutralisError:
+                continue
     return positions
 
 
@@ -1039,14 +1054,10 @@ class NeutralisMonitor:
                 except NeutralisError as error:
                     direct_error = error
             discovered = orca_positions(self.config["solanaWallet"])
-            if selected_pool:
-                discovered = [item for item in discovered if item.get("poolAddress") == selected_pool]
             if direct and all(item["positionAddress"] != direct["positionAddress"] for item in discovered):
                 discovered.insert(0, direct)
             if selected and not discovered and direct_error:
                 raise direct_error
-            if selected_pool and not discovered:
-                raise NeutralisError("Nenhuma posição aberta desta pool Orca foi encontrada na carteira configurada")
             return discovered
         return byreal_positions(self.config["solanaWallet"])
 

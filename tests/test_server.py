@@ -111,6 +111,17 @@ class NeutralisTests(unittest.TestCase):
             server.orca_bundled_position_pda(bundle, 0),
             "4GRbpiDX46zi2AdZ2b9Ho4zfpLXhpsYBhRzkp2AeZej3",
         )
+        immutable_mint = "6LdmNS8p3qLYrGcPeYby6zHRvZPq7cYDZTiBXCC3FNDs"
+        immutable_bundle = server.orca_position_bundle_pda(
+            immutable_mint, server.ORCA_IMMUTABLE_WHIRLPOOL_PROGRAM
+        )
+        self.assertEqual(immutable_bundle, "CVTZ5u8yjGngtpZ5WRx536ty8jiMCFkzwrr5TJW5FpR7")
+        self.assertEqual(
+            server.orca_bundled_position_pda(
+                immutable_bundle, 0, server.ORCA_IMMUTABLE_WHIRLPOOL_PROGRAM
+            ),
+            "FMAeLNU3RRb31UXJTmHcVwDYBJQwy7DhZepFk9Vwc1Mi",
+        )
 
     def test_orca_discovers_positions_inside_bundle(self):
         wallet = "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw"
@@ -121,7 +132,11 @@ class NeutralisTests(unittest.TestCase):
         position_data = server.ORCA_POSITION_DISCRIMINATOR + bytes(88)
         decoded = {"source": "orca", "positionAddress": mint, "poolAddress": "pool", "importable": True}
         with patch.object(server, "solana_nft_mints", return_value=[mint]), patch.object(
-            server, "solana_accounts", side_effect=[{bundle: bundle_data}, {bundled_position: position_data}]
+            server, "solana_accounts", side_effect=[
+                {bundle: bundle_data},
+                {bundled_position: position_data},
+                {},
+            ]
         ), patch.object(server, "orca_position", return_value=decoded):
             positions = server.orca_positions(wallet)
         self.assertEqual(len(positions), 1)
@@ -139,8 +154,8 @@ class NeutralisTests(unittest.TestCase):
             self.assertEqual(server.solana_nft_mints(wallet), [])
 
     def test_orca_accepts_personal_position_account(self):
-        position_address = "3obGz9gF9MTcvyebAofE1bS21fTA1sfV9KFBJMsfvfTK"
         nft = "6cHCWbDnkHehmYh8LcfwKTDdq9ncHGnVuTAVNAQ5kPEw"
+        position_address = server.orca_position_pda(nft)
         data = bytearray(216)
         data[:8] = server.ORCA_POSITION_DISCRIMINATOR
         data[40:72] = server.base58_decode(nft)
@@ -149,7 +164,7 @@ class NeutralisTests(unittest.TestCase):
             server, "orca_position", return_value=decoded
         ) as decode:
             result = server.orca_position_from_address(position_address)
-        decode.assert_called_once_with(nft, bytes(data))
+        decode.assert_called_once_with(nft, bytes(data), server.ORCA_WHIRLPOOL_PROGRAM)
         self.assertEqual(result["positionAddress"], nft)
         self.assertEqual(result["personalPositionAddress"], position_address)
 
@@ -185,16 +200,16 @@ class NeutralisTests(unittest.TestCase):
         finally:
             server.MONITOR.config = original
 
-    def test_orca_pool_reports_when_wallet_has_no_position(self):
+    def test_orca_stale_pool_does_not_hide_discovered_positions(self):
         pool = "C9U2Ksk6KKWvLEeo5yUQ7Xu46X7NzeBJtd9PBfuXaUSM"
+        position = {"positionAddress": "nft", "poolAddress": "another-pool", "importable": True}
         original = server.MONITOR.config
         server.MONITOR.config = {**original, "source": "orca", "positionAddress": pool}
         try:
             with patch.object(server, "orca_position_from_address", return_value=None), patch.object(
-                server, "orca_positions", return_value=[]
+                server, "orca_positions", return_value=[position]
             ):
-                with self.assertRaisesRegex(server.NeutralisError, "desta pool Orca"):
-                    server.MONITOR.positions()
+                self.assertEqual(server.MONITOR.positions(), [position])
         finally:
             server.MONITOR.config = original
 
