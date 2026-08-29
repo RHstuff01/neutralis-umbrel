@@ -45,6 +45,10 @@ AUTO_STEP = Decimal("0.005")
 AUTO_MAX_POSITION_NOTIONAL = Decimal("600")
 AUTO_MIN_ORDER_NOTIONAL = Decimal("10")
 AUTO_DIVERGENCE_LIMIT = Decimal("0.0075")
+AUTO_POLL_SECONDS = 2
+AUTO_RETRY_SECONDS = 1
+AUTO_MAX_EXECUTION_ATTEMPTS = 3
+AUTO_RETRY_SLIPPAGES = (Decimal("0.003"), Decimal("0.005"), Decimal("0.0075"))
 PRIVATE_KEY_PATTERN = re.compile(r"^(?:0x)?[0-9a-fA-F]{64}$")
 SOLANA_PATTERN = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 EVM_PATTERN = re.compile(r"^0x[0-9a-fA-F]{40}$")
@@ -662,54 +666,134 @@ class NeutralisMonitor:
         hyp: HypState,
         target: Decimal,
     ) -> dict[str, Any] | None:
-        if hyp.open_orders:
-            raise NeutralisError("Existem ordens abertas neste mercado")
-        if hyp.signed_position > 0:
-            raise NeutralisError("A conta ficou long; monitor pausado")
-        current_short = abs(min(hyp.signed_position, Decimal("0")))
-        quantum = Decimal(1).scaleb(-hyp.decimals)
-        difference = target - current_short
-        size = abs(difference).quantize(quantum, rounding=ROUND_DOWN)
-        if size <= 0:
-            return None
-        is_buy = difference < 0
-        if is_buy:
-            size = min(size, current_short)
-        else:
-            resulting_notional = (current_short + size) * hyp.mark
-            if resulting_notional > AUTO_MAX_POSITION_NOTIONAL:
-                raise NeutralisError("Short-alvo ultrapassaria o limite total de US$ 600")
-        notional = size * hyp.mark
-        if notional < AUTO_MIN_ORDER_NOTIONAL:
-            return None
-        limit_price = hyp.mark * (Decimal("1") + LIVE_SLIPPAGE if is_buy else Decimal("1") - LIVE_SLIPPAGE)
-        limit_price = Decimal(f"{limit_price:.5g}")
-        with self.execution_lock:
-            current = hyp_state(self.config["hyperliquidAccount"], position["hedgeSymbol"])
-            if current.open_orders or current.signed_position != hyp.signed_position:
-                raise NeutralisError("A posição ou as ordens mudaram durante a validação")
-            if abs(current.mark - hyp.mark) / hyp.mark > AUTO_STEP:
-                raise NeutralisError("O preço mudou mais de 0,5% durante a validação")
-            response = self._exchange().order(
-                hyp.market,
-                is_buy,
-                float(size),
-                float(limit_price),
-                {"limit": {"tif": "Ioc"}},
-                reduce_only=is_buy,
+        original_position = position.get("positionAddress")
+        total_filled = Decimal("0")
+        last_direction: bool | None = None
+
+        for attempt in range(AUTO_MAX_EXECUTION_ATTEMPTS):
+            if attempt:
+                position, hyp, lower, upper, _, target = self._live_snapshot()
+                if original_position and position.get("positionAddress") != original_position:
+                    raise NeutralisError("A posição selecionada mudou durante o ajuste")
+                if hyp.mark <= lower or hyp.mark >= upper:
+                    raise NeutralisError("O preço saiu da faixa da LP durante o ajuste")
+                if position.get("currentPrice") is None:
+                    raise NeutralisError("A fonte deixou de fornecer o preço independente da LP")
+                lp_price = decimal(position["currentPrice"], "preço da LP")
+                if abs(lp_price - hyp.mark) / hyp.mark > AUTO_DIVERGENCE_LIMIT:
+                    raise NeutralisError("Preço da LP e Hyperliquid divergiram mais de 0,75%")
+
+            if hyp.open_orders:
+                raise NeutralisError("Existem ordens abertas neste mercado")
+            if hyp.signed_position > 0:
+                raise NeutralisError("A conta ficou long; monitor pausado")
+            if hyp.oracle <= 0 or abs(hyp.mark - hyp.oracle) / hyp.oracle > AUTO_DIVERGENCE_LIMIT:
+                raise NeutralisError("Mark e oráculo divergiram mais de 0,75%")
+
+            current_short = abs(min(hyp.signed_position, Decimal("0")))
+            quantum = Decimal(1).scaleb(-hyp.decimals)
+            difference = target - current_short
+            size = abs(difference).quantize(quantum, rounding=ROUND_DOWN)
+            residual_notional = abs(difference) * hyp.mark
+            if size <= 0 or residual_notional < AUTO_MIN_ORDER_NOTIONAL:
+                return {
+                    "size": total_filled,
+                    "notional": total_filled * hyp.mark,
+                    "isBuy": last_direction,
+                    "filled": total_filled,
+                    "residualNotional": residual_notional,
+                    "currentShort": current_short,
+                    "target": target,
+                    "anchor": hyp.mark,
+                } if total_filled else None
+
+            is_buy = difference < 0
+            if is_buy:
+                size = min(size, current_short)
+            else:
+                resulting_notional = (current_short + size) * hyp.mark
+                if resulting_notional > AUTO_MAX_POSITION_NOTIONAL:
+                    raise NeutralisError("Short-alvo ultrapassaria o limite total de US$ 600")
+            notional = size * hyp.mark
+            if notional < AUTO_MIN_ORDER_NOTIONAL:
+                return None
+
+            slippage = AUTO_RETRY_SLIPPAGES[attempt]
+            limit_price = hyp.mark * (Decimal("1") + slippage if is_buy else Decimal("1") - slippage)
+            limit_price = Decimal(f"{limit_price:.5g}")
+            response = None
+            try:
+                with self.execution_lock:
+                    current = hyp_state(self.config["hyperliquidAccount"], position["hedgeSymbol"])
+                    if current.open_orders or current.signed_position != hyp.signed_position:
+                        raise NeutralisError("A posição ou as ordens mudaram durante a validação")
+                    if abs(current.mark - hyp.mark) / hyp.mark > AUTO_STEP:
+                        raise NeutralisError("O preço mudou mais de 0,5% durante a validação")
+                    response = self._exchange().order(
+                        hyp.market,
+                        is_buy,
+                        float(size),
+                        float(limit_price),
+                        {"limit": {"tif": "Ioc"}},
+                        reduce_only=is_buy,
+                    )
+                filled = self._order_status(response)
+            except NeutralisError as error:
+                retryable = "IOC" in str(error).upper() or "IOCCANCEL" in str(error).upper()
+                if not retryable:
+                    raise
+                if attempt + 1 >= AUTO_MAX_EXECUTION_ATTEMPTS:
+                    raise NeutralisError(
+                        f"Hedge incompleto após {AUTO_MAX_EXECUTION_ATTEMPTS} tentativas; "
+                        f"delta residual US$ {residual_notional:.2f}"
+                    ) from error
+                self._event(
+                    "live-retry",
+                    f"IOC não executada; nova tentativa {attempt + 2}/{AUTO_MAX_EXECUTION_ATTEMPTS}",
+                    target=target,
+                    mark=hyp.mark,
+                    response=response,
+                )
+                if self.stop_event.wait(AUTO_RETRY_SECONDS):
+                    raise NeutralisError("Monitor interrompido durante o ajuste")
+                continue
+
+            filled_size = decimal(filled.get("totalSz", size), "quantidade executada")
+            total_filled += filled_size
+            last_direction = is_buy
+            action = "COMPRAR / reduzir short" if is_buy else "VENDER / aumentar short"
+            self._event(
+                "live-adjustment",
+                f"ORDEM REAL {action} {size} {position['hedgeSymbol']}",
+                attempt=attempt + 1,
+                requestedSize=size,
+                target=target,
+                mark=hyp.mark,
+                limitPrice=limit_price,
+                reduceOnly=is_buy,
+                filled=filled,
             )
-        filled = self._order_status(response)
-        action = "COMPRAR / reduzir short" if is_buy else "VENDER / aumentar short"
-        self._event(
-            "live-adjustment",
-            f"ORDEM REAL {action} {size} {position['hedgeSymbol']}",
-            size=size,
-            target=target,
-            mark=hyp.mark,
-            reduceOnly=is_buy,
-            filled=filled,
-        )
-        return {"size": size, "notional": notional, "isBuy": is_buy, "filled": filled}
+            if attempt + 1 < AUTO_MAX_EXECUTION_ATTEMPTS and self.stop_event.wait(AUTO_RETRY_SECONDS):
+                raise NeutralisError("Monitor interrompido durante o ajuste")
+
+        position, hyp, _, _, _, target = self._live_snapshot()
+        current_short = abs(min(hyp.signed_position, Decimal("0")))
+        residual_notional = abs(target - current_short) * hyp.mark
+        if residual_notional >= AUTO_MIN_ORDER_NOTIONAL:
+            raise NeutralisError(
+                f"Hedge incompleto após {AUTO_MAX_EXECUTION_ATTEMPTS} tentativas; "
+                f"delta residual US$ {residual_notional:.2f}"
+            )
+        return {
+            "size": total_filled,
+            "notional": total_filled * hyp.mark,
+            "isBuy": last_direction,
+            "filled": total_filled,
+            "residualNotional": residual_notional,
+            "currentShort": current_short,
+            "target": target,
+            "anchor": hyp.mark,
+        }
 
     def positions(self) -> list[dict[str, Any]]:
         if self.config["source"] == "raydium":
@@ -832,7 +916,7 @@ class NeutralisMonitor:
                 self.state.update({"mode": "running", "message": f"{label} · aguardando nível de 0,5%", "snapshot": json_safe(initial_snapshot), "updatedAt": now_iso()})
             self._event("start-live" if live else "start", f"{'MODO REAL' if live else 'Dry-run'} iniciado em {hyp.market}; nenhuma ordem inicial", mark=hyp.mark, lower=lower, upper=upper, anchor=anchor)
 
-            while not self.stop_event.wait(5):
+            while not self.stop_event.wait(AUTO_POLL_SECONDS):
                 position_now, hyp_now, lower, upper, liquidity, target = self._live_snapshot()
                 if position_now["positionAddress"] != position["positionAddress"]:
                     return self._pause("A posição selecionada mudou")
@@ -862,15 +946,16 @@ class NeutralisMonitor:
                     notional = size * hyp_now.mark
                     if size > 0 and notional >= AUTO_MIN_ORDER_NOTIONAL:
                         if live:
-                            self._execute_auto_adjustment(position_now, hyp_now, target)
-                            refreshed = hyp_state(self.config["hyperliquidAccount"], position_now["hedgeSymbol"])
-                            virtual_short = abs(min(refreshed.signed_position, Decimal("0")))
+                            result = self._execute_auto_adjustment(position_now, hyp_now, target)
+                            if result:
+                                virtual_short = result["currentShort"]
+                                anchor = result["anchor"]
                         else:
                             action = "VENDER" if difference > 0 else "COMPRAR"
                             before = virtual_short
                             virtual_short = virtual_short + size if difference > 0 else max(Decimal("0"), virtual_short - size)
                             self._event("adjustment", f"SIMULAR {action} {size} {position['hedgeSymbol']}", size=size, before=before, after=virtual_short, target=target, mark=hyp_now.mark)
-                        anchor = hyp_now.mark
+                            anchor = hyp_now.mark
                     elif size > 0:
                         self._event("below-minimum", f"Ajuste de US$ {notional:.2f} aguardando próximo nível", size=size, target=target, mark=hyp_now.mark)
 
@@ -900,7 +985,7 @@ class NeutralisMonitor:
 
     def public_state(self) -> dict[str, Any]:
         with self.lock:
-            return {"config": dict(self.config), "monitor": json_safe(dict(self.state)), "events": self.events(50), "dryRun": not bool((self.state.get("snapshot") or {}).get("live")), "ordersEnabled": True, "apiWalletConfigured": API_KEY_FILE.exists(), "autoLimits": {"stepPercent": 0.5, "maxPositionNotional": 600, "minOrderNotional": 10}, "liveLimits": {"market": LIVE_MARKET, "maxNotional": 20}}
+            return {"config": dict(self.config), "monitor": json_safe(dict(self.state)), "events": self.events(50), "dryRun": not bool((self.state.get("snapshot") or {}).get("live")), "ordersEnabled": True, "apiWalletConfigured": API_KEY_FILE.exists(), "autoLimits": {"stepPercent": 0.5, "pollSeconds": AUTO_POLL_SECONDS, "maxExecutionAttempts": AUTO_MAX_EXECUTION_ATTEMPTS, "maxPositionNotional": 600, "minOrderNotional": 10}, "liveLimits": {"market": LIVE_MARKET, "maxNotional": 20}}
 
 
 MONITOR = NeutralisMonitor()

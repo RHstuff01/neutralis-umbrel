@@ -39,7 +39,7 @@
         <div class="notice"><b>Dry-run:</b> registra o ajuste a cada movimento de 0,5% sem enviar ordens. Ao iniciar, o preço atual vira a âncora e nenhum ajuste inicial é realizado.</div>
         <label class="field"><span>Confirmação para modo real</span><input id="liveConfirmation" autocomplete="off" placeholder="A confirmação aparecerá após carregar o mercado"></label>
         <div class="actions"><button id="startLive">Ativar monitor real</button></div>
-        <div class="notice"><b>Modo real:</b> envia IOC somente após cruzar 0,5%. Compra sempre usa reduce-only e nunca abre long. O short total fica limitado a US$ 600. Qualquer ordem aberta, saída da faixa ou divergência de preços pausa o monitor.</div>
+        <div class="notice"><b>Modo real:</b> consulta a cada 2 segundos e envia IOC após cruzar 0,5%. Se houver execução parcial, relê a posição e tenta o delta residual até três vezes. Compra sempre usa reduce-only e nunca abre long. O short total fica limitado a US$ 600.</div>
       </article>
     </section>
     <section class="panel logs"><h2>03 · Registro do monitor</h2><div id="events" class="empty">Nenhum evento registrado.</div></section>

@@ -181,16 +181,52 @@ class NeutralisTests(unittest.TestCase):
         exchange.assert_not_called()
 
     def test_auto_buy_is_reduce_only_and_never_crosses_zero(self):
-        position = {"hedgeSymbol": "COIN"}
+        position = {"positionAddress": "position", "hedgeSymbol": "COIN", "currentPrice": Decimal("176")}
         hyp = server.HypState("xyz:COIN", 3, Decimal("176"), Decimal("176"), Decimal("-2.740"), 0)
+        completed = server.HypState("xyz:COIN", 3, Decimal("176"), Decimal("176"), Decimal("-2.600"), 0)
+        snapshot = (position, completed, Decimal("150"), Decimal("200"), Decimal("1"), Decimal("2.600"))
         response = {"status": "ok", "response": {"data": {"statuses": [{"filled": {"totalSz": "0.140"}}]}}}
         exchange = Mock()
         exchange.order.return_value = response
-        with patch.object(server, "hyp_state", return_value=hyp), patch.object(server.MONITOR, "_exchange", return_value=exchange), patch.object(server.MONITOR, "_event"):
+        with patch.object(server, "hyp_state", return_value=hyp), patch.object(server.MONITOR, "_live_snapshot", return_value=snapshot), patch.object(server.MONITOR, "_exchange", return_value=exchange), patch.object(server.MONITOR, "_event"), patch.object(server.MONITOR.stop_event, "wait", return_value=False):
             result = server.MONITOR._execute_auto_adjustment(position, hyp, Decimal("2.600"))
         self.assertTrue(result["isBuy"])
         self.assertEqual(exchange.order.call_args.kwargs["reduce_only"], True)
         self.assertEqual(exchange.order.call_args.args[2], 0.14)
+        self.assertLess(result["residualNotional"], server.AUTO_MIN_ORDER_NOTIONAL)
+
+    def test_partial_ioc_is_recalculated_and_retried(self):
+        position = {"positionAddress": "position", "hedgeSymbol": "COIN", "currentPrice": Decimal("176")}
+        initial = server.HypState("xyz:COIN", 3, Decimal("176"), Decimal("176"), Decimal("-2.740"), 0)
+        partial = server.HypState("xyz:COIN", 3, Decimal("176"), Decimal("176"), Decimal("-2.670"), 0)
+        completed = server.HypState("xyz:COIN", 3, Decimal("176"), Decimal("176"), Decimal("-2.600"), 0)
+        snapshots = [
+            (position, partial, Decimal("150"), Decimal("200"), Decimal("1"), Decimal("2.600")),
+            (position, completed, Decimal("150"), Decimal("200"), Decimal("1"), Decimal("2.600")),
+        ]
+        responses = [
+            {"status": "ok", "response": {"data": {"statuses": [{"filled": {"totalSz": "0.070"}}]}}},
+            {"status": "ok", "response": {"data": {"statuses": [{"filled": {"totalSz": "0.070"}}]}}},
+        ]
+        exchange = Mock()
+        exchange.order.side_effect = responses
+        with patch.object(server, "hyp_state", side_effect=[initial, partial]), patch.object(server.MONITOR, "_live_snapshot", side_effect=snapshots), patch.object(server.MONITOR, "_exchange", return_value=exchange), patch.object(server.MONITOR, "_event"), patch.object(server.MONITOR.stop_event, "wait", return_value=False):
+            result = server.MONITOR._execute_auto_adjustment(position, initial, Decimal("2.600"))
+        self.assertEqual(exchange.order.call_count, 2)
+        self.assertEqual(result["currentShort"], Decimal("2.600"))
+        self.assertEqual(result["filled"], Decimal("0.140"))
+
+    def test_unfilled_ioc_retries_three_times_then_pauses(self):
+        position = {"positionAddress": "position", "hedgeSymbol": "COIN", "currentPrice": Decimal("176")}
+        hyp = server.HypState("xyz:COIN", 3, Decimal("176"), Decimal("176"), Decimal("-2.740"), 0)
+        snapshot = (position, hyp, Decimal("150"), Decimal("200"), Decimal("1"), Decimal("2.600"))
+        response = {"status": "ok", "response": {"data": {"statuses": [{"error": "IocCancel"}]}}}
+        exchange = Mock()
+        exchange.order.return_value = response
+        with patch.object(server, "hyp_state", return_value=hyp), patch.object(server.MONITOR, "_live_snapshot", return_value=snapshot), patch.object(server.MONITOR, "_exchange", return_value=exchange), patch.object(server.MONITOR, "_event"), patch.object(server.MONITOR.stop_event, "wait", return_value=False):
+            with self.assertRaisesRegex(server.NeutralisError, "Hedge incompleto após 3 tentativas"):
+                server.MONITOR._execute_auto_adjustment(position, hyp, Decimal("2.600"))
+        self.assertEqual(exchange.order.call_count, 3)
 
     def test_auto_sell_pauses_above_six_hundred_total_notional(self):
         position = {"hedgeSymbol": "COIN"}
