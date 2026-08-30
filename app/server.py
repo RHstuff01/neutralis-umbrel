@@ -60,8 +60,11 @@ SOLANA_PATTERN = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 EVM_PATTERN = re.compile(r"^0x[0-9a-fA-F]{40}$")
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{1,15}$")
 STABLE_SYMBOLS = {"USD", "USDC", "USDT", "USDS", "PYUSD"}
-SYMBOL_ALIASES = {"AAPLX": "AAPL", "CRCLX": "CRCL", "COINX": "COIN", "SPYX": "SP500"}
-NOTIONAL_HEDGE_SYMBOLS = {"SPYX"}
+# SPYx é a unidade de ETF próxima de US$ 770. O perp `mkts:US500` usa a
+# mesma escala. `xyz:SP500` é um índice próximo de US$ 7.700 e, portanto,
+# não pode ser usado como hedge 1:1 da quantidade de SPYx na LP.
+SYMBOL_ALIASES = {"AAPLX": "AAPL", "CRCLX": "CRCL", "COINX": "COIN", "SPYX": "US500"}
+HYP_DEX_BY_SYMBOL = {"US500": "mkts"}
 KNOWN_MINTS = {
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
     "XsueG8BtpquVJX9LVLLEGuViXUungE6WmK5YZ3p3bd1": "CRCLX",
@@ -144,7 +147,12 @@ def hyp_symbol(lp_symbol: str) -> str:
 
 
 def hedge_mode(lp_symbol: str) -> str:
-    return "notional" if str(lp_symbol or "").strip().upper() in NOTIONAL_HEDGE_SYMBOLS else "units"
+    return "units"
+
+
+def hyp_dex(symbol: str) -> str:
+    """DEX Hyperliquid que contém o contrato correspondente."""
+    return HYP_DEX_BY_SYMBOL.get(hyp_symbol(symbol), "xyz")
 
 
 def base58_decode(value: str) -> bytes:
@@ -812,16 +820,18 @@ class HypState:
     oracle: Decimal
     signed_position: Decimal
     open_orders: int
+    dex: str = "xyz"
 
 
 def hyp_state(account: str, symbol: str) -> HypState:
     if not EVM_PATTERN.fullmatch(account):
         raise NeutralisError("Conta Hyperliquid inválida")
     symbol = hyp_symbol(symbol)
-    market = f"xyz:{symbol}"
-    metadata, contexts = json_request(HYP_INFO_URL, {"type": "metaAndAssetCtxs", "dex": "xyz"})
-    clearinghouse = json_request(HYP_INFO_URL, {"type": "clearinghouseState", "user": account, "dex": "xyz"})
-    orders = json_request(HYP_INFO_URL, {"type": "frontendOpenOrders", "user": account, "dex": "xyz"})
+    dex = hyp_dex(symbol)
+    market = f"{dex}:{symbol}"
+    metadata, contexts = json_request(HYP_INFO_URL, {"type": "metaAndAssetCtxs", "dex": dex})
+    clearinghouse = json_request(HYP_INFO_URL, {"type": "clearinghouseState", "user": account, "dex": dex})
+    orders = json_request(HYP_INFO_URL, {"type": "frontendOpenOrders", "user": account, "dex": dex})
     universe = metadata.get("universe", [])
     index = next((i for i, row in enumerate(universe) if str(row.get("name", "")).upper() in {symbol, market.upper()}), None)
     if index is None:
@@ -841,6 +851,7 @@ def hyp_state(account: str, symbol: str) -> HypState:
         oracle=decimal(context.get("oraclePx", context.get("markPx")), "Hyperliquid oraclePx"),
         signed_position=signed,
         open_orders=open_orders,
+        dex=dex,
     )
 
 
@@ -986,7 +997,7 @@ class NeutralisMonitor:
             wallet,
             MAINNET_API_URL,
             account_address=self.config["hyperliquidAccount"],
-            perp_dexs=["xyz"],
+            perp_dexs=["xyz", "mkts"],
         )
 
     @staticmethod

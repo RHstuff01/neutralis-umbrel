@@ -24,8 +24,8 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(server.hyp_symbol("CRCLX"), "CRCL")
         self.assertEqual(server.hyp_symbol("COINX"), "COIN")
         self.assertEqual(server.hyp_symbol("SPCX"), "SPCX")
-        self.assertEqual(server.hyp_symbol("SPYx"), "SP500")
-        self.assertEqual(server.hedge_mode("SPYx"), "notional")
+        self.assertEqual(server.hyp_symbol("SPYx"), "US500")
+        self.assertEqual(server.hedge_mode("SPYx"), "units")
         self.assertEqual(server.hyp_symbol("crcl"), "CRCL")
 
     def test_raydium_position_pda_from_nft(self):
@@ -114,8 +114,8 @@ class NeutralisTests(unittest.TestCase):
         with patch.object(server, "solana_account", side_effect=[bytes(pool_data), bytes(mint_a_data), bytes(mint_b_data)]):
             result = server.orca_position(nft, bytes(position_data))
         self.assertEqual(result["pair"], "SPYX / USDC")
-        self.assertEqual(result["hedgeSymbol"], "SP500")
-        self.assertEqual(result["hedgeMode"], "notional")
+        self.assertEqual(result["hedgeSymbol"], "US500")
+        self.assertEqual(result["hedgeMode"], "units")
         self.assertTrue(result["importable"])
 
     def test_orca_discovers_classic_and_token_2022_position_nfts(self):
@@ -325,43 +325,39 @@ class NeutralisTests(unittest.TestCase):
         self.assertGreater(below, center)
         self.assertGreater(center, above)
 
-    def test_spyx_target_is_converted_to_sp500_notional(self):
+    def test_spyx_target_uses_same_units_as_mkts_us500(self):
         position = {
-            "positionAddress": "position", "assetSymbol": "SPYX", "hedgeSymbol": "SP500",
-            "hedgeMode": "notional", "liquidityUsd": Decimal("10000"),
+            "positionAddress": "position", "assetSymbol": "SPYX", "hedgeSymbol": "US500",
+            "hedgeMode": "units", "liquidityUsd": Decimal("10000"),
             "normalizedLiquidity": Decimal("1000"), "currentPrice": Decimal("775"),
             "lowerPrice": Decimal("700"), "upperPrice": Decimal("850"), "importable": True,
         }
-        hyp = server.HypState("xyz:SP500", 3, Decimal("7675"), Decimal("7675"), Decimal("0"), 0)
+        hyp = server.HypState("mkts:US500", 3, Decimal("775"), Decimal("775"), Decimal("0"), 0, "mkts")
         asset_delta = server.base_target(Decimal("1000"), Decimal("775"), Decimal("700"), Decimal("850"))
         with patch.object(server.MONITOR, "_selected_position", return_value=position), patch.object(
             server, "hyp_state", return_value=hyp
         ):
             *_, target = server.MONITOR._live_snapshot()
-        self.assertEqual(target, asset_delta * Decimal("775") / Decimal("7675"))
-        self.assertNotEqual(target, asset_delta)
+        self.assertEqual(target, asset_delta)
 
     def test_snapshot_rejects_lp_outside_active_range(self):
         position = {
-            "positionAddress": "position", "assetSymbol": "SPYX", "hedgeSymbol": "SP500",
-            "hedgeMode": "notional", "liquidityUsd": Decimal("10000"),
+            "positionAddress": "position", "assetSymbol": "SPYX", "hedgeSymbol": "US500",
+            "hedgeMode": "units", "liquidityUsd": Decimal("10000"),
             "normalizedLiquidity": Decimal("1000"), "currentPrice": Decimal("851"),
             "lowerPrice": Decimal("700"), "upperPrice": Decimal("850"), "importable": True,
         }
-        hyp = server.HypState("xyz:SP500", 3, Decimal("7675"), Decimal("7675"), Decimal("0"), 0)
+        hyp = server.HypState("mkts:US500", 3, Decimal("775"), Decimal("775"), Decimal("0"), 0, "mkts")
         with patch.object(server.MONITOR, "_selected_position", return_value=position), patch.object(
             server, "hyp_state", return_value=hyp
         ):
             with self.assertRaisesRegex(server.NeutralisError, "fora da faixa ativa"):
                 server.MONITOR._live_snapshot()
 
-    def test_spyx_basis_tracks_ratio_drift_not_price_scale(self):
-        position = {"hedgeMode": "notional"}
-        initial_ratio = Decimal("775") / Decimal("7675")
-        self.assertEqual(server.hedge_basis(position, Decimal("775"), Decimal("7675"), initial_ratio), 0)
-        drift = server.hedge_basis(position, Decimal("780"), Decimal("7675"), initial_ratio)
-        self.assertGreater(drift, Decimal("0.006"))
-        self.assertLess(drift, Decimal("0.007"))
+    def test_spyx_maps_to_units_contract_on_mkts_dex(self):
+        self.assertEqual(server.hyp_symbol("SPYX"), "US500")
+        self.assertEqual(server.hyp_dex("US500"), "mkts")
+        self.assertEqual(server.hedge_mode("SPYX"), "units")
 
     def test_api_wallet_key_is_never_returned(self):
         key = "11" * 32
