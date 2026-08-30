@@ -637,10 +637,27 @@ def orca_positions_manual(wallet: str) -> list[dict[str, Any]]:
 
 def orca_positions(wallet: str) -> list[dict[str, Any]]:
     """Prioriza o SDK oficial; mantém a leitura nativa como contingência."""
+    sdk_error = None
     try:
-        return orca_sdk_positions(wallet)
-    except NeutralisError:
-        return orca_positions_manual(wallet)
+        positions = orca_sdk_positions(wallet)
+        if positions:
+            return positions
+    except NeutralisError as error:
+        sdk_error = str(error)
+    try:
+        positions = orca_positions_manual(wallet)
+        if positions:
+            return positions
+    except NeutralisError as error:
+        fallback_error = str(error)
+        detail = f" SDK: {sdk_error}." if sdk_error else " SDK: nenhuma posição decodificável."
+        raise NeutralisError(f"Nenhuma posição Orca foi encontrada nesta carteira.{detail} Leitor alternativo: {fallback_error}.") from error
+    detail = f" SDK: {sdk_error}." if sdk_error else " SDK oficial: 0 posições decodificáveis."
+    raise NeutralisError(
+        "Nenhuma posição Orca foi encontrada nesta carteira."
+        f"{detail} Leitor alternativo: 0 posições decodificáveis. "
+        "Verifique se a LP é realmente um Whirlpool da Orca e se a carteira pública é a proprietária do NFT da posição."
+    )
 
 
 def token_metadata(pool: dict[str, Any], side: str) -> dict[str, Any]:

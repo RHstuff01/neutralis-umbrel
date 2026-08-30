@@ -82,5 +82,5 @@ docker compose -f compose.yaml stop neutralis
 
 `umbrel-app.yml` e `docker-compose.yml` são um esqueleto para a instalação
 nativa. Antes de adicioná-lo a uma loja, é necessário publicar a imagem
-`neutralis-umbrel:0.5.7` para ARM64 e AMD64 em um registry e substituir a
+`neutralis-umbrel:0.5.8` para ARM64 e AMD64 em um registry e substituir a
 diretiva `build` por esse endereço de imagem.
