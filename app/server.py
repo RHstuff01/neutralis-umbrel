@@ -65,6 +65,10 @@ NOTIONAL_HEDGE_SYMBOLS = {"SPYX"}
 KNOWN_MINTS = {
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
     "XsueG8BtpquVJX9LVLLEGuViXUungE6WmK5YZ3p3bd1": "CRCLX",
+    # SP500 xStock (SPYx). O endpoint de tokens da Orca nem sempre devolve
+    # este mint a tempo; sem este mapeamento uma posição SPYx/USDC válida era
+    # descartada antes de aparecer na lista de posições.
+    "XsoCS1TfEyfFhfvj8EtZ528L3CaKBDBRqRapnBbDF2W": "SPYX",
 }
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 

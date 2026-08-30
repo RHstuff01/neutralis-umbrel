@@ -7,7 +7,7 @@ services:
   server:
     build:
       context: .
-    image: neutralis-umbrel:0.5.8
+    image: neutralis-umbrel:0.5.9
     user: "0:0"
     container_name: neutralis_server_1
     restart: on-failure

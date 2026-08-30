@@ -93,6 +93,31 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(result["hedgeSymbol"], "CRCL")
         self.assertTrue(result["importable"])
 
+    def test_orca_spyx_usdc_uses_known_spyx_mint_without_token_api(self):
+        nft = "6cHCWbDnkHehmYh8LcfwKTDdq9ncHGnVuTAVNAQ5kPEw"
+        pool = "Fae5dWVntUt6zbWu2voXxioDpMii7SqQwtsxBmoVCsHR"
+        mint_a = "XsoCS1TfEyfFhfvj8EtZ528L3CaKBDBRqRapnBbDF2W"
+        mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        position_data = bytearray(216)
+        position_data[:8] = server.ORCA_POSITION_DISCRIMINATOR
+        position_data[8:40] = server.base58_decode(pool)
+        position_data[40:72] = server.base58_decode(nft)
+        position_data[72:88] = (10**12).to_bytes(16, "little")
+        position_data[88:92] = (66000).to_bytes(4, "little", signed=True)
+        position_data[92:96] = (68000).to_bytes(4, "little", signed=True)
+        pool_data = bytearray(653)
+        pool_data[65:81] = int((775**0.5) * 2**64).to_bytes(16, "little")
+        pool_data[101:133] = server.base58_decode(mint_a)
+        pool_data[181:213] = server.base58_decode(mint_b)
+        mint_a_data, mint_b_data = bytearray(82), bytearray(82)
+        mint_a_data[44] = mint_b_data[44] = 6
+        with patch.object(server, "solana_account", side_effect=[bytes(pool_data), bytes(mint_a_data), bytes(mint_b_data)]):
+            result = server.orca_position(nft, bytes(position_data))
+        self.assertEqual(result["pair"], "SPYX / USDC")
+        self.assertEqual(result["hedgeSymbol"], "SP500")
+        self.assertEqual(result["hedgeMode"], "notional")
+        self.assertTrue(result["importable"])
+
     def test_orca_discovers_classic_and_token_2022_position_nfts(self):
         wallet = "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw"
         classic = "6cHCWbDnkHehmYh8LcfwKTDdq9ncHGnVuTAVNAQ5kPEw"
