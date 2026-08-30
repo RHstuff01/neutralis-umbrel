@@ -73,10 +73,14 @@ docker compose -f compose.yaml stop neutralis
 - Para SPYx, o hedge usa `xyz:SP500` por **valor nocional**: quantidade de SPYx × preço da LP ÷ preço do SP500. O robô monitora a variação da relação entre os dois preços e pausa se ela se afastar mais de 0,75% da relação observada ao iniciar.
 - SPYx e SP500 não são o mesmo ativo. O hedge reduz o delta em dólares, mas permanece sujeito a risco de base entre o ETF/token e o índice.
 - Pares sem cotação estável reconhecida, como Fartcoin/SOL, não são elegíveis para este monitor de RWA/USD.
+- A descoberta da Orca usa `fetchPositionsForOwner` do SDK oficial para SPL
+  Token, Token-2022 e Position Bundles. A URL do RPC Solana pode ser cadastrada
+  na interface e fica somente no volume `/data`, com permissão `0600`; ela não
+  é devolvida pela API nem incluída na imagem.
 
 ## Community App Store
 
 `umbrel-app.yml` e `docker-compose.yml` são um esqueleto para a instalação
 nativa. Antes de adicioná-lo a uma loja, é necessário publicar a imagem
-`neutralis-umbrel:0.5.6` para ARM64 e AMD64 em um registry e substituir a
+`neutralis-umbrel:0.5.7` para ARM64 e AMD64 em um registry e substituir a
 diretiva `build` por esse endereço de imagem.

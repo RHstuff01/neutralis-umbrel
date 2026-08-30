@@ -9,6 +9,7 @@ import hashlib
 import math
 import os
 import re
+import subprocess
 import threading
 import traceback
 from dataclasses import dataclass
@@ -27,10 +28,12 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 CONFIG_FILE = DATA_DIR / "config.json"
 LOG_FILE = DATA_DIR / "events.jsonl"
 API_KEY_FILE = DATA_DIR / "hyperliquid-api-wallet.key"
+SOLANA_RPC_FILE = DATA_DIR / "solana-rpc.url"
 BYREAL_URL = "https://api2.byreal.io/byreal/api/dex/v2/position/list"
 BYREAL_MINT_LIST_URL = "https://api2.byreal.io/byreal/api/dex/v2/mint/list"
 HYP_INFO_URL = "https://api.hyperliquid.xyz/info"
 SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+ORCA_DISCOVERY_HELPER = Path(__file__).resolve().parent / "orca-discovery.mjs"
 RAYDIUM_MINT_URL = "https://api-v3.raydium.io/mint/ids"
 ORCA_TOKEN_URL = "https://api.orca.so/v2/solana/tokens"
 RAYDIUM_CLMM_PROGRAM = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
@@ -78,7 +81,7 @@ def prepare_data_permissions() -> None:
     """Prepara o volume persistente antes de iniciar o servidor."""
     DATA_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(DATA_DIR, 0o700)
-    for path in (CONFIG_FILE, LOG_FILE):
+    for path in (CONFIG_FILE, LOG_FILE, SOLANA_RPC_FILE, API_KEY_FILE):
         if path.exists():
             os.chmod(path, 0o600)
 
@@ -114,6 +117,18 @@ def json_request(url: str, payload: dict[str, Any] | None = None) -> Any:
             return json.load(response)
     except Exception as error:
         raise NeutralisError(f"Falha de rede ao consultar {urlparse(url).hostname}") from error
+
+
+def solana_rpc_url() -> str:
+    try:
+        stored = SOLANA_RPC_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        stored = ""
+    return stored or SOLANA_RPC_URL
+
+
+def solana_request(payload: dict[str, Any]) -> Any:
+    return json_request(solana_rpc_url(), payload)
 
 
 def hyp_symbol(lp_symbol: str) -> str:
@@ -206,7 +221,7 @@ def orca_bundled_position_pda(bundle_address: str, bundle_index: int, program_id
 
 
 def solana_account(address: str, expected_owner: str | None = None) -> bytes:
-    response = json_request(SOLANA_RPC_URL, {
+    response = solana_request({
         "jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
         "params": [address, {"encoding": "base64", "commitment": "confirmed"}],
     })
@@ -232,7 +247,7 @@ def solana_accounts(addresses: list[str], expected_owner: str | None = None) -> 
     result: dict[str, bytes] = {}
     for start in range(0, len(addresses), 100):
         chunk = addresses[start : start + 100]
-        response = json_request(SOLANA_RPC_URL, {
+        response = solana_request({
             "jsonrpc": "2.0", "id": 1, "method": "getMultipleAccounts",
             "params": [chunk, {"encoding": "base64", "commitment": "confirmed"}],
         })
@@ -381,7 +396,7 @@ def solana_nft_mints(wallet: str) -> list[str]:
     successful_queries = 0
     for program_id in (SPL_TOKEN_PROGRAM, TOKEN_2022_PROGRAM):
         try:
-            response = json_request(SOLANA_RPC_URL, {
+            response = solana_request({
                 "jsonrpc": "2.0", "id": 1, "method": "getTokenAccountsByOwner",
                 "params": [wallet, {"programId": program_id}, {"encoding": "base64", "commitment": "confirmed"}],
             })
@@ -524,7 +539,57 @@ def orca_position_from_address(address: str) -> dict[str, Any] | None:
     raise last_error or NeutralisError("Posição Orca não encontrada")
 
 
-def orca_positions(wallet: str) -> list[dict[str, Any]]:
+def orca_sdk_positions(wallet: str) -> list[dict[str, Any]]:
+    environment = {**os.environ, "SOLANA_RPC_URL": solana_rpc_url()}
+    try:
+        completed = subprocess.run(
+            ["node", str(ORCA_DISCOVERY_HELPER), wallet],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise NeutralisError("SDK oficial da Orca não está disponível") from error
+    if completed.returncode != 0:
+        raise NeutralisError("SDK oficial da Orca não conseguiu consultar a carteira")
+    try:
+        payload = json.loads(completed.stdout)
+        rows = payload.get("positions", [])
+    except (json.JSONDecodeError, AttributeError) as error:
+        raise NeutralisError("Resposta inválida do SDK oficial da Orca") from error
+    if not isinstance(rows, list):
+        raise NeutralisError("Resposta inválida do SDK oficial da Orca")
+
+    positions = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        address = str(row.get("positionAddress", ""))
+        mint = str(row.get("positionMint", ""))
+        program_id = str(row.get("programId", ""))
+        if not SOLANA_PATTERN.fullmatch(address) or not SOLANA_PATTERN.fullmatch(mint):
+            continue
+        if program_id not in ORCA_WHIRLPOOL_PROGRAMS:
+            continue
+        try:
+            data = solana_account(address, program_id)
+            position = orca_position(mint, data, program_id)
+            position["personalPositionAddress"] = address
+            if row.get("positionBundleAddress"):
+                position.update({
+                    "positionAddress": address,
+                    "positionNftMint": mint,
+                    "positionBundleAddress": str(row["positionBundleAddress"]),
+                })
+            positions.append(position)
+        except NeutralisError:
+            continue
+    return positions
+
+
+def orca_positions_manual(wallet: str) -> list[dict[str, Any]]:
     nft_mints = solana_nft_mints(wallet)
     positions = []
     for program_id in ORCA_WHIRLPOOL_PROGRAMS:
@@ -568,6 +633,14 @@ def orca_positions(wallet: str) -> list[dict[str, Any]]:
             except NeutralisError:
                 continue
     return positions
+
+
+def orca_positions(wallet: str) -> list[dict[str, Any]]:
+    """Prioriza o SDK oficial; mantém a leitura nativa como contingência."""
+    try:
+        return orca_sdk_positions(wallet)
+    except NeutralisError:
+        return orca_positions_manual(wallet)
 
 
 def token_metadata(pool: dict[str, Any], side: str) -> dict[str, Any]:
@@ -858,6 +931,17 @@ class NeutralisMonitor:
         API_KEY_FILE.write_text(normalized, encoding="ascii")
         os.chmod(API_KEY_FILE, 0o600)
         return {"configured": True}
+
+    def save_solana_rpc(self, incoming: dict[str, Any]) -> dict[str, Any]:
+        endpoint = str(incoming.get("endpoint", "")).strip()
+        parsed = urlparse(endpoint)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            raise NeutralisError("Endpoint RPC Solana inválido; use uma URL HTTPS")
+        if len(endpoint) > 2048:
+            raise NeutralisError("Endpoint RPC Solana muito longo")
+        SOLANA_RPC_FILE.write_text(endpoint, encoding="utf-8")
+        os.chmod(SOLANA_RPC_FILE, 0o600)
+        return {"configured": True, "host": parsed.hostname}
 
     def _api_key(self) -> str:
         try:
@@ -1287,7 +1371,7 @@ class NeutralisMonitor:
 
     def public_state(self) -> dict[str, Any]:
         with self.lock:
-            return {"config": dict(self.config), "monitor": json_safe(dict(self.state)), "events": self.events(50), "dryRun": not bool((self.state.get("snapshot") or {}).get("live")), "ordersEnabled": True, "apiWalletConfigured": API_KEY_FILE.exists(), "autoLimits": {"stepPercent": 0.5, "pollSeconds": AUTO_POLL_SECONDS, "maxExecutionAttempts": AUTO_MAX_EXECUTION_ATTEMPTS, "maxPositionNotional": float(self.max_position_notional()), "minOrderNotional": 10}}
+            return {"config": dict(self.config), "monitor": json_safe(dict(self.state)), "events": self.events(50), "dryRun": not bool((self.state.get("snapshot") or {}).get("live")), "ordersEnabled": True, "apiWalletConfigured": API_KEY_FILE.exists(), "solanaRpcConfigured": SOLANA_RPC_FILE.exists(), "solanaRpcHost": urlparse(solana_rpc_url()).hostname, "autoLimits": {"stepPercent": 0.5, "pollSeconds": AUTO_POLL_SECONDS, "maxExecutionAttempts": AUTO_MAX_EXECUTION_ATTEMPTS, "maxPositionNotional": float(self.max_position_notional()), "minOrderNotional": 10}}
 
 
 MONITOR = NeutralisMonitor()
@@ -1349,6 +1433,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"config": MONITOR.save_config(self.read_json())})
             if path == "/api/trading/key":
                 return self.send_json(MONITOR.save_api_key(self.read_json()))
+            if path == "/api/solana/rpc":
+                return self.send_json(MONITOR.save_solana_rpc(self.read_json()))
             if path == "/api/monitor/start":
                 MONITOR.start()
                 return self.send_json({"ok": True}, HTTPStatus.ACCEPTED)

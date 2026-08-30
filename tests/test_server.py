@@ -138,7 +138,7 @@ class NeutralisTests(unittest.TestCase):
                 {},
             ]
         ), patch.object(server, "orca_position", return_value=decoded):
-            positions = server.orca_positions(wallet)
+            positions = server.orca_positions_manual(wallet)
         self.assertEqual(len(positions), 1)
         self.assertEqual(positions[0]["positionAddress"], bundled_position)
         self.assertEqual(positions[0]["positionNftMint"], mint)

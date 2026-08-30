@@ -1,0 +1,9 @@
+{
+  "name": "neutralis-orca-reader",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@orca-so/whirlpools": "8.0.1",
+    "@solana/kit": "^5.0.0"
+  }
+}
