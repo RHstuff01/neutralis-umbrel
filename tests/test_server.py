@@ -524,17 +524,17 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(result["currentShort"], Decimal("2.600"))
         self.assertEqual(result["filled"], Decimal("0.140"))
 
-    def test_unfilled_ioc_retries_three_times_then_pauses(self):
+    def test_unfilled_ioc_keeps_retrying_until_manual_stop(self):
         position = {"positionAddress": "position", "hedgeSymbol": "COIN", "currentPrice": Decimal("176")}
         hyp = server.HypState("xyz:COIN", 3, Decimal("176"), Decimal("176"), Decimal("-2.740"), 0)
         snapshot = (position, hyp, Decimal("150"), Decimal("200"), Decimal("1"), Decimal("2.600"))
         response = {"status": "ok", "response": {"data": {"statuses": [{"error": "IocCancel"}]}}}
         exchange = Mock()
         exchange.order.return_value = response
-        with patch.object(server, "hyp_state", return_value=hyp), patch.object(server.MONITOR, "_live_snapshot", return_value=snapshot), patch.object(server.MONITOR, "_exchange", return_value=exchange), patch.object(server.MONITOR, "_event"), patch.object(server.MONITOR.stop_event, "wait", return_value=False):
-            with self.assertRaisesRegex(server.NeutralisError, "Hedge incompleto após 3 tentativas"):
+        with patch.object(server, "hyp_state", return_value=hyp), patch.object(server.MONITOR, "_live_snapshot", return_value=snapshot), patch.object(server.MONITOR, "_exchange", return_value=exchange), patch.object(server.MONITOR, "_event"), patch.object(server.MONITOR.stop_event, "wait", side_effect=[False, False, False, True]):
+            with self.assertRaisesRegex(server.NeutralisError, "Monitor interrompido durante o ajuste"):
                 server.MONITOR._execute_auto_adjustment(position, hyp, Decimal("2.600"))
-        self.assertEqual(exchange.order.call_count, 3)
+        self.assertEqual(exchange.order.call_count, 4)
 
     def test_auto_sell_pauses_above_six_hundred_total_notional(self):
         position = {"hedgeSymbol": "COIN", "currentPrice": Decimal("176")}

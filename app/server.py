@@ -12,6 +12,7 @@ import re
 import subprocess
 import threading
 import traceback
+from itertools import count
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
@@ -56,8 +57,10 @@ AUTO_EXECUTION_PRICE_DRIFT = Decimal("0.005")
 AUTO_MIN_ORDER_NOTIONAL = Decimal("10")
 AUTO_POLL_SECONDS = 2
 AUTO_RETRY_SECONDS = 1
-AUTO_MAX_EXECUTION_ATTEMPTS = 3
-AUTO_RETRY_SLIPPAGES = (Decimal("0.003"), Decimal("0.005"), Decimal("0.0075"))
+# Uma IOC que não encontra livro não deve abandonar o hedge. O preço-limite
+# vai ficando mais agressivo até este teto e depois continua tentando nele,
+# sempre podendo ser interrompido manualmente pelo usuário.
+AUTO_RETRY_SLIPPAGES = (Decimal("0.005"), Decimal("0.01"), Decimal("0.02"), Decimal("0.03"))
 PRIVATE_KEY_PATTERN = re.compile(r"^(?:0x)?[0-9a-fA-F]{64}$")
 TELEGRAM_TOKEN_PATTERN = re.compile(r"^\d{6,12}:[A-Za-z0-9_-]{20,}$")
 TELEGRAM_CHAT_PATTERN = re.compile(r"^-?\d{5,20}$")
@@ -1160,7 +1163,7 @@ class NeutralisMonitor:
         total_filled = Decimal("0")
         last_direction: bool | None = None
 
-        for attempt in range(AUTO_MAX_EXECUTION_ATTEMPTS):
+        for attempt in count():
             if attempt:
                 position, hyp, lower, upper, _, _ = self._live_snapshot()
                 if original_position and position.get("positionAddress") != original_position:
@@ -1200,17 +1203,21 @@ class NeutralisMonitor:
             if notional < AUTO_MIN_ORDER_NOTIONAL:
                 return None
 
-            slippage = AUTO_RETRY_SLIPPAGES[attempt]
-            limit_price = hyp.mark * (Decimal("1") + slippage if is_buy else Decimal("1") - slippage)
-            limit_price = Decimal(f"{limit_price:.5g}")
+            slippage = AUTO_RETRY_SLIPPAGES[min(attempt, len(AUTO_RETRY_SLIPPAGES) - 1)]
             response = None
             try:
                 with self.execution_lock:
                     current = hyp_state(self.config["hyperliquidAccount"], position["hedgeSymbol"])
                     if current.open_orders or current.signed_position != hyp.signed_position:
                         raise NeutralisError("A posição ou as ordens mudaram durante a validação")
-                    if abs(current.mark - hyp.mark) / hyp.mark > AUTO_EXECUTION_PRICE_DRIFT:
-                        raise NeutralisError("O preço mudou mais de 0,5% durante a validação")
+                    # O mark pode mudar rápido entre a consulta e o envio.
+                    # Usamos o mark recém-lido para tornar a IOC executável,
+                    # em vez de pausar com o hedge incompleto.
+                    hyp = current
+                    if not is_buy and (current_short + size) * hyp.mark > self.max_position_notional():
+                        raise NeutralisError(f"Short-alvo ultrapassaria o limite total de US$ {self.max_position_notional():.2f}")
+                    limit_price = hyp.mark * (Decimal("1") + slippage if is_buy else Decimal("1") - slippage)
+                    limit_price = Decimal(f"{limit_price:.5g}")
                     response = self._exchange().order(
                         hyp.market,
                         is_buy,
@@ -1233,18 +1240,25 @@ class NeutralisMonitor:
                 )
                 if not retryable:
                     raise
-                if attempt + 1 >= AUTO_MAX_EXECUTION_ATTEMPTS:
-                    raise NeutralisError(
-                        f"Hedge incompleto após {AUTO_MAX_EXECUTION_ATTEMPTS} tentativas; "
-                        f"delta residual US$ {residual_notional:.2f}"
-                    ) from error
-                self._event(
-                    "live-retry",
-                    f"IOC não executada; nova tentativa {attempt + 2}/{AUTO_MAX_EXECUTION_ATTEMPTS}",
-                    target=target,
-                    mark=hyp.mark,
-                    response=response,
-                )
+                attempt_number = attempt + 1
+                max_attempt = len(AUTO_RETRY_SLIPPAGES)
+                # Registra o escalonamento e, no patamar máximo, uma vez a
+                # cada dez tentativas para manter o histórico legível.
+                if attempt_number <= max_attempt or attempt_number % 10 == 0:
+                    suffix = (
+                        f"tentando novamente com slippage máximo de {slippage * 100:.2f}%"
+                        if attempt_number >= max_attempt
+                        else f"nova tentativa {attempt_number + 1}/{max_attempt}"
+                    )
+                    self._event(
+                        "live-retry",
+                        f"IOC não executada; {suffix}",
+                        target=target,
+                        mark=hyp.mark,
+                        response=response,
+                        attempt=attempt_number,
+                        slippagePercent=slippage * 100,
+                    )
                 if self.stop_event.wait(AUTO_RETRY_SECONDS):
                     raise NeutralisError("Monitor interrompido durante o ajuste")
                 continue
@@ -1264,27 +1278,8 @@ class NeutralisMonitor:
                 reduceOnly=is_buy,
                 filled=filled,
             )
-            if attempt + 1 < AUTO_MAX_EXECUTION_ATTEMPTS and self.stop_event.wait(AUTO_RETRY_SECONDS):
+            if self.stop_event.wait(AUTO_RETRY_SECONDS):
                 raise NeutralisError("Monitor interrompido durante o ajuste")
-
-        position, hyp, _, _, _, _ = self._live_snapshot()
-        current_short = abs(min(hyp.signed_position, Decimal("0")))
-        residual_notional = abs(target - current_short) * hyp.mark
-        if residual_notional >= AUTO_MIN_ORDER_NOTIONAL:
-            raise NeutralisError(
-                f"Hedge incompleto após {AUTO_MAX_EXECUTION_ATTEMPTS} tentativas; "
-                f"delta residual US$ {residual_notional:.2f}"
-            )
-        return {
-            "size": total_filled,
-            "notional": total_filled * hyp.mark,
-            "isBuy": last_direction,
-            "filled": total_filled,
-            "residualNotional": residual_notional,
-            "currentShort": current_short,
-            "target": target,
-            "anchor": hyp.mark,
-        }
 
     def positions(self) -> list[dict[str, Any]]:
         if self.config["source"] == "raydium":
@@ -1646,7 +1641,7 @@ class NeutralisMonitor:
 
     def public_state(self) -> dict[str, Any]:
         with self.lock:
-            return {"config": dict(self.config), "monitor": json_safe(dict(self.state)), "events": self.events(50), "dryRun": not bool((self.state.get("snapshot") or {}).get("live")), "ordersEnabled": True, "apiWalletConfigured": API_KEY_FILE.exists(), "telegramConfigured": self.telegram_configured(), "solanaRpcConfigured": SOLANA_RPC_FILE.exists(), "solanaRpcHost": urlparse(solana_rpc_url()).hostname, "autoLimits": {"narrowRangePercent": 3, "narrowStepPercent": 0.25, "wideStepPercent": 0.5, "pollSeconds": AUTO_POLL_SECONDS, "maxExecutionAttempts": AUTO_MAX_EXECUTION_ATTEMPTS, "maxPositionNotional": float(self.max_position_notional()), "minOrderNotional": 10}}
+            return {"config": dict(self.config), "monitor": json_safe(dict(self.state)), "events": self.events(50), "dryRun": not bool((self.state.get("snapshot") or {}).get("live")), "ordersEnabled": True, "apiWalletConfigured": API_KEY_FILE.exists(), "telegramConfigured": self.telegram_configured(), "solanaRpcConfigured": SOLANA_RPC_FILE.exists(), "solanaRpcHost": urlparse(solana_rpc_url()).hostname, "autoLimits": {"pollSeconds": AUTO_POLL_SECONDS, "maxSlippagePercent": float(AUTO_RETRY_SLIPPAGES[-1] * 100), "maxPositionNotional": float(self.max_position_notional()), "minOrderNotional": 10}}
 
 
 MONITORS = {"1": NeutralisMonitor("1"), "2": NeutralisMonitor("2")}
