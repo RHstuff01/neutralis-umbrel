@@ -309,7 +309,7 @@ def raydium_symbols(mints: list[str]) -> dict[str, str]:
                 symbol = str(row.get("symbol") or "").upper()
                 if address in missing and symbol:
                     symbols[address] = symbol
-    except NeutralisError:
+    except (NeutralisError, StopIteration):
         pass
     return symbols
 
@@ -447,7 +447,26 @@ def solana_nft_mints(wallet: str) -> list[str]:
             mint = base58_encode(token_account[:32])
             if SOLANA_PATTERN.fullmatch(mint):
                 mints.add(mint)
-    if not successful_queries:
+    # Helius e outros RPCs compatíveis com DAS enxergam NFTs de posição que
+    # nem sempre aparecem na enumeração SPL padrão (por exemplo posições
+    # agrupadas/Token-2022). É uma contingência: RPCs comuns apenas ignoram
+    # esse método e a descoberta tradicional continua funcionando.
+    try:
+        assets = solana_request({
+            "jsonrpc": "2.0", "id": 2, "method": "getAssetsByOwner",
+            "params": {"ownerAddress": wallet, "page": 1, "limit": 1000,
+                       "displayOptions": {"showFungible": False}},
+        })
+        rows = assets.get("result", {}).get("items", []) if isinstance(assets, dict) else []
+        for row in rows if isinstance(rows, list) else []:
+            mint = str(row.get("id", "")) if isinstance(row, dict) else ""
+            token_info = row.get("token_info", {}) if isinstance(row, dict) else {}
+            decimals = token_info.get("decimals") if isinstance(token_info, dict) else None
+            if SOLANA_PATTERN.fullmatch(mint) and (decimals in {None, 0}):
+                mints.add(mint)
+    except (NeutralisError, StopIteration):
+        pass
+    if not successful_queries and not mints:
         raise NeutralisError("Falha ao consultar os NFTs da carteira Solana")
     return sorted(mints)
 
@@ -963,8 +982,13 @@ def json_safe(value: Any) -> Any:
 
 
 class NeutralisMonitor:
-    def __init__(self) -> None:
+    def __init__(self, slot: str = "1") -> None:
         DATA_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.slot = slot
+        # O slot 1 preserva os dados já usados pelo app. O segundo slot tem
+        # arquivos próprios: configuração e registro jamais se misturam.
+        self.config_file = CONFIG_FILE if slot == "1" else DATA_DIR / f"config-{slot}.json"
+        self.log_file = LOG_FILE if slot == "1" else DATA_DIR / f"events-{slot}.jsonl"
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
@@ -986,7 +1010,7 @@ class NeutralisMonitor:
             "maxPositionNotional": "600",
         }
         try:
-            stored = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            stored = json.loads(self.config_file.read_text(encoding="utf-8"))
             if isinstance(stored, dict):
                 defaults.update({key: str(stored.get(key, defaults[key])) for key in defaults})
         except (OSError, json.JSONDecodeError):
@@ -1013,8 +1037,8 @@ class NeutralisMonitor:
             if self.state["mode"] == "running":
                 raise NeutralisError("Pare o monitor antes de alterar a configuração")
             self.config = {"source": source, "solanaWallet": wallet, "hyperliquidAccount": account, "positionAddress": position, "maxPositionNotional": str(max_notional)}
-            CONFIG_FILE.write_text(json.dumps(self.config, indent=2), encoding="utf-8")
-            os.chmod(CONFIG_FILE, 0o600)
+            self.config_file.write_text(json.dumps(self.config, indent=2), encoding="utf-8")
+            os.chmod(self.config_file, 0o600)
         return dict(self.config)
 
     def max_position_notional(self) -> Decimal:
@@ -1283,14 +1307,14 @@ class NeutralisMonitor:
 
     def _event(self, event: str, message: str, **details: Any) -> None:
         record = {"at": now_iso(), "event": event, "message": message, **json_safe(details)}
-        with LOG_FILE.open("a", encoding="utf-8") as handle:
+        with self.log_file.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         with self.lock:
             self.state["lastEvent"] = record
 
     def events(self, limit: int = 100) -> list[dict[str, Any]]:
         try:
-            lines = LOG_FILE.read_text(encoding="utf-8").splitlines()[-max(1, min(limit, 500)) :]
+            lines = self.log_file.read_text(encoding="utf-8").splitlines()[-max(1, min(limit, 500)) :]
             return [json.loads(line) for line in reversed(lines) if line.strip()]
         except (OSError, json.JSONDecodeError):
             return []
@@ -1525,7 +1549,16 @@ class NeutralisMonitor:
             return {"config": dict(self.config), "monitor": json_safe(dict(self.state)), "events": self.events(50), "dryRun": not bool((self.state.get("snapshot") or {}).get("live")), "ordersEnabled": True, "apiWalletConfigured": API_KEY_FILE.exists(), "solanaRpcConfigured": SOLANA_RPC_FILE.exists(), "solanaRpcHost": urlparse(solana_rpc_url()).hostname, "autoLimits": {"narrowRangePercent": 3, "narrowStepPercent": 0.25, "wideStepPercent": 0.5, "pollSeconds": AUTO_POLL_SECONDS, "maxExecutionAttempts": AUTO_MAX_EXECUTION_ATTEMPTS, "maxPositionNotional": float(self.max_position_notional()), "minOrderNotional": 10}}
 
 
-MONITOR = NeutralisMonitor()
+MONITORS = {"1": NeutralisMonitor("1"), "2": NeutralisMonitor("2")}
+# Compatibilidade com testes e chamadas internas antigas: slot 1.
+MONITOR = MONITORS["1"]
+
+
+def monitor_for_slot(value: Any) -> NeutralisMonitor:
+    slot = str(value or "1")
+    if slot not in MONITORS:
+        raise NeutralisError("Monitor inválido")
+    return MONITORS[slot]
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -1559,12 +1592,25 @@ class Handler(SimpleHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             if path == "/api/status":
-                return self.send_json(MONITOR.public_state())
+                # Retorna os dois estados de uma vez; assim a interface pode
+                # mostrar e atualizar as duas pools simultaneamente.
+                selected = monitor_for_slot(parse_qs(urlparse(self.path).query).get("slot", ["1"])[0])
+                selected_state = selected.public_state()
+                return self.send_json({
+                    # Campos do slot selecionado preservam a interface/API
+                    # anterior e permitem alternar entre as duas pools.
+                    **selected_state,
+                    "monitors": {slot: monitor.public_state() for slot, monitor in MONITORS.items()},
+                    "apiWalletConfigured": API_KEY_FILE.exists(),
+                    "solanaRpcConfigured": SOLANA_RPC_FILE.exists(),
+                })
             if path == "/api/positions":
-                return self.send_json({"positions": MONITOR.positions(), "updatedAt": now_iso()})
+                monitor = monitor_for_slot(parse_qs(urlparse(self.path).query).get("slot", ["1"])[0])
+                return self.send_json({"positions": monitor.positions(), "updatedAt": now_iso()})
             if path == "/api/events":
                 limit = int(parse_qs(urlparse(self.path).query).get("limit", ["100"])[0])
-                return self.send_json({"events": MONITOR.events(limit)})
+                monitor = monitor_for_slot(parse_qs(urlparse(self.path).query).get("slot", ["1"])[0])
+                return self.send_json({"events": monitor.events(limit)})
             if path == "/healthz":
                 return self.send_json({"ok": True, "dryRun": True})
             return super().do_GET()
@@ -1581,20 +1627,21 @@ class Handler(SimpleHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             if path == "/api/config":
-                return self.send_json({"config": MONITOR.save_config(self.read_json())})
+                incoming = self.read_json()
+                return self.send_json({"config": monitor_for_slot(incoming.get("slot")).save_config(incoming)})
             if path == "/api/trading/key":
                 return self.send_json(MONITOR.save_api_key(self.read_json()))
             if path == "/api/solana/rpc":
                 return self.send_json(MONITOR.save_solana_rpc(self.read_json()))
             if path == "/api/monitor/start":
-                MONITOR.start()
+                monitor_for_slot(self.read_json().get("slot")).start()
                 return self.send_json({"ok": True}, HTTPStatus.ACCEPTED)
             if path == "/api/monitor/start-live":
                 incoming = self.read_json()
-                MONITOR.start(live=True, confirmation=str(incoming.get("confirmation", "")))
+                monitor_for_slot(incoming.get("slot")).start(live=True, confirmation=str(incoming.get("confirmation", "")))
                 return self.send_json({"ok": True}, HTTPStatus.ACCEPTED)
             if path == "/api/monitor/stop":
-                MONITOR.stop()
+                monitor_for_slot(self.read_json().get("slot")).stop()
                 return self.send_json({"ok": True})
             return self.send_json({"error": "Endpoint não encontrado"}, HTTPStatus.NOT_FOUND)
         except (NeutralisError, ValueError, json.JSONDecodeError) as error:
