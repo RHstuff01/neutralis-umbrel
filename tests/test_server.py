@@ -407,6 +407,21 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(server.hyp_dex("US500"), "mkts")
         self.assertEqual(server.hedge_mode("SPYX"), "units")
 
+    def test_zec_and_sol_use_main_hyperliquid_market(self):
+        self.assertIsNone(server.hyp_dex("ZEC"))
+        self.assertIsNone(server.hyp_dex("SOL"))
+
+    def test_main_hyperliquid_market_is_queried_without_dex(self):
+        account = "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF"
+        metadata = {"universe": [{"name": "ZEC", "szDecimals": 3}]}
+        contexts = [{"markPx": "42", "oraclePx": "42"}]
+        clearinghouse = {"assetPositions": [{"position": {"coin": "ZEC", "szi": "-1.2"}}]}
+        with patch.object(server, "json_request", side_effect=[(metadata, contexts), clearinghouse, []]) as request:
+            hyp = server.hyp_state(account, "ZEC")
+        self.assertEqual(hyp.market, "ZEC")
+        self.assertEqual(hyp.signed_position, Decimal("-1.2"))
+        self.assertTrue(all("dex" not in call.args[1] for call in request.call_args_list))
+
     def test_basis_guard_measures_drift_from_anchor_not_initial_spread(self):
         position = {"hedgeMode": "units"}
         anchor_ratio = Decimal("770.83") / Decimal("766.31")
