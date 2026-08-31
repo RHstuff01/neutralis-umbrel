@@ -338,6 +338,10 @@ class NeutralisTests(unittest.TestCase):
         self.assertGreater(below, center)
         self.assertGreater(center, above)
 
+    def test_adaptive_rebalance_step_uses_lp_range_width(self):
+        self.assertEqual(server.adaptive_rebalance_step(Decimal("99"), Decimal("101")), Decimal("0.0025"))
+        self.assertEqual(server.adaptive_rebalance_step(Decimal("98.5"), Decimal("101.5")), Decimal("0.005"))
+
     def test_spyx_target_uses_same_units_as_mkts_us500(self):
         position = {
             "positionAddress": "position", "assetSymbol": "SPYX", "hedgeSymbol": "US500",
@@ -363,7 +367,7 @@ class NeutralisTests(unittest.TestCase):
         after_hyp_move = server.target_at_reference_price(position, liquidity, Decimal("778.875"), lower, upper, Decimal("778.875"))
         self.assertLess(after_hyp_move, at_anchor)
 
-    def test_snapshot_rejects_lp_outside_active_range(self):
+    def test_snapshot_keeps_hedge_when_lp_is_outside_active_range(self):
         position = {
             "positionAddress": "position", "assetSymbol": "SPYX", "hedgeSymbol": "US500",
             "hedgeMode": "units", "liquidityUsd": Decimal("10000"),
@@ -374,8 +378,14 @@ class NeutralisTests(unittest.TestCase):
         with patch.object(server.MONITOR, "_selected_position", return_value=position), patch.object(
             server, "hyp_state", return_value=hyp
         ):
-            with self.assertRaisesRegex(server.NeutralisError, "fora da faixa ativa"):
-                server.MONITOR._live_snapshot()
+            *_, target = server.MONITOR._live_snapshot()
+        # Acima da faixa, a LP fica integralmente em USDC e o short-alvo é 0.
+        self.assertEqual(target, Decimal("0"))
+
+    def test_liquidity_can_be_inferred_below_or_above_range(self):
+        lower, upper = Decimal("90"), Decimal("110")
+        self.assertGreater(server.lp_liquidity(Decimal("1000"), Decimal("80"), lower, upper), 0)
+        self.assertGreater(server.lp_liquidity(Decimal("1000"), Decimal("120"), lower, upper), 0)
 
     def test_spyx_maps_to_units_contract_on_mkts_dex(self):
         self.assertEqual(server.hyp_symbol("SPYX"), "US500")
