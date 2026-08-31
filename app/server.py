@@ -1058,7 +1058,10 @@ class NeutralisMonitor:
             wallet,
             MAINNET_API_URL,
             account_address=self.config["hyperliquidAccount"],
-            perp_dexs=["xyz", "mkts"],
+            # A SDK só carrega o perp principal quando a lista inclui "".
+            # Ao informar apenas DEXs HIP-3, ela não cria o mapa interno para
+            # ZEC/SOL e `order("ZEC", ...)` termina em KeyError.
+            perp_dexs=["", "xyz", "mkts"],
         )
 
     @staticmethod

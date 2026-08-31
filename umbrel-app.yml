@@ -4,7 +4,7 @@ name: Neutralis Hedge
 tagline: Hedge dinâmico protegido para LPs RWA
 icon: https://neutralis-rwa-hedge.rafaelherzer.chatgpt.site/favicon.svg
 category: finance
-version: "0.7.7"
+version: "0.7.8"
 port: 8787
 description: >-
   Monitora uma posição de liquidez concentrada na Byreal, Raydium ou Orca e a posição
@@ -17,7 +17,7 @@ submission: https://github.com/getumbrel/umbrel-community-app-store
 repo: https://github.com/getumbrel/umbrel-community-app-store
 support: https://github.com/getumbrel/umbrel-community-app-store/issues
 gallery: []
-releaseNotes: Exibe um diagnóstico seguro caso uma execução automática falhe, sem revelar a chave da API Wallet.
+releaseNotes: Corrige envio de ordens nos perps principais da Hyperliquid, incluindo ZEC e SOL.
 dependencies: []
 path: ""
 defaultUsername: ""
