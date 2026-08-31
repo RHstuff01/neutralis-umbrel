@@ -1086,11 +1086,11 @@ class NeutralisMonitor:
         except (OSError, json.JSONDecodeError):
             return False
 
-    def _notify_unexpected_pause(self, message: str) -> None:
+    def _notify_telegram(self, message: str) -> None:
         try:
             stored = json.loads(TELEGRAM_FILE.read_text(encoding="utf-8"))
             token, chat_id = str(stored["botToken"]), str(stored["chatId"])
-            text = f"⚠️ Neutralis: Pool {self.slot} pausou automaticamente.\nMotivo: {message}"
+            text = f"⚠️ Neutralis: Pool {self.slot}.\n{message}"
             json_request(f"https://api.telegram.org/bot{token}/sendMessage", {"chat_id": chat_id, "text": text})
         except Exception:
             # Uma falha no Telegram jamais pode parar, esconder ou reiniciar
@@ -1401,7 +1401,7 @@ class NeutralisMonitor:
                 return
             self.state.update({"mode": "paused", "message": message, "updatedAt": now_iso()})
         self._event("pause", message)
-        self._notify_unexpected_pause(message)
+        self._notify_telegram(f"Pausou automaticamente.\nMotivo: {message}")
 
     def _finish_upper_exit(self, market: str, mark: Decimal, live: bool) -> None:
         message = "Faixa superior atingida; short zerado e monitor encerrado" if live else "Faixa superior atingida; zeramento simulado e monitor encerrado"
@@ -1485,6 +1485,7 @@ class NeutralisMonitor:
             )
             self._event("start-live" if live else "start", start_message, mark=hyp.mark, lpPrice=lp_price, lower=lower, upper=upper, anchor=anchor, hedgeRatio=ratio_anchor)
             awaiting_upper_reentry = False
+            below_range = lp_price <= lower
 
             while not self.stop_event.wait(AUTO_POLL_SECONDS):
                 position_now, hyp_now, lower, upper, liquidity, target = self._live_snapshot()
@@ -1510,6 +1511,19 @@ class NeutralisMonitor:
                 movement = hyp_now.mark / hyp_anchor - Decimal("1")
                 projected_lp_price = lp_anchor * hyp_now.mark / hyp_anchor
                 target = target_at_reference_price(position_now, liquidity, projected_lp_price, lower, upper, hyp_now.mark)
+                # A saída inferior deixa a LP 100% no ativo. O hedge segue
+                # normalmente, mas o aviso é útil para o usuário reavaliar a
+                # faixa. Só avisamos na transição para não gerar spam a cada
+                # consulta de dois segundos.
+                if projected_lp_price <= lower:
+                    if not below_range:
+                        below_range = True
+                        message = "Pool saiu pela faixa inferior; o hedge continua ativo."
+                        self._event("lower-exit", message, market=hyp_now.market, mark=hyp_now.mark, live=live)
+                        self._notify_telegram(message)
+                elif below_range:
+                    below_range = False
+                    self._event("lower-reentry", "Preço reentrou acima da faixa inferior; hedge continua ativo", market=hyp_now.market, mark=hyp_now.mark, live=live)
                 # Acima da faixa a LP fica 100% em USDC. Fecha o short uma
                 # única vez, mas mantém o processo vivo: se o preço voltar
                 # para dentro da faixa, o hedge é reconstruído automaticamente.
@@ -1533,6 +1547,7 @@ class NeutralisMonitor:
                             mark=hyp_now.mark,
                             live=live,
                         )
+                        self._notify_telegram("Pool saiu pela faixa superior; short zerado e aguardando reentrada automática.")
                     # A nova âncora evita reexecutar o mesmo zeramento em
                     # todos os ciclos enquanto a LP permanece 100% em USDC.
                     lp_anchor, hyp_anchor, anchor = projected_lp_price, hyp_now.mark, projected_lp_price

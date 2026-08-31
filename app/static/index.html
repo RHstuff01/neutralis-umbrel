@@ -50,7 +50,7 @@
         <label class="field"><span>Token do bot Telegram (alertas)</span><input id="telegramBotToken" type="password" autocomplete="new-password" placeholder="Armazenado somente no Umbrel"></label>
         <label class="field"><span>Chat ID do Telegram</span><input id="telegramChatId" autocomplete="off" placeholder="Ex.: 123456789 ou -100…"></label>
         <div class="actions"><button id="saveTelegram" class="secondary">Salvar alertas Telegram</button></div>
-        <div class="notice"><b>Alerta:</b> o Telegram recebe uma mensagem somente se esta pool pausar automaticamente. Parar pelo botão não envia alerta.</div>
+        <div class="notice"><b>Alerta:</b> o Telegram recebe uma mensagem se esta pool pausar automaticamente ou sair da faixa superior/inferior. Parar pelo botão não envia alerta.</div>
         <label class="field"><span>Confirmação para modo real</span><input id="liveConfirmation" autocomplete="off" placeholder="Digite ATIVAR"></label>
         <div class="actions"><button id="startLive">Ativar monitor real</button></div>
         <div class="notice"><b>Modo real:</b> corrige o delta inicial ao ativar e depois consulta a cada 2 segundos, com novos ajustes após cruzar o gatilho configurado. Se houver execução parcial, relê a posição e tenta o residual até três vezes. Compra sempre usa reduce-only e nunca abre long. O limite total é definido pelo usuário e aparece na confirmação textual.</div>

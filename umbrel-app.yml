@@ -4,12 +4,12 @@ name: Neutralis Hedge
 tagline: Hedge dinâmico protegido para LPs RWA
 icon: https://neutralis-rwa-hedge.rafaelherzer.chatgpt.site/favicon.svg
 category: finance
-version: "0.8.5"
+version: "0.8.6"
 port: 8787
 description: >-
   Monitora uma posição de liquidez concentrada na Byreal, Raydium ou Orca e a posição
   correspondente na Hyperliquid. Simula ou executa ajustes protegidos a cada
-  gatilho configurável por pool, alertas Telegram e execução protegida.
+  gatilho configurável por pool, alertas Telegram de pausa e faixa, execução protegida.
 developer: Neutralis
 website: https://neutralis-rwa-hedge.rafaelherzer.chatgpt.site
 submitter: Neutralis
