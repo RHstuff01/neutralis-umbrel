@@ -1189,7 +1189,15 @@ class NeutralisMonitor:
                         selected_pool = selected
                 except NeutralisError as error:
                     direct_error = error
-            discovered = orca_positions(self.config["solanaWallet"])
+            # Quando já há uma posição selecionada por NFT/PDA, ela pode ser
+            # lida diretamente. Não deixe uma falha temporária na enumeração
+            # de todos os NFTs da carteira interromper o monitor dessa LP.
+            try:
+                discovered = orca_positions(self.config["solanaWallet"])
+            except NeutralisError:
+                if direct:
+                    return [direct]
+                raise
             if direct and all(item["positionAddress"] != direct["positionAddress"] for item in discovered):
                 discovered.insert(0, direct)
             if selected and not discovered and direct_error:

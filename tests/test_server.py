@@ -238,6 +238,19 @@ class NeutralisTests(unittest.TestCase):
         finally:
             server.MONITOR.config = original
 
+    def test_selected_orca_position_survives_wallet_discovery_failure(self):
+        nft = "6cHCWbDnkHehmYh8LcfwKTDdq9ncHGnVuTAVNAQ5kPEw"
+        position = {"positionAddress": nft, "importable": True}
+        original = server.MONITOR.config
+        server.MONITOR.config = {**original, "source": "orca", "positionAddress": nft}
+        try:
+            with patch.object(server, "orca_position_from_address", return_value=position), patch.object(
+                server, "orca_positions", side_effect=server.NeutralisError("RPC temporariamente indisponível")
+            ):
+                self.assertEqual(server.MONITOR.positions(), [position])
+        finally:
+            server.MONITOR.config = original
+
     def test_initialization_prepares_persistent_data(self):
         with patch.object(server.os, "chmod") as chmod:
             server.prepare_data_permissions()
