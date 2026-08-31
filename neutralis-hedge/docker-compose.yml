@@ -6,8 +6,6 @@ services:
 
   server:
     image: ghcr.io/rhstuff01/neutralis-umbrel:0.6.1
-    ports:
-      - "8787:8787"
     user: "0:0"
     restart: on-failure
     stop_grace_period: 15s
