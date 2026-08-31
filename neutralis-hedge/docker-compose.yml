@@ -1,7 +1,7 @@
 services:
   app_proxy:
     environment:
-      APP_HOST: neutralis-hedge_server_1
+      APP_HOST: server
       APP_PORT: 8787
 
   server:
