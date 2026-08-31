@@ -53,7 +53,6 @@ AUTO_WIDE_STEP = Decimal("0.005")
 AUTO_NARROW_RANGE = Decimal("0.03")
 AUTO_EXECUTION_PRICE_DRIFT = Decimal("0.005")
 AUTO_MIN_ORDER_NOTIONAL = Decimal("10")
-AUTO_DIVERGENCE_LIMIT = Decimal("0.0075")
 AUTO_POLL_SECONDS = 2
 AUTO_RETRY_SECONDS = 1
 AUTO_MAX_EXECUTION_ATTEMPTS = 3
@@ -1128,9 +1127,6 @@ class NeutralisMonitor:
                 raise NeutralisError("Existem ordens abertas neste mercado")
             if hyp.signed_position > 0:
                 raise NeutralisError("A conta ficou long; monitor pausado")
-            if hyp.oracle <= 0 or abs(hyp.mark - hyp.oracle) / hyp.oracle > AUTO_DIVERGENCE_LIMIT:
-                raise NeutralisError("Mark e oráculo divergiram mais de 0,75%")
-
             current_short = abs(min(hyp.signed_position, Decimal("0")))
             quantum = Decimal(1).scaleb(-hyp.decimals)
             difference = target - current_short
@@ -1356,7 +1352,6 @@ class NeutralisMonitor:
         self._event("upper-exit", message, market=market, mark=mark, live=live)
 
     def _run(self, live: bool = False) -> None:
-        divergence_limit = AUTO_DIVERGENCE_LIMIT
         try:
             position, hyp, lower, upper, liquidity, target = self._live_snapshot()
             step = adaptive_rebalance_step(lower, upper)
@@ -1366,8 +1361,6 @@ class NeutralisMonitor:
                 raise NeutralisError(f"O short real já ultrapassa o limite total de US$ {self.max_position_notional():.2f}")
             if hyp.open_orders:
                 raise NeutralisError("Existem ordens abertas neste mercado")
-            if hyp.oracle <= 0 or abs(hyp.mark - hyp.oracle) / hyp.oracle > divergence_limit:
-                raise NeutralisError("Mark e oráculo divergiram mais de 0,75%")
             if live and position.get("currentPrice") is None:
                 raise NeutralisError("A fonte não forneceu preço independente da LP; modo real bloqueado")
             lp_price = decimal(position.get("currentPrice") or hyp.mark, "preço da LP")
@@ -1446,8 +1439,6 @@ class NeutralisMonitor:
                     return self._pause("Foram detectadas ordens abertas neste mercado")
                 if live and abs(min(hyp_now.signed_position, Decimal("0"))) * hyp_now.mark > self.max_position_notional():
                     return self._pause(f"O short real ultrapassou o limite total de US$ {self.max_position_notional():.2f}")
-                if hyp_now.oracle <= 0 or abs(hyp_now.mark - hyp_now.oracle) / hyp_now.oracle > divergence_limit:
-                    return self._pause("Mark e oráculo divergiram mais de 0,75%")
                 if live and position_now.get("currentPrice") is None:
                     return self._pause("A fonte deixou de fornecer o preço independente da LP")
                 lp_price = decimal(position_now.get("currentPrice") or hyp_now.mark, "preço da LP")
