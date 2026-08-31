@@ -465,6 +465,21 @@ class NeutralisTests(unittest.TestCase):
         with self.assertRaisesRegex(server.NeutralisError, "inválida"):
             server.MONITOR.save_api_key({"privateKey": "segredo"})
 
+    def test_telegram_alert_is_secret_and_only_sent_for_automatic_pause(self):
+        token = "123456:abcdefghijklmnopqrstuvwxyzABCDE"
+        server.MONITOR.save_telegram_alert({"botToken": token, "chatId": "123456789"})
+        self.assertTrue(server.MONITOR.public_state()["telegramConfigured"])
+        self.assertNotIn(token, str(server.MONITOR.public_state()))
+        server.MONITOR.manual_stop_requested = False
+        with patch.object(server, "json_request", return_value={"ok": True}) as request:
+            server.MONITOR._pause("falha de teste")
+        self.assertIn("api.telegram.org", request.call_args.args[0])
+        server.MONITOR.manual_stop_requested = True
+        with patch.object(server, "json_request") as request:
+            server.MONITOR._pause("não deve alertar")
+        request.assert_not_called()
+        server.MONITOR.manual_stop_requested = False
+
     def test_auto_adjustment_waits_below_hyperliquid_minimum(self):
         position = {"hedgeSymbol": "COIN", "currentPrice": Decimal("176")}
         hyp = server.HypState("xyz:COIN", 3, Decimal("176"), Decimal("176"), Decimal("-2.740"), 0)

@@ -29,6 +29,7 @@ CONFIG_FILE = DATA_DIR / "config.json"
 LOG_FILE = DATA_DIR / "events.jsonl"
 API_KEY_FILE = DATA_DIR / "hyperliquid-api-wallet.key"
 SOLANA_RPC_FILE = DATA_DIR / "solana-rpc.url"
+TELEGRAM_FILE = DATA_DIR / "telegram-alert.json"
 BYREAL_URL = "https://api2.byreal.io/byreal/api/dex/v2/position/list"
 BYREAL_MINT_LIST_URL = "https://api2.byreal.io/byreal/api/dex/v2/mint/list"
 HYP_INFO_URL = "https://api.hyperliquid.xyz/info"
@@ -58,6 +59,8 @@ AUTO_RETRY_SECONDS = 1
 AUTO_MAX_EXECUTION_ATTEMPTS = 3
 AUTO_RETRY_SLIPPAGES = (Decimal("0.003"), Decimal("0.005"), Decimal("0.0075"))
 PRIVATE_KEY_PATTERN = re.compile(r"^(?:0x)?[0-9a-fA-F]{64}$")
+TELEGRAM_TOKEN_PATTERN = re.compile(r"^\d{6,12}:[A-Za-z0-9_-]{20,}$")
+TELEGRAM_CHAT_PATTERN = re.compile(r"^-?\d{5,20}$")
 SOLANA_PATTERN = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 EVM_PATTERN = re.compile(r"^0x[0-9a-fA-F]{40}$")
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{1,15}$")
@@ -102,7 +105,7 @@ def prepare_data_permissions() -> None:
     """Prepara o volume persistente antes de iniciar o servidor."""
     DATA_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(DATA_DIR, 0o700)
-    for path in (CONFIG_FILE, LOG_FILE, SOLANA_RPC_FILE, API_KEY_FILE):
+    for path in (CONFIG_FILE, LOG_FILE, SOLANA_RPC_FILE, API_KEY_FILE, TELEGRAM_FILE):
         if path.exists():
             os.chmod(path, 0o600)
 
@@ -992,6 +995,7 @@ class NeutralisMonitor:
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.execution_lock = threading.Lock()
+        self.manual_stop_requested = False
         self.config = self._load_config()
         self.state: dict[str, Any] = {
             "mode": "stopped",
@@ -1062,6 +1066,36 @@ class NeutralisMonitor:
         API_KEY_FILE.write_text(normalized, encoding="ascii")
         os.chmod(API_KEY_FILE, 0o600)
         return {"configured": True}
+
+    def save_telegram_alert(self, incoming: dict[str, Any]) -> dict[str, Any]:
+        token = str(incoming.get("botToken", "")).strip()
+        chat_id = str(incoming.get("chatId", "")).strip()
+        if not TELEGRAM_TOKEN_PATTERN.fullmatch(token):
+            raise NeutralisError("Token do bot Telegram inválido")
+        if not TELEGRAM_CHAT_PATTERN.fullmatch(chat_id):
+            raise NeutralisError("Chat ID do Telegram inválido")
+        TELEGRAM_FILE.write_text(json.dumps({"botToken": token, "chatId": chat_id}), encoding="utf-8")
+        os.chmod(TELEGRAM_FILE, 0o600)
+        return {"configured": True}
+
+    @staticmethod
+    def telegram_configured() -> bool:
+        try:
+            stored = json.loads(TELEGRAM_FILE.read_text(encoding="utf-8"))
+            return bool(isinstance(stored, dict) and stored.get("botToken") and stored.get("chatId"))
+        except (OSError, json.JSONDecodeError):
+            return False
+
+    def _notify_unexpected_pause(self, message: str) -> None:
+        try:
+            stored = json.loads(TELEGRAM_FILE.read_text(encoding="utf-8"))
+            token, chat_id = str(stored["botToken"]), str(stored["chatId"])
+            text = f"⚠️ Neutralis: Pool {self.slot} pausou automaticamente.\nMotivo: {message}"
+            json_request(f"https://api.telegram.org/bot{token}/sendMessage", {"chat_id": chat_id, "text": text})
+        except Exception:
+            # Uma falha no Telegram jamais pode parar, esconder ou reiniciar
+            # o monitor; o motivo original continua disponível no registro.
+            return
 
     def save_solana_rpc(self, incoming: dict[str, Any]) -> dict[str, Any]:
         endpoint = str(incoming.get("endpoint", "")).strip()
@@ -1348,6 +1382,7 @@ class NeutralisMonitor:
                     raise NeutralisError("Cadastre a chave da API Wallet antes de ativar o modo real")
                 if position["hedgeSymbol"] != hyp_symbol(position["assetSymbol"]):
                     raise NeutralisError("Mapeamento do contrato não pôde ser validado")
+            self.manual_stop_requested = False
             self.stop_event.clear()
             self.state.update({"mode": "starting", "message": "Validando fontes de dados", "updatedAt": now_iso()})
             self.thread = threading.Thread(target=self._run, args=(live,), name="neutralis-live" if live else "neutralis-dry-run", daemon=True)
@@ -1356,13 +1391,17 @@ class NeutralisMonitor:
     def stop(self) -> None:
         self.stop_event.set()
         with self.lock:
+            self.manual_stop_requested = True
             self.state.update({"mode": "stopped", "message": "Monitor interrompido pelo usuário", "updatedAt": now_iso()})
         self._event("stop", "Monitor interrompido pelo usuário")
 
     def _pause(self, message: str) -> None:
         with self.lock:
+            if self.manual_stop_requested:
+                return
             self.state.update({"mode": "paused", "message": message, "updatedAt": now_iso()})
         self._event("pause", message)
+        self._notify_unexpected_pause(message)
 
     def _finish_upper_exit(self, market: str, mark: Decimal, live: bool) -> None:
         message = "Faixa superior atingida; short zerado e monitor encerrado" if live else "Faixa superior atingida; zeramento simulado e monitor encerrado"
@@ -1592,7 +1631,7 @@ class NeutralisMonitor:
 
     def public_state(self) -> dict[str, Any]:
         with self.lock:
-            return {"config": dict(self.config), "monitor": json_safe(dict(self.state)), "events": self.events(50), "dryRun": not bool((self.state.get("snapshot") or {}).get("live")), "ordersEnabled": True, "apiWalletConfigured": API_KEY_FILE.exists(), "solanaRpcConfigured": SOLANA_RPC_FILE.exists(), "solanaRpcHost": urlparse(solana_rpc_url()).hostname, "autoLimits": {"narrowRangePercent": 3, "narrowStepPercent": 0.25, "wideStepPercent": 0.5, "pollSeconds": AUTO_POLL_SECONDS, "maxExecutionAttempts": AUTO_MAX_EXECUTION_ATTEMPTS, "maxPositionNotional": float(self.max_position_notional()), "minOrderNotional": 10}}
+            return {"config": dict(self.config), "monitor": json_safe(dict(self.state)), "events": self.events(50), "dryRun": not bool((self.state.get("snapshot") or {}).get("live")), "ordersEnabled": True, "apiWalletConfigured": API_KEY_FILE.exists(), "telegramConfigured": self.telegram_configured(), "solanaRpcConfigured": SOLANA_RPC_FILE.exists(), "solanaRpcHost": urlparse(solana_rpc_url()).hostname, "autoLimits": {"narrowRangePercent": 3, "narrowStepPercent": 0.25, "wideStepPercent": 0.5, "pollSeconds": AUTO_POLL_SECONDS, "maxExecutionAttempts": AUTO_MAX_EXECUTION_ATTEMPTS, "maxPositionNotional": float(self.max_position_notional()), "minOrderNotional": 10}}
 
 
 MONITORS = {"1": NeutralisMonitor("1"), "2": NeutralisMonitor("2")}
@@ -1648,6 +1687,7 @@ class Handler(SimpleHTTPRequestHandler):
                     **selected_state,
                     "monitors": {slot: monitor.public_state() for slot, monitor in MONITORS.items()},
                     "apiWalletConfigured": API_KEY_FILE.exists(),
+                    "telegramConfigured": MONITOR.telegram_configured(),
                     "solanaRpcConfigured": SOLANA_RPC_FILE.exists(),
                 })
             if path == "/api/positions":
@@ -1677,6 +1717,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"config": monitor_for_slot(incoming.get("slot")).save_config(incoming)})
             if path == "/api/trading/key":
                 return self.send_json(MONITOR.save_api_key(self.read_json()))
+            if path == "/api/alerts/telegram":
+                return self.send_json(MONITOR.save_telegram_alert(self.read_json()))
             if path == "/api/solana/rpc":
                 return self.send_json(MONITOR.save_solana_rpc(self.read_json()))
             if path == "/api/monitor/start":
