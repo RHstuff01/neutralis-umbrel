@@ -1503,8 +1503,15 @@ class NeutralisMonitor:
                     self.state.update({"snapshot": json_safe(snapshot), "updatedAt": now_iso()})
         except NeutralisError as error:
             self._pause(str(error))
-        except Exception:
-            self._pause("Falha inesperada; consulte os logs do container")
+        except Exception as error:
+            # O Umbrel não expõe os logs do container na interface normal.  Sem
+            # este detalhe, uma falha da SDK, de assinatura ou da resposta da
+            # corretora vira apenas uma mensagem genérica impossível de agir.
+            # Nunca incluímos request/headers/chave: apenas o tipo e a mensagem
+            # curta da exceção que o Python já devolveu.
+            detail = re.sub(r"0x[a-fA-F0-9]{64}", "[chave ocultada]", str(error)).strip()
+            detail = detail[:240] or "sem detalhes retornados"
+            self._pause(f"Falha técnica ao executar ajuste ({type(error).__name__}): {detail}")
 
     def public_state(self) -> dict[str, Any]:
         with self.lock:
