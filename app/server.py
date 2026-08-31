@@ -71,7 +71,7 @@ SYMBOL_ALIASES = {"AAPLX": "AAPL", "CRCLX": "CRCL", "COINX": "COIN", "SPYX": "US
 # da API ele não recebe o campo `dex` e o nome do contrato não tem prefixo.
 # Os RWAs tokenizados permanecem no DEX xyz; US500 usa mkts por ter a mesma
 # escala unitária de SPYx na Orca.
-HYP_DEX_BY_SYMBOL: dict[str, str | None] = {"US500": "mkts", "ZEC": None, "SOL": None}
+HYP_DEX_BY_SYMBOL: dict[str, str | None] = {"US500": "mkts", "ZEC": None, "SOL": None, "SKR": None}
 KNOWN_MINTS = {
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
     "XsueG8BtpquVJX9LVLLEGuViXUungE6WmK5YZ3p3bd1": "CRCLX",
@@ -83,6 +83,10 @@ KNOWN_MINTS = {
     # O catálogo público da Orca pode não responder durante a descoberta e,
     # nesse caso, a posição seria descartada antes de chegar ao hedge ZEC.
     "A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS": "ZEC",
+    # Seeker (SKR) da pool Orca SKR/USDC.  Na Hyperliquid o contrato
+    # correspondente é o perp principal SKR (exibido na interface como
+    # SKR-USD), portanto é consultado e negociado sem prefixo de DEX.
+    "SKRbvo6Gf7GondiT3BbTfuRDPqLWei4j2Qy2NPGZhW3": "SKR",
 }
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 

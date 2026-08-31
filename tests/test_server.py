@@ -411,6 +411,13 @@ class NeutralisTests(unittest.TestCase):
         self.assertIsNone(server.hyp_dex("ZEC"))
         self.assertIsNone(server.hyp_dex("SOL"))
 
+    def test_orca_skr_usdc_uses_main_hyperliquid_skr_market(self):
+        skr = "SKRbvo6Gf7GondiT3BbTfuRDPqLWei4j2Qy2NPGZhW3"
+        usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        self.assertEqual(server.orca_symbols([skr, usdc]), {skr: "SKR", usdc: "USDC"})
+        self.assertEqual(server.hyp_symbol("SKR"), "SKR")
+        self.assertIsNone(server.hyp_dex("SKR"))
+
     def test_main_hyperliquid_market_is_queried_without_dex(self):
         account = "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF"
         metadata = {"universe": [{"name": "ZEC", "szDecimals": 3}]}
