@@ -876,6 +876,26 @@ def base_target(liquidity: Decimal, price: Decimal, lower: Decimal, upper: Decim
     return liquidity * (Decimal("1") / sqrt_price - Decimal("1") / sqrt_upper)
 
 
+def target_at_reference_price(
+    position: dict[str, Any],
+    liquidity: Decimal,
+    price: Decimal,
+    lower: Decimal,
+    upper: Decimal,
+    hyp_mark: Decimal,
+) -> Decimal:
+    """Calcula a exposição da LP para um preço de referência do ativo.
+
+    Para a LP SPYx, o preço de referência acompanha o US500 da Hyperliquid
+    desde a âncora. Assim o gatilho e o ajuste não ficam à espera de um swap
+    na Orca apenas para atualizar o tick on-chain.
+    """
+    target = base_target(liquidity, price, lower, upper)
+    if position.get("hedgeMode") == "notional":
+        target = target * price / hyp_mark
+    return target
+
+
 def hedge_basis(position: dict[str, Any], lp_price: Decimal, hyp_mark: Decimal, reference_ratio: Decimal | None = None) -> Decimal:
     if hyp_mark <= 0 or lp_price <= 0:
         raise NeutralisError("Preço inválido para calcular o basis do hedge")
@@ -1028,7 +1048,7 @@ class NeutralisMonitor:
 
         for attempt in range(AUTO_MAX_EXECUTION_ATTEMPTS):
             if attempt:
-                position, hyp, lower, upper, _, target = self._live_snapshot()
+                position, hyp, lower, upper, _, _ = self._live_snapshot()
                 if original_position and position.get("positionAddress") != original_position:
                     raise NeutralisError("A posição selecionada mudou durante o ajuste")
                 if position.get("currentPrice") is None:
@@ -1211,10 +1231,7 @@ class NeutralisMonitor:
             liquidity = decimal(position["normalizedLiquidity"], "normalizedLiquidity")
         else:
             liquidity = lp_liquidity(value, lp_price, lower, upper)
-        asset_delta = base_target(liquidity, lp_price, lower, upper)
-        target = asset_delta
-        if position.get("hedgeMode") == "notional":
-            target = asset_delta * lp_price / hyp.mark
+        target = target_at_reference_price(position, liquidity, lp_price, lower, upper, hyp.mark)
         return position, hyp, lower, upper, liquidity, target
 
     def _event(self, event: str, message: str, **details: Any) -> None:
@@ -1276,7 +1293,11 @@ class NeutralisMonitor:
             if live and position.get("currentPrice") is None:
                 raise NeutralisError("A fonte não forneceu preço independente da LP; modo real bloqueado")
             lp_price = decimal(position.get("currentPrice") or hyp.mark, "preço da LP")
-            ratio_anchor = lp_price / hyp.mark
+            # A Hyp é o mercado contínuo que determina quando o hedge deve
+            # reagir. A Orca permanece como fonte da faixa e da liquidez.
+            lp_anchor = lp_price
+            hyp_anchor = hyp.mark
+            ratio_anchor = lp_anchor / hyp_anchor
             basis = hedge_basis(position, lp_price, hyp.mark, ratio_anchor)
             if position.get("hedgeMode") != "notional" and basis > divergence_limit:
                 raise NeutralisError("Preço da LP e Hyperliquid divergiram mais de 0,75%")
@@ -1295,11 +1316,13 @@ class NeutralisMonitor:
                 initial_adjusted = bool(result)
                 position, hyp, lower, upper, liquidity, target = self._live_snapshot()
                 lp_price = decimal(position.get("currentPrice"), "preço da LP")
-                ratio_anchor = lp_price / hyp.mark
+                lp_anchor = lp_price
+                hyp_anchor = hyp.mark
+                ratio_anchor = lp_anchor / hyp_anchor
             initial_signed = hyp.signed_position
             virtual_short = abs(min(initial_signed, Decimal("0")))
             quantum = Decimal(1).scaleb(-hyp.decimals)
-            anchor = lp_price
+            anchor = lp_anchor
             initial_snapshot = {
                 "position": position,
                 "market": hyp.market,
@@ -1310,6 +1333,8 @@ class NeutralisMonitor:
                 "basisFromAnchorPercent": Decimal("0"),
                 "movementFromAnchorPercent": Decimal("0"),
                 "hedgeRatio": lp_price / hyp.mark,
+                "hypAnchor": hyp_anchor,
+                "projectedLpPrice": lp_price,
                 "hedgeMode": position.get("hedgeMode", "units"),
                 "realShort": abs(min(hyp.signed_position, Decimal("0"))),
                 "virtualShort": virtual_short,
@@ -1356,7 +1381,12 @@ class NeutralisMonitor:
                 if basis_from_anchor > divergence_limit:
                     return self._pause("Preço da LP e Hyperliquid divergiram mais de 0,75%")
 
-                movement = lp_price / anchor - Decimal("1")
+                # A projeção usa a relação LP/Hyp registrada na última
+                # âncora. É ela que alimenta a fórmula CLMM entre swaps na
+                # Orca; o gatilho é exclusivamente o mark da Hyperliquid.
+                movement = hyp_now.mark / hyp_anchor - Decimal("1")
+                projected_lp_price = lp_anchor * hyp_now.mark / hyp_anchor
+                target = target_at_reference_price(position_now, liquidity, projected_lp_price, lower, upper, hyp_now.mark)
                 if abs(movement) >= step:
                     current_short = abs(min(hyp_now.signed_position, Decimal("0")))
                     difference = target - (current_short if live else virtual_short)
@@ -1367,13 +1397,28 @@ class NeutralisMonitor:
                             result = self._execute_auto_adjustment(position_now, hyp_now, target)
                             if result:
                                 virtual_short = result["currentShort"]
-                                anchor = lp_price
+                                # Conserva o preço projetado no próximo
+                                # degrau, mesmo que o tick Orca ainda esteja
+                                # temporariamente atrasado em relação à Hyp.
+                                lp_anchor = projected_lp_price
+                                hyp_anchor = hyp_now.mark
+                                ratio_anchor = lp_price / hyp_anchor
+                                anchor = lp_anchor
+                                movement = Decimal("0")
+                                projected_lp_price = lp_anchor
+                                basis_from_anchor = Decimal("0")
                         else:
                             action = "VENDER" if difference > 0 else "COMPRAR"
                             before = virtual_short
                             virtual_short = virtual_short + size if difference > 0 else max(Decimal("0"), virtual_short - size)
                             self._event("adjustment", f"SIMULAR {action} {size} {position['hedgeSymbol']}", size=size, before=before, after=virtual_short, target=target, mark=hyp_now.mark)
-                            anchor = lp_price
+                            lp_anchor = projected_lp_price
+                            hyp_anchor = hyp_now.mark
+                            ratio_anchor = lp_price / hyp_anchor
+                            anchor = lp_anchor
+                            movement = Decimal("0")
+                            projected_lp_price = lp_anchor
+                            basis_from_anchor = Decimal("0")
                     elif size > 0:
                         self._event("below-minimum", f"Ajuste de US$ {notional:.2f} aguardando próximo nível", size=size, target=target, mark=hyp_now.mark)
 
@@ -1387,6 +1432,8 @@ class NeutralisMonitor:
                     "basisFromAnchorPercent": basis_from_anchor * 100,
                     "movementFromAnchorPercent": movement * 100,
                     "hedgeRatio": lp_price / hyp_now.mark,
+                    "hypAnchor": hyp_anchor,
+                    "projectedLpPrice": projected_lp_price,
                     "hedgeMode": position_now.get("hedgeMode", "units"),
                     "realShort": abs(min(hyp_now.signed_position, Decimal("0"))),
                     "virtualShort": virtual_short,

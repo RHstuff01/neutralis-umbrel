@@ -340,6 +340,16 @@ class NeutralisTests(unittest.TestCase):
             *_, target = server.MONITOR._live_snapshot()
         self.assertEqual(target, asset_delta)
 
+    def test_hyp_price_projection_changes_spyx_target_without_orca_tick(self):
+        position = {"hedgeMode": "units"}
+        liquidity = Decimal("1000")
+        lower, upper = Decimal("700"), Decimal("850")
+        at_anchor = server.target_at_reference_price(position, liquidity, Decimal("775"), lower, upper, Decimal("775"))
+        # Mesmo se o tick da Orca ainda não mudou, +0,5% no US500 deve
+        # diminuir a exposição estimada de SPYx e habilitar o rebalanceamento.
+        after_hyp_move = server.target_at_reference_price(position, liquidity, Decimal("778.875"), lower, upper, Decimal("778.875"))
+        self.assertLess(after_hyp_move, at_anchor)
+
     def test_snapshot_rejects_lp_outside_active_range(self):
         position = {
             "positionAddress": "position", "assetSymbol": "SPYX", "hedgeSymbol": "US500",
