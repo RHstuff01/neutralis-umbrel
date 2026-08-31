@@ -75,6 +75,10 @@ KNOWN_MINTS = {
     # este mint a tempo; sem este mapeamento uma posição SPYx/USDC válida era
     # descartada antes de aparecer na lista de posições.
     "XsoCS1TfEyfFhfvj8EtZ528L3CaKBDBRqRapnBbDF2W": "SPYX",
+    # ZEC nativo encapsulado em Solana usado pela pool Orca ZEC/USDC.
+    # O catálogo público da Orca pode não responder durante a descoberta e,
+    # nesse caso, a posição seria descartada antes de chegar ao hedge ZEC.
+    "A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS": "ZEC",
 }
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 

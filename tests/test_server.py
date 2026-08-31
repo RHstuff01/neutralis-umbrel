@@ -118,6 +118,12 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(result["hedgeMode"], "units")
         self.assertTrue(result["importable"])
 
+    def test_orca_zec_usdc_uses_known_zec_mint_without_token_api(self):
+        zec = "A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS"
+        usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        self.assertEqual(server.orca_symbols([zec, usdc]), {zec: "ZEC", usdc: "USDC"})
+        self.assertEqual(server.hyp_symbol("ZEC"), "ZEC")
+
     def test_orca_discovers_classic_and_token_2022_position_nfts(self):
         wallet = "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw"
         classic = "6cHCWbDnkHehmYh8LcfwKTDdq9ncHGnVuTAVNAQ5kPEw"
