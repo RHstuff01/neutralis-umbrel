@@ -359,6 +359,24 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(server.hyp_dex("US500"), "mkts")
         self.assertEqual(server.hedge_mode("SPYX"), "units")
 
+    def test_basis_guard_measures_drift_from_anchor_not_initial_spread(self):
+        position = {"hedgeMode": "units"}
+        anchor_ratio = Decimal("770.83") / Decimal("766.31")
+        self.assertEqual(server.hedge_basis(position, Decimal("770.83"), Decimal("766.31"), anchor_ratio), 0)
+        self.assertLess(
+            server.hedge_basis(position, Decimal("774.68"), Decimal("766.31"), anchor_ratio),
+            Decimal("0.0051"),
+        )
+
+    def test_live_activation_accepts_simple_confirmation(self):
+        position = {"assetSymbol": "COINX", "hedgeSymbol": "COIN"}
+        hyp = server.HypState("xyz:COIN", 3, Decimal("176"), Decimal("176"), Decimal("0"), 0)
+        api_key_file = Mock()
+        api_key_file.exists.return_value = True
+        with patch.object(server.MONITOR, "_live_snapshot", return_value=(position, hyp, Decimal("1"), Decimal("2"), Decimal("1"), Decimal("1"))), patch.object(server, "API_KEY_FILE", api_key_file), patch.object(server.threading, "Thread") as thread:
+            server.MONITOR.start(live=True, confirmation="ATIVAR")
+        thread.assert_called_once()
+
     def test_api_wallet_key_is_never_returned(self):
         key = "11" * 32
         result = server.MONITOR.save_api_key({"privateKey": key})

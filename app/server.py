@@ -880,11 +880,11 @@ def hedge_basis(position: dict[str, Any], lp_price: Decimal, hyp_mark: Decimal, 
     if hyp_mark <= 0 or lp_price <= 0:
         raise NeutralisError("Preço inválido para calcular o basis do hedge")
     ratio = lp_price / hyp_mark
-    if position.get("hedgeMode") == "notional":
-        if reference_ratio is None or reference_ratio <= 0:
-            return Decimal("0")
-        return abs(ratio / reference_ratio - Decimal("1"))
-    return abs(ratio - Decimal("1"))
+    # O spread inicial entre dois mercados é normal. A proteção mede a
+    # alteração desse spread a partir da âncora, não o spread absoluto.
+    if reference_ratio is None or reference_ratio <= 0:
+        return abs(ratio - Decimal("1"))
+    return abs(ratio / reference_ratio - Decimal("1"))
 
 
 def json_safe(value: Any) -> Any:
@@ -1237,9 +1237,9 @@ class NeutralisMonitor:
                 raise NeutralisError("O monitor já está em execução")
             if live:
                 position, hyp, _, _, _, _ = self._live_snapshot()
-                expected = f"ATIVAR HEDGE REAL {hyp.market.upper()} MAX US$ {self.max_position_notional():.2f}"
+                expected = "ATIVAR"
                 if confirmation.strip().upper() != expected:
-                    raise NeutralisError(f"Confirmação incorreta. Digite exatamente: {expected}")
+                    raise NeutralisError("Confirmação incorreta. Digite exatamente: ATIVAR")
                 if not API_KEY_FILE.exists():
                     raise NeutralisError("Cadastre a chave da API Wallet antes de ativar o modo real")
                 if position["hedgeSymbol"] != hyp_symbol(position["assetSymbol"]):
@@ -1306,7 +1306,9 @@ class NeutralisMonitor:
                 "mark": hyp.mark,
                 "oracle": hyp.oracle,
                 "lpPrice": lp_price,
-                "basisPercent": hedge_basis(position, lp_price, hyp.mark, ratio_anchor) * 100,
+                "basisPercent": hedge_basis(position, lp_price, hyp.mark) * 100,
+                "basisFromAnchorPercent": Decimal("0"),
+                "movementFromAnchorPercent": Decimal("0"),
                 "hedgeRatio": lp_price / hyp.mark,
                 "hedgeMode": position.get("hedgeMode", "units"),
                 "realShort": abs(min(hyp.signed_position, Decimal("0"))),
@@ -1350,8 +1352,8 @@ class NeutralisMonitor:
                 lp_price = decimal(position_now.get("currentPrice") or hyp_now.mark, "preço da LP")
                 if lp_price <= lower or lp_price >= upper:
                     return self._pause("O preço saiu da faixa da LP")
-                basis = hedge_basis(position_now, lp_price, hyp_now.mark, ratio_anchor)
-                if basis > divergence_limit:
+                basis_from_anchor = hedge_basis(position_now, lp_price, hyp_now.mark, ratio_anchor)
+                if basis_from_anchor > divergence_limit:
                     return self._pause("Preço da LP e Hyperliquid divergiram mais de 0,75%")
 
                 movement = lp_price / anchor - Decimal("1")
@@ -1381,7 +1383,9 @@ class NeutralisMonitor:
                     "mark": hyp_now.mark,
                     "oracle": hyp_now.oracle,
                     "lpPrice": lp_price,
-                    "basisPercent": basis * 100,
+                    "basisPercent": hedge_basis(position_now, lp_price, hyp_now.mark) * 100,
+                    "basisFromAnchorPercent": basis_from_anchor * 100,
+                    "movementFromAnchorPercent": movement * 100,
                     "hedgeRatio": lp_price / hyp_now.mark,
                     "hedgeMode": position_now.get("hedgeMode", "units"),
                     "realShort": abs(min(hyp_now.signed_position, Decimal("0"))),
