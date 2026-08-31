@@ -1007,6 +1007,7 @@ class NeutralisMonitor:
             "hyperliquidAccount": DEFAULT_HYP_ACCOUNT,
             "positionAddress": "",
             "maxPositionNotional": "600",
+            "stepPercent": "0.5",
         }
         try:
             stored = json.loads(self.config_file.read_text(encoding="utf-8"))
@@ -1022,6 +1023,7 @@ class NeutralisMonitor:
         account = str(incoming.get("hyperliquidAccount", self.config["hyperliquidAccount"]))
         position = str(incoming.get("positionAddress", self.config["positionAddress"]))
         max_notional = decimal(incoming.get("maxPositionNotional", self.config["maxPositionNotional"]), "limite máximo do short")
+        step_percent = decimal(incoming.get("stepPercent", self.config["stepPercent"]), "gatilho de ajuste")
         if source not in {"byreal", "raydium", "orca"}:
             raise NeutralisError("Fonte de liquidez inválida")
         if not SOLANA_PATTERN.fullmatch(wallet):
@@ -1032,16 +1034,25 @@ class NeutralisMonitor:
             raise NeutralisError("Endereço da posição inválido")
         if not Decimal("10") <= max_notional <= Decimal("100000"):
             raise NeutralisError("O limite máximo do short deve ficar entre US$ 10 e US$ 100.000")
+        if not Decimal("0.05") <= step_percent <= Decimal("5"):
+            raise NeutralisError("O gatilho de ajuste deve ficar entre 0,05% e 5,00%")
         with self.lock:
             if self.state["mode"] == "running":
                 raise NeutralisError("Pare o monitor antes de alterar a configuração")
-            self.config = {"source": source, "solanaWallet": wallet, "hyperliquidAccount": account, "positionAddress": position, "maxPositionNotional": str(max_notional)}
+            self.config = {"source": source, "solanaWallet": wallet, "hyperliquidAccount": account, "positionAddress": position, "maxPositionNotional": str(max_notional), "stepPercent": str(step_percent)}
             self.config_file.write_text(json.dumps(self.config, indent=2), encoding="utf-8")
             os.chmod(self.config_file, 0o600)
         return dict(self.config)
 
     def max_position_notional(self) -> Decimal:
         return decimal(self.config.get("maxPositionNotional", "600"), "limite máximo do short")
+
+    def rebalance_step(self, lower: Decimal, upper: Decimal) -> Decimal:
+        # O gatilho é definido pelo usuário para cada pool. Mantemos os
+        # parâmetros da faixa para tornar explícito que esta escolha pertence
+        # à posição selecionada, e não ao mercado inteiro.
+        del lower, upper
+        return decimal(self.config.get("stepPercent", "0.5"), "gatilho de ajuste") / Decimal("100")
 
     def save_api_key(self, incoming: dict[str, Any]) -> dict[str, Any]:
         key = str(incoming.get("privateKey", "")).strip()
@@ -1176,7 +1187,16 @@ class NeutralisMonitor:
                     )
                 filled = self._order_status(response)
             except NeutralisError as error:
-                retryable = "IOC" in str(error).upper() or "IOCCANCEL" in str(error).upper()
+                # A Hyp devolve mensagens diferentes para a mesma situação:
+                # IOC sem contraparte. Ambas devem seguir para o próximo
+                # limite mais agressivo, e não pausar o hedge de imediato.
+                error_text = str(error).upper()
+                retryable = (
+                    "IOC" in error_text
+                    or "IOCCANCEL" in error_text
+                    or "COULD NOT IMMEDIATELY MATCH" in error_text
+                    or "RESTING ORDERS" in error_text
+                )
                 if not retryable:
                     raise
                 if attempt + 1 >= AUTO_MAX_EXECUTION_ATTEMPTS:
@@ -1354,7 +1374,7 @@ class NeutralisMonitor:
     def _run(self, live: bool = False) -> None:
         try:
             position, hyp, lower, upper, liquidity, target = self._live_snapshot()
-            step = adaptive_rebalance_step(lower, upper)
+            step = self.rebalance_step(lower, upper)
             if hyp.signed_position > 0:
                 raise NeutralisError("A conta está long; o monitor exige posição zero ou short")
             if live and abs(hyp.signed_position) * hyp.mark > self.max_position_notional():
@@ -1416,7 +1436,7 @@ class NeutralisMonitor:
             }
             with self.lock:
                 label = "MODO REAL ativo" if live else "Dry-run ativo"
-                self.state.update({"mode": "running", "message": f"{label} · aguardando nível de 0,5%", "snapshot": json_safe(initial_snapshot), "updatedAt": now_iso()})
+                self.state.update({"mode": "running", "message": f"{label} · aguardando nível de {step * 100:.2f}%", "snapshot": json_safe(initial_snapshot), "updatedAt": now_iso()})
             start_message = (
                 f"MODO REAL iniciado em {hyp.market}; delta inicial corrigido"
                 if live and initial_adjusted
@@ -1429,7 +1449,7 @@ class NeutralisMonitor:
 
             while not self.stop_event.wait(AUTO_POLL_SECONDS):
                 position_now, hyp_now, lower, upper, liquidity, target = self._live_snapshot()
-                step = adaptive_rebalance_step(lower, upper)
+                step = self.rebalance_step(lower, upper)
                 if position_now["positionAddress"] != position["positionAddress"]:
                     return self._pause("A posição selecionada mudou")
                 if hyp_now.decimals != hyp.decimals:

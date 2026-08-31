@@ -348,6 +348,14 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(server.adaptive_rebalance_step(Decimal("99"), Decimal("101")), Decimal("0.0025"))
         self.assertEqual(server.adaptive_rebalance_step(Decimal("98.5"), Decimal("101.5")), Decimal("0.005"))
 
+    def test_monitor_uses_configured_manual_rebalance_step(self):
+        original = dict(server.MONITOR.config)
+        try:
+            server.MONITOR.config["stepPercent"] = "0.25"
+            self.assertEqual(server.MONITOR.rebalance_step(Decimal("90"), Decimal("110")), Decimal("0.0025"))
+        finally:
+            server.MONITOR.config = original
+
     def test_spyx_target_uses_same_units_as_mkts_us500(self):
         position = {
             "positionAddress": "position", "assetSymbol": "SPYX", "hedgeSymbol": "US500",
