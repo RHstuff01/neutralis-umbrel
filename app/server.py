@@ -67,7 +67,11 @@ STABLE_SYMBOLS = {"USD", "USDC", "USDT", "USDS", "PYUSD"}
 # mesma escala. `xyz:SP500` é um índice próximo de US$ 7.700 e, portanto,
 # não pode ser usado como hedge 1:1 da quantidade de SPYx na LP.
 SYMBOL_ALIASES = {"AAPLX": "AAPL", "CRCLX": "CRCL", "COINX": "COIN", "SPYX": "US500"}
-HYP_DEX_BY_SYMBOL = {"US500": "mkts"}
+# `None` representa o mercado perp principal da Hyperliquid.  Nos endpoints
+# da API ele não recebe o campo `dex` e o nome do contrato não tem prefixo.
+# Os RWAs tokenizados permanecem no DEX xyz; US500 usa mkts por ter a mesma
+# escala unitária de SPYx na Orca.
+HYP_DEX_BY_SYMBOL: dict[str, str | None] = {"US500": "mkts", "ZEC": None, "SOL": None}
 KNOWN_MINTS = {
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
     "XsueG8BtpquVJX9LVLLEGuViXUungE6WmK5YZ3p3bd1": "CRCLX",
@@ -75,6 +79,10 @@ KNOWN_MINTS = {
     # este mint a tempo; sem este mapeamento uma posição SPYx/USDC válida era
     # descartada antes de aparecer na lista de posições.
     "XsoCS1TfEyfFhfvj8EtZ528L3CaKBDBRqRapnBbDF2W": "SPYX",
+    # ZEC nativo encapsulado em Solana usado pela pool Orca ZEC/USDC.
+    # O catálogo público da Orca pode não responder durante a descoberta e,
+    # nesse caso, a posição seria descartada antes de chegar ao hedge ZEC.
+    "A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS": "ZEC",
 }
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
@@ -153,7 +161,7 @@ def hedge_mode(lp_symbol: str) -> str:
     return "units"
 
 
-def hyp_dex(symbol: str) -> str:
+def hyp_dex(symbol: str) -> str | None:
     """DEX Hyperliquid que contém o contrato correspondente."""
     return HYP_DEX_BY_SYMBOL.get(hyp_symbol(symbol), "xyz")
 
@@ -823,7 +831,7 @@ class HypState:
     oracle: Decimal
     signed_position: Decimal
     open_orders: int
-    dex: str = "xyz"
+    dex: str | None = "xyz"
 
 
 def hyp_state(account: str, symbol: str) -> HypState:
@@ -831,10 +839,19 @@ def hyp_state(account: str, symbol: str) -> HypState:
         raise NeutralisError("Conta Hyperliquid inválida")
     symbol = hyp_symbol(symbol)
     dex = hyp_dex(symbol)
-    market = f"{dex}:{symbol}"
-    metadata, contexts = json_request(HYP_INFO_URL, {"type": "metaAndAssetCtxs", "dex": dex})
-    clearinghouse = json_request(HYP_INFO_URL, {"type": "clearinghouseState", "user": account, "dex": dex})
-    orders = json_request(HYP_INFO_URL, {"type": "frontendOpenOrders", "user": account, "dex": dex})
+    market = f"{dex}:{symbol}" if dex else symbol
+
+    # O perp principal (ZEC, SOL etc.) é consultado sem `dex`. Mandar
+    # `dex: "xyz"` faz a Hyperliquid procurar um contrato inexistente.
+    def info_payload(request_type: str, **values: str) -> dict[str, str]:
+        payload = {"type": request_type, **values}
+        if dex:
+            payload["dex"] = dex
+        return payload
+
+    metadata, contexts = json_request(HYP_INFO_URL, info_payload("metaAndAssetCtxs"))
+    clearinghouse = json_request(HYP_INFO_URL, info_payload("clearinghouseState", user=account))
+    orders = json_request(HYP_INFO_URL, info_payload("frontendOpenOrders", user=account))
     universe = metadata.get("universe", [])
     index = next((i for i, row in enumerate(universe) if str(row.get("name", "")).upper() in {symbol, market.upper()}), None)
     if index is None:
