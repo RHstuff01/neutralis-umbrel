@@ -387,6 +387,15 @@ class NeutralisTests(unittest.TestCase):
         self.assertGreater(server.lp_liquidity(Decimal("1000"), Decimal("80"), lower, upper), 0)
         self.assertGreater(server.lp_liquidity(Decimal("1000"), Decimal("120"), lower, upper), 0)
 
+    def test_upper_exit_finishes_monitor_after_short_is_zero(self):
+        server.MONITOR.stop_event.clear()
+        with patch.object(server.MONITOR, "_event") as event:
+            server.MONITOR._finish_upper_exit("xyz:AAPL", Decimal("200"), live=True)
+        self.assertEqual(server.MONITOR.state["mode"], "stopped")
+        self.assertIn("short zerado", server.MONITOR.state["message"])
+        event.assert_called_once()
+        server.MONITOR.stop_event.clear()
+
     def test_spyx_maps_to_units_contract_on_mkts_dex(self):
         self.assertEqual(server.hyp_symbol("SPYX"), "US500")
         self.assertEqual(server.hyp_dex("US500"), "mkts")

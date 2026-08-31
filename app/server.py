@@ -1065,8 +1065,6 @@ class NeutralisMonitor:
         target: Decimal,
     ) -> dict[str, Any] | None:
         original_position = position.get("positionAddress")
-        original_lp_price = decimal(position.get("currentPrice"), "preço da LP")
-        original_ratio = original_lp_price / hyp.mark
         total_filled = Decimal("0")
         last_direction: bool | None = None
 
@@ -1077,9 +1075,6 @@ class NeutralisMonitor:
                     raise NeutralisError("A posição selecionada mudou durante o ajuste")
                 if position.get("currentPrice") is None:
                     raise NeutralisError("A fonte deixou de fornecer o preço independente da LP")
-                lp_price = decimal(position["currentPrice"], "preço da LP")
-                if hedge_basis(position, lp_price, hyp.mark, original_ratio) > AUTO_DIVERGENCE_LIMIT:
-                    raise NeutralisError("Preço da LP e Hyperliquid divergiram mais de 0,75%")
 
             if hyp.open_orders:
                 raise NeutralisError("Existem ordens abertas neste mercado")
@@ -1174,7 +1169,7 @@ class NeutralisMonitor:
             if attempt + 1 < AUTO_MAX_EXECUTION_ATTEMPTS and self.stop_event.wait(AUTO_RETRY_SECONDS):
                 raise NeutralisError("Monitor interrompido durante o ajuste")
 
-        position, hyp, _, _, _, target = self._live_snapshot()
+        position, hyp, _, _, _, _ = self._live_snapshot()
         current_short = abs(min(hyp.signed_position, Decimal("0")))
         residual_notional = abs(target - current_short) * hyp.mark
         if residual_notional >= AUTO_MIN_ORDER_NOTIONAL:
@@ -1305,6 +1300,13 @@ class NeutralisMonitor:
             self.state.update({"mode": "paused", "message": message, "updatedAt": now_iso()})
         self._event("pause", message)
 
+    def _finish_upper_exit(self, market: str, mark: Decimal, live: bool) -> None:
+        message = "Faixa superior atingida; short zerado e monitor encerrado" if live else "Faixa superior atingida; zeramento simulado e monitor encerrado"
+        self.stop_event.set()
+        with self.lock:
+            self.state.update({"mode": "stopped", "message": message, "updatedAt": now_iso()})
+        self._event("upper-exit", message, market=market, mark=mark, live=live)
+
     def _run(self, live: bool = False) -> None:
         divergence_limit = AUTO_DIVERGENCE_LIMIT
         try:
@@ -1326,9 +1328,6 @@ class NeutralisMonitor:
             lp_anchor = lp_price
             hyp_anchor = hyp.mark
             ratio_anchor = lp_anchor / hyp_anchor
-            basis = hedge_basis(position, lp_price, hyp.mark, ratio_anchor)
-            if position.get("hedgeMode") != "notional" and basis > divergence_limit:
-                raise NeutralisError("Preço da LP e Hyperliquid divergiram mais de 0,75%")
             initial_adjusted = False
             current_short = abs(min(hyp.signed_position, Decimal("0")))
             initial_residual = abs(target - current_short) * hyp.mark
@@ -1405,8 +1404,6 @@ class NeutralisMonitor:
                     return self._pause("A fonte deixou de fornecer o preço independente da LP")
                 lp_price = decimal(position_now.get("currentPrice") or hyp_now.mark, "preço da LP")
                 basis_from_anchor = hedge_basis(position_now, lp_price, hyp_now.mark, ratio_anchor)
-                if basis_from_anchor > divergence_limit:
-                    return self._pause("Preço da LP e Hyperliquid divergiram mais de 0,75%")
 
                 # A projeção usa a relação LP/Hyp registrada na última
                 # âncora. É ela que alimenta a fórmula CLMM entre swaps na
@@ -1414,6 +1411,19 @@ class NeutralisMonitor:
                 movement = hyp_now.mark / hyp_anchor - Decimal("1")
                 projected_lp_price = lp_anchor * hyp_now.mark / hyp_anchor
                 target = target_at_reference_price(position_now, liquidity, projected_lp_price, lower, upper, hyp_now.mark)
+                # Acima da faixa a LP fica 100% em USDC. Fecha o short
+                # imediatamente e encerra apenas depois da confirmação.
+                if projected_lp_price >= upper:
+                    if live:
+                        current_short = abs(min(hyp_now.signed_position, Decimal("0")))
+                        if current_short:
+                            result = self._execute_auto_adjustment(position_now, hyp_now, Decimal("0"))
+                            if not result or result["currentShort"] > 0:
+                                return self._pause("Faixa superior atingida, mas não foi possível zerar todo o short")
+                    else:
+                        virtual_short = Decimal("0")
+                    self._finish_upper_exit(hyp_now.market, hyp_now.mark, live)
+                    return
                 if abs(movement) >= step:
                     current_short = abs(min(hyp_now.signed_position, Decimal("0")))
                     difference = target - (current_short if live else virtual_short)
