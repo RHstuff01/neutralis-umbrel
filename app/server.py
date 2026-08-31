@@ -1425,6 +1425,7 @@ class NeutralisMonitor:
                 else f"Dry-run iniciado em {hyp.market}; nenhuma ordem inicial"
             )
             self._event("start-live" if live else "start", start_message, mark=hyp.mark, lpPrice=lp_price, lower=lower, upper=upper, anchor=anchor, hedgeRatio=ratio_anchor)
+            awaiting_upper_reentry = False
 
             while not self.stop_event.wait(AUTO_POLL_SECONDS):
                 position_now, hyp_now, lower, upper, liquidity, target = self._live_snapshot()
@@ -1450,19 +1451,53 @@ class NeutralisMonitor:
                 movement = hyp_now.mark / hyp_anchor - Decimal("1")
                 projected_lp_price = lp_anchor * hyp_now.mark / hyp_anchor
                 target = target_at_reference_price(position_now, liquidity, projected_lp_price, lower, upper, hyp_now.mark)
-                # Acima da faixa a LP fica 100% em USDC. Fecha o short
-                # imediatamente e encerra apenas depois da confirmação.
+                # Acima da faixa a LP fica 100% em USDC. Fecha o short uma
+                # única vez, mas mantém o processo vivo: se o preço voltar
+                # para dentro da faixa, o hedge é reconstruído automaticamente.
                 if projected_lp_price >= upper:
-                    if live:
+                    target = Decimal("0")
+                    if not awaiting_upper_reentry and live:
                         current_short = abs(min(hyp_now.signed_position, Decimal("0")))
                         if current_short:
                             result = self._execute_auto_adjustment(position_now, hyp_now, Decimal("0"))
                             if not result or result["currentShort"] > 0:
                                 return self._pause("Faixa superior atingida, mas não foi possível zerar todo o short")
-                    else:
+                            virtual_short = result["currentShort"]
+                    elif not awaiting_upper_reentry:
                         virtual_short = Decimal("0")
-                    self._finish_upper_exit(hyp_now.market, hyp_now.mark, live)
-                    return
+                    if not awaiting_upper_reentry:
+                        awaiting_upper_reentry = True
+                        self._event(
+                            "upper-exit",
+                            "Faixa superior atingida; short zerado e aguardando reentrada automática",
+                            market=hyp_now.market,
+                            mark=hyp_now.mark,
+                            live=live,
+                        )
+                    # A nova âncora evita reexecutar o mesmo zeramento em
+                    # todos os ciclos enquanto a LP permanece 100% em USDC.
+                    lp_anchor, hyp_anchor, anchor = projected_lp_price, hyp_now.mark, projected_lp_price
+                    ratio_anchor, movement, basis_from_anchor = lp_price / hyp_anchor, Decimal("0"), Decimal("0")
+                    projected_lp_price = lp_anchor
+                elif awaiting_upper_reentry:
+                    awaiting_upper_reentry = False
+                    self._event(
+                        "upper-reentry",
+                        "Preço reentrou na faixa; recalculando e restaurando hedge automaticamente",
+                        market=hyp_now.market,
+                        mark=hyp_now.mark,
+                        target=target,
+                        live=live,
+                    )
+                    if live:
+                        result = self._execute_auto_adjustment(position_now, hyp_now, target)
+                        if result:
+                            virtual_short = result["currentShort"]
+                    else:
+                        virtual_short = target
+                    lp_anchor, hyp_anchor, anchor = projected_lp_price, hyp_now.mark, projected_lp_price
+                    ratio_anchor, movement, basis_from_anchor = lp_price / hyp_anchor, Decimal("0"), Decimal("0")
+                    projected_lp_price = lp_anchor
                 if abs(movement) >= step:
                     current_short = abs(min(hyp_now.signed_position, Decimal("0")))
                     difference = target - (current_short if live else virtual_short)
