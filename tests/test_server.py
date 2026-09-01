@@ -420,6 +420,10 @@ class NeutralisTests(unittest.TestCase):
         self.assertIsNone(server.hyp_dex("SOL"))
         self.assertIsNone(server.hyp_dex("PENGU"))
 
+    def test_ibm_uses_xyz_hyperliquid_market(self):
+        self.assertEqual(server.hyp_symbol("IBM"), "IBM")
+        self.assertEqual(server.hyp_dex("IBM"), "xyz")
+
     def test_uniswap_config_accepts_evm_wallet_and_v4_pool_id(self):
         monitor = server.NeutralisMonitor("uniswap-test")
         monitor.config_file = Path(TEST_DATA.name) / "uniswap-config.json"

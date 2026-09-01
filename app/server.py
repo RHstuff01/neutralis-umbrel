@@ -84,6 +84,9 @@ SYMBOL_ALIASES = {"AAPLX": "AAPL", "CRCLX": "CRCL", "COINX": "COIN", "SPYX": "US
 # escala unitária de SPYx na Orca.
 HYP_DEX_BY_SYMBOL: dict[str, str | None] = {"US500": "mkts", "ZEC": None, "SOL": None, "SKR": None}
 HYP_DEX_BY_SYMBOL["PENGU"] = None
+# Ativos já homologados para as LPs Uniswap V4 da Robinhood Chain. Os demais
+# pares não são importados até terem um perp correspondente confirmado.
+ROBINHOOD_UNISWAP_ASSETS = {"PENGU", "IBM"}
 # O RPC oficial é o preferencial. Ele é público e pode ficar indisponível ou
 # limitado; o segundo endpoint permite que a leitura da LP continue no Umbrel
 # sem depender de uma única infraestrutura.
@@ -297,7 +300,10 @@ def uniswap_v4_position(token_id: int, pool_id: str) -> dict[str, Any] | None:
         return None
     symbol0, decimals0 = erc20_metadata(token0)
     symbol1, decimals1 = erc20_metadata(token1)
-    if {symbol0, symbol1} != {"PENGU", "USDG"}:
+    if "USDG" not in {symbol0, symbol1}:
+        return None
+    asset_symbol = symbol1 if symbol0 == "USDG" else symbol0
+    if asset_symbol not in ROBINHOOD_UNISWAP_ASSETS:
         return None
     slot = robinhood_call(UNISWAP_V4_STATE_VIEW, "getSlot0(bytes32)", "0x" + pool_id)
     sqrt_price_x96 = int(slot[:64], 16)
@@ -308,12 +314,12 @@ def uniswap_v4_position(token_id: int, pool_id: str) -> dict[str, Any] | None:
         return None
     raw_price_1_per_0 = Decimal(sqrt_price_x96) ** 2 / Decimal(2) ** 192
     price_1_per_0 = raw_price_1_per_0 * Decimal(10) ** (decimals0 - decimals1)
-    pengu_is_0 = symbol0 == "PENGU"
-    current_price = price_1_per_0 if pengu_is_0 else Decimal(1) / price_1_per_0
+    asset_is_0 = symbol0 == asset_symbol
+    current_price = price_1_per_0 if asset_is_0 else Decimal(1) / price_1_per_0
     tick_price_1_per_0 = lambda tick: Decimal("1.0001") ** tick * Decimal(10) ** (decimals0 - decimals1)
     lower_raw, upper_raw = tick_price_1_per_0(tick_lower), tick_price_1_per_0(tick_upper)
-    lower_price, upper_price = (lower_raw, upper_raw) if pengu_is_0 else (Decimal(1) / upper_raw, Decimal(1) / lower_raw)
-    # Converte a liquidez raw V4 para a quantidade efetiva de PENGU da LP.
+    lower_price, upper_price = (lower_raw, upper_raw) if asset_is_0 else (Decimal(1) / upper_raw, Decimal(1) / lower_raw)
+    # Converte a liquidez raw V4 para a quantidade efetiva do ativo da LP.
     sqrt_l = Decimal("1.0001") ** (Decimal(tick_lower) / 2) * Decimal(2) ** 96
     sqrt_u = Decimal("1.0001") ** (Decimal(tick_upper) / 2) * Decimal(2) ** 96
     sqrt_p = Decimal(sqrt_price_x96)
@@ -325,17 +331,17 @@ def uniswap_v4_position(token_id: int, pool_id: str) -> dict[str, Any] | None:
         amount0_raw = Decimal(liquidity) * (sqrt_u - sqrt_p) * Decimal(2) ** 96 / (sqrt_p * sqrt_u)
         amount1_raw = Decimal(liquidity) * (sqrt_p - sqrt_l) / Decimal(2) ** 96
     amount0, amount1 = amount0_raw / Decimal(10) ** decimals0, amount1_raw / Decimal(10) ** decimals1
-    asset_amount = amount0 if pengu_is_0 else amount1
-    quote_amount = amount1 if pengu_is_0 else amount0
+    asset_amount = amount0 if asset_is_0 else amount1
+    quote_amount = amount1 if asset_is_0 else amount0
     liquidity_usd = asset_amount * current_price + quote_amount
     # A conversão inversa mantém a posição monitorável quando ela está acima
-    # da faixa (100% USDG). Nesse caso o alvo de PENGU é naturalmente zero.
+    # da faixa (100% USDG). Nesse caso o alvo do ativo é naturalmente zero.
     normalized_liquidity = (
         asset_amount / base_target(Decimal(1), current_price, lower_price, upper_price)
         if asset_amount
         else lp_liquidity(liquidity_usd, current_price, lower_price, upper_price)
     )
-    return {"source": "uniswap", "positionAddress": str(token_id), "personalPositionAddress": str(token_id), "poolAddress": "0x" + pool_id, "pair": "PENGU / USDG", "assetSymbol": "PENGU", "hedgeSymbol": "PENGU", "hedgeMode": "units", "quoteSymbol": "USDG", "liquidityUsd": liquidity_usd, "normalizedLiquidity": normalized_liquidity, "lowerPrice": lower_price, "upperPrice": upper_price, "currentPrice": current_price, "importable": bool(liquidity_usd > 0)}
+    return {"source": "uniswap", "positionAddress": str(token_id), "personalPositionAddress": str(token_id), "poolAddress": "0x" + pool_id, "pair": f"{asset_symbol} / USDG", "assetSymbol": asset_symbol, "hedgeSymbol": hyp_symbol(asset_symbol), "hedgeMode": "units", "quoteSymbol": "USDG", "liquidityUsd": liquidity_usd, "normalizedLiquidity": normalized_liquidity, "lowerPrice": lower_price, "upperPrice": upper_price, "currentPrice": current_price, "importable": bool(liquidity_usd > 0)}
 
 
 def uniswap_v4_positions(wallet: str, pool_id: str) -> list[dict[str, Any]]:
@@ -1513,7 +1519,7 @@ class NeutralisMonitor:
                 if position is None:
                     raise NeutralisError(
                         "NFT Uniswap não corresponde a esta pool, está sem liquidez ou não pôde ser lido pelo RPC. "
-                        "Confirme o Token ID numérico do NFT PENGU/USDG."
+                        "Confirme o Token ID numérico do NFT da pool selecionada."
                     )
                 return [position]
             positions = uniswap_v4_positions(self.config["evmWallet"], pool_id)
