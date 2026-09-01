@@ -35,6 +35,7 @@ CONFIG_FILE = DATA_DIR / "config.json"
 LOG_FILE = DATA_DIR / "events.jsonl"
 API_KEY_FILE = DATA_DIR / "hyperliquid-api-wallet.key"
 SOLANA_RPC_FILE = DATA_DIR / "solana-rpc.url"
+ROBINHOOD_RPC_FILE = DATA_DIR / "robinhood-rpc.url"
 TELEGRAM_FILE = DATA_DIR / "telegram-alert.json"
 BYREAL_URL = "https://api2.byreal.io/byreal/api/dex/v2/position/list"
 BYREAL_MINT_LIST_URL = "https://api2.byreal.io/byreal/api/dex/v2/mint/list"
@@ -127,7 +128,7 @@ def prepare_data_permissions() -> None:
     """Prepara o volume persistente antes de iniciar o servidor."""
     DATA_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(DATA_DIR, 0o700)
-    for path in (CONFIG_FILE, LOG_FILE, SOLANA_RPC_FILE, API_KEY_FILE, TELEGRAM_FILE):
+    for path in (CONFIG_FILE, LOG_FILE, SOLANA_RPC_FILE, ROBINHOOD_RPC_FILE, API_KEY_FILE, TELEGRAM_FILE):
         if path.exists():
             os.chmod(path, 0o600)
 
@@ -177,6 +178,16 @@ def solana_request(payload: dict[str, Any]) -> Any:
     return json_request(solana_rpc_url(), payload)
 
 
+def robinhood_rpc_urls() -> tuple[str, ...]:
+    """Prioriza o RPC dedicado guardado localmente, sem expor a URL/chave."""
+    try:
+        dedicated = ROBINHOOD_RPC_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        dedicated = ""
+    urls = ((dedicated,) if dedicated else ()) + ROBINHOOD_RPC_URLS
+    return tuple(dict.fromkeys(urls))
+
+
 def evm_word(value: int | str) -> str:
     if isinstance(value, int):
         return f"{value:064x}"
@@ -192,7 +203,7 @@ def evm_selector(signature: str) -> str:
 
 def robinhood_request(method: str, params: list[Any]) -> Any:
     last_error: NeutralisError | None = None
-    for rpc_url in ROBINHOOD_RPC_URLS:
+    for rpc_url in robinhood_rpc_urls():
         try:
             root = json_request(rpc_url, {"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
             if not isinstance(root, dict) or root.get("error") or "result" not in root:
@@ -1284,6 +1295,17 @@ class NeutralisMonitor:
         os.chmod(SOLANA_RPC_FILE, 0o600)
         return {"configured": True, "host": parsed.hostname}
 
+    def save_robinhood_rpc(self, incoming: dict[str, Any]) -> dict[str, Any]:
+        endpoint = str(incoming.get("endpoint", "")).strip()
+        parsed = urlparse(endpoint)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            raise NeutralisError("Endpoint RPC Robinhood inválido; use uma URL HTTPS")
+        if len(endpoint) > 2048:
+            raise NeutralisError("Endpoint RPC Robinhood muito longo")
+        ROBINHOOD_RPC_FILE.write_text(endpoint, encoding="utf-8")
+        os.chmod(ROBINHOOD_RPC_FILE, 0o600)
+        return {"configured": True, "host": parsed.hostname}
+
     def _api_key(self) -> str:
         try:
             key = API_KEY_FILE.read_text(encoding="ascii").strip()
@@ -1819,7 +1841,7 @@ class NeutralisMonitor:
 
     def public_state(self) -> dict[str, Any]:
         with self.lock:
-            return {"config": dict(self.config), "monitor": json_safe(dict(self.state)), "events": self.events(50), "dryRun": not bool((self.state.get("snapshot") or {}).get("live")), "ordersEnabled": True, "apiWalletConfigured": API_KEY_FILE.exists(), "telegramConfigured": self.telegram_configured(), "solanaRpcConfigured": SOLANA_RPC_FILE.exists(), "solanaRpcHost": urlparse(solana_rpc_url()).hostname, "autoLimits": {"pollSeconds": AUTO_POLL_SECONDS, "maxSlippagePercent": float(AUTO_RETRY_SLIPPAGES[-1] * 100), "maxPositionNotional": float(self.max_position_notional()), "minOrderNotional": 10}}
+            return {"config": dict(self.config), "monitor": json_safe(dict(self.state)), "events": self.events(50), "dryRun": not bool((self.state.get("snapshot") or {}).get("live")), "ordersEnabled": True, "apiWalletConfigured": API_KEY_FILE.exists(), "telegramConfigured": self.telegram_configured(), "solanaRpcConfigured": SOLANA_RPC_FILE.exists(), "solanaRpcHost": urlparse(solana_rpc_url()).hostname, "robinhoodRpcConfigured": ROBINHOOD_RPC_FILE.exists(), "autoLimits": {"pollSeconds": AUTO_POLL_SECONDS, "maxSlippagePercent": float(AUTO_RETRY_SLIPPAGES[-1] * 100), "maxPositionNotional": float(self.max_position_notional()), "minOrderNotional": 10}}
 
 
 MONITORS = {"1": NeutralisMonitor("1"), "2": NeutralisMonitor("2")}
@@ -1877,6 +1899,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "apiWalletConfigured": API_KEY_FILE.exists(),
                     "telegramConfigured": MONITOR.telegram_configured(),
                     "solanaRpcConfigured": SOLANA_RPC_FILE.exists(),
+                    "robinhoodRpcConfigured": ROBINHOOD_RPC_FILE.exists(),
                 })
             if path == "/api/positions":
                 monitor = monitor_for_slot(parse_qs(urlparse(self.path).query).get("slot", ["1"])[0])
@@ -1909,6 +1932,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(MONITOR.save_telegram_alert(self.read_json()))
             if path == "/api/solana/rpc":
                 return self.send_json(MONITOR.save_solana_rpc(self.read_json()))
+            if path == "/api/robinhood/rpc":
+                return self.send_json(MONITOR.save_robinhood_rpc(self.read_json()))
             if path == "/api/monitor/start":
                 monitor_for_slot(self.read_json().get("slot")).start()
                 return self.send_json({"ok": True}, HTTPStatus.ACCEPTED)
