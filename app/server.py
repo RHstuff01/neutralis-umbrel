@@ -97,6 +97,7 @@ ROBINHOOD_RPC_URLS = (
 ROBINHOOD_CHAIN_ID = 4663
 UNISWAP_V4_POSITION_MANAGER = "0x58daec3116aae6d93017baaea7749052e8a04fa7"
 UNISWAP_V4_STATE_VIEW = "0xf3334192d15450cdd385c8b70e03f9a6bd9e673b"
+ROBINHOOD_BLOCKSCOUT_API = "https://robinhoodchain.blockscout.com/api/v2"
 KNOWN_MINTS = {
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
     "XsueG8BtpquVJX9LVLLEGuViXUungE6WmK5YZ3p3bd1": "CRCLX",
@@ -250,23 +251,28 @@ def erc20_metadata(address: str) -> tuple[str, int]:
 def uniswap_v4_owner_tokens(wallet: str) -> list[int]:
     if not EVM_PATTERN.fullmatch(wallet):
         raise NeutralisError("Carteira EVM inválida")
-    transfer_topic = "0x" + keccak(text="Transfer(address,address,uint256)").hex()
-    target_topic = "0x" + wallet.lower().removeprefix("0x").rjust(64, "0")
-    logs = robinhood_request("eth_getLogs", [{"fromBlock": "0x0", "toBlock": "latest", "address": UNISWAP_V4_POSITION_MANAGER, "topics": [transfer_topic, None, target_topic]}])
-    if not isinstance(logs, list):
+    # Não usamos eth_getLogs desde o bloco zero: o plano gratuito da Alchemy
+    # limita essa consulta a dez blocos. O Blockscout indexa os NFTs da
+    # carteira e fornece justamente os token IDs da PositionManager.
+    root = json_request(
+        f"{ROBINHOOD_BLOCKSCOUT_API}/addresses/{wallet}/nft/collections?type=ERC-721,ERC-1155"
+    )
+    collections = root.get("items", []) if isinstance(root, dict) else []
+    if not isinstance(collections, list):
         raise NeutralisError("Resposta inválida ao localizar NFTs Uniswap")
     tokens: list[int] = []
-    for log in logs:
-        topics = log.get("topics", []) if isinstance(log, dict) else []
-        if len(topics) != 4:
+    for collection in collections:
+        token = collection.get("token", {}) if isinstance(collection, dict) else {}
+        address = str(token.get("address") or token.get("address_hash") or "") if isinstance(token, dict) else ""
+        if address.lower() != UNISWAP_V4_POSITION_MANAGER:
             continue
-        token_id = int(str(topics[3]), 16)
-        try:
-            owner = "0x" + robinhood_call(UNISWAP_V4_POSITION_MANAGER, "ownerOf(uint256)", token_id)[-40:]
-            if owner.lower() == wallet.lower():
-                tokens.append(token_id)
-        except NeutralisError:
-            continue
+        instances = collection.get("token_instances", [])
+        for instance in instances if isinstance(instances, list) else []:
+            token_id = instance.get("id", instance.get("token_id")) if isinstance(instance, dict) else None
+            try:
+                tokens.append(int(str(token_id)))
+            except (TypeError, ValueError):
+                continue
     return sorted(set(tokens))
 
 

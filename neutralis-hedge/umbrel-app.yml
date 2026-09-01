@@ -4,7 +4,7 @@ name: Neutralis Hedge
 tagline: Hedge dinâmico protegido para LPs RWA
 icon: https://neutralis-rwa-hedge.rafaelherzer.chatgpt.site/favicon.svg
 category: finance
-version: "0.8.11"
+version: "0.8.12"
 port: 8787
 description: >-
   Monitora uma posição de liquidez concentrada na Byreal, Raydium, Orca ou Uniswap V4 e a posição
@@ -17,7 +17,7 @@ submission: https://github.com/RHstuff01/neutralis-umbrel
 repo: https://github.com/RHstuff01/neutralis-umbrel
 support: https://github.com/RHstuff01/neutralis-umbrel/issues
 gallery: []
-releaseNotes: Permite salvar um RPC Robinhood dedicado (Alchemy) somente no Umbrel.
+releaseNotes: Localiza NFTs Uniswap via Blockscout, sem eth_getLogs limitado da Alchemy gratuita.
 dependencies: []
 path: ""
 defaultUsername: ""

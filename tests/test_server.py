@@ -444,6 +444,13 @@ class NeutralisTests(unittest.TestCase):
             self.assertEqual(server.robinhood_request("eth_chainId", []), "0x123")
         self.assertEqual(request.call_count, 2)
 
+    def test_uniswap_nft_discovery_uses_blockscout_not_alchemy_logs(self):
+        wallet = "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF"
+        payload = {"items": [{"token": {"address": server.UNISWAP_V4_POSITION_MANAGER}, "token_instances": [{"id": "42"}, {"token_id": "43"}]}]}
+        with patch.object(server, "json_request", return_value=payload) as request:
+            self.assertEqual(server.uniswap_v4_owner_tokens(wallet), [42, 43])
+        self.assertIn("/nft/collections", request.call_args.args[0])
+
     def test_orca_skr_usdc_uses_main_hyperliquid_skr_market(self):
         skr = "SKRbvo6Gf7GondiT3BbTfuRDPqLWei4j2Qy2NPGZhW3"
         usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
