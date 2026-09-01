@@ -1196,6 +1196,7 @@ class NeutralisMonitor:
             "source": "byreal",
             "solanaWallet": DEFAULT_SOLANA_WALLET,
             "evmWallet": DEFAULT_HYP_ACCOUNT,
+            "uniswapTokenId": "",
             "hyperliquidAccount": DEFAULT_HYP_ACCOUNT,
             "positionAddress": "",
             "maxPositionNotional": "600",
@@ -1213,6 +1214,7 @@ class NeutralisMonitor:
         source = str(incoming.get("source", self.config["source"])).lower()
         wallet = str(incoming.get("solanaWallet", self.config["solanaWallet"]))
         evm_wallet = str(incoming.get("evmWallet", self.config["evmWallet"]))
+        uniswap_token_id = str(incoming.get("uniswapTokenId", self.config.get("uniswapTokenId", ""))).strip()
         account = str(incoming.get("hyperliquidAccount", self.config["hyperliquidAccount"]))
         position = str(incoming.get("positionAddress", self.config["positionAddress"]))
         max_notional = decimal(incoming.get("maxPositionNotional", self.config["maxPositionNotional"]), "limite máximo do short")
@@ -1227,6 +1229,8 @@ class NeutralisMonitor:
             raise NeutralisError("Conta Hyperliquid inválida")
         if source == "uniswap" and position and not re.fullmatch(r"0x[0-9a-fA-F]{64}", position):
             raise NeutralisError("Pool ID Uniswap V4 inválido")
+        if source == "uniswap" and uniswap_token_id and not re.fullmatch(r"[1-9][0-9]{0,77}", uniswap_token_id):
+            raise NeutralisError("NFT Uniswap inválido; use somente o número do Token ID")
         if source != "uniswap" and position and not SOLANA_PATTERN.fullmatch(position):
             raise NeutralisError("Endereço da posição inválido")
         if not Decimal("10") <= max_notional <= Decimal("100000"):
@@ -1236,7 +1240,7 @@ class NeutralisMonitor:
         with self.lock:
             if self.state["mode"] == "running":
                 raise NeutralisError("Pare o monitor antes de alterar a configuração")
-            self.config = {"source": source, "solanaWallet": wallet, "evmWallet": evm_wallet, "hyperliquidAccount": account, "positionAddress": position, "maxPositionNotional": str(max_notional), "stepPercent": str(step_percent)}
+            self.config = {"source": source, "solanaWallet": wallet, "evmWallet": evm_wallet, "uniswapTokenId": uniswap_token_id, "hyperliquidAccount": account, "positionAddress": position, "maxPositionNotional": str(max_notional), "stepPercent": str(step_percent)}
             self.config_file.write_text(json.dumps(self.config, indent=2), encoding="utf-8")
             os.chmod(self.config_file, 0o600)
         return dict(self.config)
@@ -1487,6 +1491,10 @@ class NeutralisMonitor:
             pool_id = self.config["positionAddress"]
             if not pool_id:
                 return []
+            token_id = self.config.get("uniswapTokenId", "")
+            if token_id:
+                position = uniswap_v4_position(int(token_id), pool_id)
+                return [position] if position is not None else []
             return uniswap_v4_positions(self.config["evmWallet"], pool_id)
         if self.config["source"] == "raydium":
             position = self.config["positionAddress"]

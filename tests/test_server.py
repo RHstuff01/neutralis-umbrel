@@ -429,11 +429,23 @@ class NeutralisTests(unittest.TestCase):
             "evmWallet": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
             "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
             "positionAddress": pool_id,
+            "uniswapTokenId": "42",
             "maxPositionNotional": "1000",
             "stepPercent": "0.5",
         })
         self.assertEqual(result["source"], "uniswap")
         self.assertEqual(result["positionAddress"], pool_id)
+        self.assertEqual(result["uniswapTokenId"], "42")
+
+    def test_uniswap_manual_token_id_skips_blockscout_discovery(self):
+        monitor = server.NeutralisMonitor("uniswap-manual-token-test")
+        pool_id = "0x" + "a" * 64
+        monitor.config.update({"source": "uniswap", "positionAddress": pool_id, "uniswapTokenId": "42"})
+        position = {"positionAddress": "42"}
+        with patch.object(server, "uniswap_v4_position", return_value=position) as direct, patch.object(server, "uniswap_v4_positions") as discovery:
+            self.assertEqual(monitor.positions(), [position])
+        direct.assert_called_once_with(42, pool_id)
+        discovery.assert_not_called()
 
     def test_uniswap_helpers_decode_signed_tick(self):
         self.assertEqual(server.abi_int24(0x7FFFFF), 8388607)
