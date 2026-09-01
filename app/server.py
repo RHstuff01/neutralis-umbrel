@@ -1494,8 +1494,19 @@ class NeutralisMonitor:
             token_id = self.config.get("uniswapTokenId", "")
             if token_id:
                 position = uniswap_v4_position(int(token_id), pool_id)
-                return [position] if position is not None else []
-            return uniswap_v4_positions(self.config["evmWallet"], pool_id)
+                if position is None:
+                    raise NeutralisError(
+                        "NFT Uniswap não corresponde a esta pool, está sem liquidez ou não pôde ser lido pelo RPC. "
+                        "Confirme o Token ID numérico do NFT PENGU/USDG."
+                    )
+                return [position]
+            positions = uniswap_v4_positions(self.config["evmWallet"], pool_id)
+            if not positions:
+                raise NeutralisError(
+                    "Nenhum NFT Uniswap foi localizado automaticamente. Informe o Token ID numérico do NFT no campo próprio "
+                    "para não depender do Blockscout."
+                )
+            return positions
         if self.config["source"] == "raydium":
             position = self.config["positionAddress"]
             if not position:

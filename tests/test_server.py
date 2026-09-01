@@ -447,6 +447,13 @@ class NeutralisTests(unittest.TestCase):
         direct.assert_called_once_with(42, pool_id)
         discovery.assert_not_called()
 
+    def test_uniswap_manual_token_id_reports_unreadable_position(self):
+        monitor = server.NeutralisMonitor("uniswap-manual-token-error-test")
+        monitor.config.update({"source": "uniswap", "positionAddress": "0x" + "a" * 64, "uniswapTokenId": "42"})
+        with patch.object(server, "uniswap_v4_position", return_value=None):
+            with self.assertRaisesRegex(server.NeutralisError, "NFT Uniswap não corresponde"):
+                monitor.positions()
+
     def test_uniswap_helpers_decode_signed_tick(self):
         self.assertEqual(server.abi_int24(0x7FFFFF), 8388607)
         self.assertEqual(server.abi_int24(0xFFFFFF), -1)
