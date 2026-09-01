@@ -439,6 +439,11 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(server.abi_int24(0x7FFFFF), 8388607)
         self.assertEqual(server.abi_int24(0xFFFFFF), -1)
 
+    def test_uniswap_uses_second_rpc_when_official_rpc_fails(self):
+        with patch.object(server, "json_request", side_effect=[server.NeutralisError("offline"), {"result": "0x123"}]) as request:
+            self.assertEqual(server.robinhood_request("eth_chainId", []), "0x123")
+        self.assertEqual(request.call_count, 2)
+
     def test_orca_skr_usdc_uses_main_hyperliquid_skr_market(self):
         skr = "SKRbvo6Gf7GondiT3BbTfuRDPqLWei4j2Qy2NPGZhW3"
         usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"

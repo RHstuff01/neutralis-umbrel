@@ -83,7 +83,13 @@ SYMBOL_ALIASES = {"AAPLX": "AAPL", "CRCLX": "CRCL", "COINX": "COIN", "SPYX": "US
 # escala unitária de SPYx na Orca.
 HYP_DEX_BY_SYMBOL: dict[str, str | None] = {"US500": "mkts", "ZEC": None, "SOL": None, "SKR": None}
 HYP_DEX_BY_SYMBOL["PENGU"] = None
-ROBINHOOD_RPC_URL = "https://rpc.mainnet.chain.robinhood.com"
+# O RPC oficial é o preferencial. Ele é público e pode ficar indisponível ou
+# limitado; o segundo endpoint permite que a leitura da LP continue no Umbrel
+# sem depender de uma única infraestrutura.
+ROBINHOOD_RPC_URLS = (
+    "https://rpc.mainnet.chain.robinhood.com",
+    "https://robinhood-rpc.publicnode.com",
+)
 ROBINHOOD_CHAIN_ID = 4663
 UNISWAP_V4_POSITION_MANAGER = "0x58daec3116aae6d93017baaea7749052e8a04fa7"
 UNISWAP_V4_STATE_VIEW = "0xf3334192d15450cdd385c8b70e03f9a6bd9e673b"
@@ -182,10 +188,16 @@ def evm_selector(signature: str) -> str:
 
 
 def robinhood_request(method: str, params: list[Any]) -> Any:
-    root = json_request(ROBINHOOD_RPC_URL, {"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
-    if not isinstance(root, dict) or root.get("error") or "result" not in root:
-        raise NeutralisError("Falha ao consultar a Robinhood Chain")
-    return root["result"]
+    last_error: NeutralisError | None = None
+    for rpc_url in ROBINHOOD_RPC_URLS:
+        try:
+            root = json_request(rpc_url, {"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+            if not isinstance(root, dict) or root.get("error") or "result" not in root:
+                raise NeutralisError("Resposta inválida do RPC da Robinhood Chain")
+            return root["result"]
+        except NeutralisError as error:
+            last_error = error
+    raise NeutralisError("Falha de rede nos RPCs da Robinhood Chain") from last_error
 
 
 def robinhood_call(contract: str, signature: str, *arguments: int | str) -> str:
