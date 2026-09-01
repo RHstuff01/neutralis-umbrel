@@ -22,6 +22,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
+try:
+    from eth_utils import keccak
+except ImportError:  # permite testes de leitura sem as deps de produção
+    def keccak(*_: Any, **__: Any) -> bytes:
+        raise NeutralisError("Dependência Ethereum indisponível para consultar Uniswap")
 
 
 DATA_DIR = Path(os.environ.get("NEUTRALIS_DATA_DIR", "/data"))
@@ -77,6 +82,11 @@ SYMBOL_ALIASES = {"AAPLX": "AAPL", "CRCLX": "CRCL", "COINX": "COIN", "SPYX": "US
 # Os RWAs tokenizados permanecem no DEX xyz; US500 usa mkts por ter a mesma
 # escala unitária de SPYx na Orca.
 HYP_DEX_BY_SYMBOL: dict[str, str | None] = {"US500": "mkts", "ZEC": None, "SOL": None, "SKR": None}
+HYP_DEX_BY_SYMBOL["PENGU"] = None
+ROBINHOOD_RPC_URL = "https://rpc.mainnet.chain.robinhood.com"
+ROBINHOOD_CHAIN_ID = 4663
+UNISWAP_V4_POSITION_MANAGER = "0x58daec3116aae6d93017baaea7749052e8a04fa7"
+UNISWAP_V4_STATE_VIEW = "0xf3334192d15450cdd385c8b70e03f9a6bd9e673b"
 KNOWN_MINTS = {
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
     "XsueG8BtpquVJX9LVLLEGuViXUungE6WmK5YZ3p3bd1": "CRCLX",
@@ -156,6 +166,148 @@ def solana_rpc_url() -> str:
 
 def solana_request(payload: dict[str, Any]) -> Any:
     return json_request(solana_rpc_url(), payload)
+
+
+def evm_word(value: int | str) -> str:
+    if isinstance(value, int):
+        return f"{value:064x}"
+    text = str(value).lower().removeprefix("0x")
+    if not re.fullmatch(r"[0-9a-f]{1,64}", text):
+        raise NeutralisError("Parâmetro EVM inválido")
+    return text.rjust(64, "0")
+
+
+def evm_selector(signature: str) -> str:
+    return keccak(text=signature)[:4].hex()
+
+
+def robinhood_request(method: str, params: list[Any]) -> Any:
+    root = json_request(ROBINHOOD_RPC_URL, {"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+    if not isinstance(root, dict) or root.get("error") or "result" not in root:
+        raise NeutralisError("Falha ao consultar a Robinhood Chain")
+    return root["result"]
+
+
+def robinhood_call(contract: str, signature: str, *arguments: int | str) -> str:
+    if not EVM_PATTERN.fullmatch(contract):
+        raise NeutralisError("Contrato Robinhood inválido")
+    data = "0x" + evm_selector(signature) + "".join(evm_word(argument) for argument in arguments)
+    result = robinhood_request("eth_call", [{"to": contract, "data": data}, "latest"])
+    if not isinstance(result, str) or not result.startswith("0x"):
+        raise NeutralisError("Resposta inválida da Robinhood Chain")
+    return result[2:]
+
+
+def abi_int24(word: int) -> int:
+    result = word & 0xFFFFFF
+    return result - (1 << 24) if result & (1 << 23) else result
+
+
+def abi_string(data: str) -> str:
+    raw = bytes.fromhex(data)
+    if len(raw) == 32:  # alguns ERC-20 antigos retornam bytes32
+        return raw.rstrip(b"\0").decode("utf-8", "replace")
+    if len(raw) < 64:
+        return ""
+    length = int.from_bytes(raw[32:64], "big")
+    return raw[64 : 64 + length].decode("utf-8", "replace")
+
+
+def erc20_metadata(address: str) -> tuple[str, int]:
+    symbol = abi_string(robinhood_call(address, "symbol()"))
+    decimals = int(robinhood_call(address, "decimals()") or "0", 16)
+    if not symbol or not 0 <= decimals <= 36:
+        raise NeutralisError("Token ERC-20 inválido na Robinhood Chain")
+    return symbol.upper(), decimals
+
+
+def uniswap_v4_owner_tokens(wallet: str) -> list[int]:
+    if not EVM_PATTERN.fullmatch(wallet):
+        raise NeutralisError("Carteira EVM inválida")
+    transfer_topic = "0x" + keccak(text="Transfer(address,address,uint256)").hex()
+    target_topic = "0x" + wallet.lower().removeprefix("0x").rjust(64, "0")
+    logs = robinhood_request("eth_getLogs", [{"fromBlock": "0x0", "toBlock": "latest", "address": UNISWAP_V4_POSITION_MANAGER, "topics": [transfer_topic, None, target_topic]}])
+    if not isinstance(logs, list):
+        raise NeutralisError("Resposta inválida ao localizar NFTs Uniswap")
+    tokens: list[int] = []
+    for log in logs:
+        topics = log.get("topics", []) if isinstance(log, dict) else []
+        if len(topics) != 4:
+            continue
+        token_id = int(str(topics[3]), 16)
+        try:
+            owner = "0x" + robinhood_call(UNISWAP_V4_POSITION_MANAGER, "ownerOf(uint256)", token_id)[-40:]
+            if owner.lower() == wallet.lower():
+                tokens.append(token_id)
+        except NeutralisError:
+            continue
+    return sorted(set(tokens))
+
+
+def uniswap_v4_position(token_id: int, pool_id: str) -> dict[str, Any] | None:
+    pool_id = pool_id.lower().removeprefix("0x")
+    if not re.fullmatch(r"[0-9a-f]{64}", pool_id):
+        raise NeutralisError("Pool ID Uniswap V4 inválido")
+    encoded_position = robinhood_call(UNISWAP_V4_POSITION_MANAGER, "getPoolAndPositionInfo(uint256)", token_id)
+    if len(encoded_position) < 384:
+        return None
+    words = [int(encoded_position[i : i + 64], 16) for i in range(0, 384, 64)]
+    if len(words) != 6:
+        return None
+    token0, token1 = f"0x{words[0] & ((1 << 160) - 1):040x}", f"0x{words[1] & ((1 << 160) - 1):040x}"
+    packed = words[5]
+    tick_lower, tick_upper = abi_int24(packed >> 8), abi_int24(packed >> 32)
+    if not tick_lower < tick_upper:
+        return None
+    pool_key_encoded = "".join(evm_word(item) for item in (token0, token1, words[2], words[3] & ((1 << 256) - 1), f"0x{words[4] & ((1 << 160) - 1):040x}"))
+    actual_pool_id = keccak(hexstr="0x" + pool_key_encoded).hex()
+    if actual_pool_id.lower() != pool_id:
+        return None
+    symbol0, decimals0 = erc20_metadata(token0)
+    symbol1, decimals1 = erc20_metadata(token1)
+    if {symbol0, symbol1} != {"PENGU", "USDG"}:
+        return None
+    slot = robinhood_call(UNISWAP_V4_STATE_VIEW, "getSlot0(bytes32)", "0x" + pool_id)
+    sqrt_price_x96 = int(slot[:64], 16)
+    if sqrt_price_x96 <= 0:
+        return None
+    liquidity = int(robinhood_call(UNISWAP_V4_POSITION_MANAGER, "getPositionLiquidity(uint256)", token_id)[:64], 16)
+    if liquidity <= 0:
+        return None
+    raw_price_1_per_0 = Decimal(sqrt_price_x96) ** 2 / Decimal(2) ** 192
+    price_1_per_0 = raw_price_1_per_0 * Decimal(10) ** (decimals0 - decimals1)
+    pengu_is_0 = symbol0 == "PENGU"
+    current_price = price_1_per_0 if pengu_is_0 else Decimal(1) / price_1_per_0
+    tick_price_1_per_0 = lambda tick: Decimal("1.0001") ** tick * Decimal(10) ** (decimals0 - decimals1)
+    lower_raw, upper_raw = tick_price_1_per_0(tick_lower), tick_price_1_per_0(tick_upper)
+    lower_price, upper_price = (lower_raw, upper_raw) if pengu_is_0 else (Decimal(1) / upper_raw, Decimal(1) / lower_raw)
+    # Converte a liquidez raw V4 para a quantidade efetiva de PENGU da LP.
+    sqrt_l = Decimal("1.0001") ** (Decimal(tick_lower) / 2) * Decimal(2) ** 96
+    sqrt_u = Decimal("1.0001") ** (Decimal(tick_upper) / 2) * Decimal(2) ** 96
+    sqrt_p = Decimal(sqrt_price_x96)
+    if sqrt_p <= sqrt_l:
+        amount0_raw, amount1_raw = Decimal(liquidity) * (sqrt_u - sqrt_l) * Decimal(2) ** 96 / (sqrt_l * sqrt_u), Decimal(0)
+    elif sqrt_p >= sqrt_u:
+        amount0_raw, amount1_raw = Decimal(0), Decimal(liquidity) * (sqrt_u - sqrt_l) / Decimal(2) ** 96
+    else:
+        amount0_raw = Decimal(liquidity) * (sqrt_u - sqrt_p) * Decimal(2) ** 96 / (sqrt_p * sqrt_u)
+        amount1_raw = Decimal(liquidity) * (sqrt_p - sqrt_l) / Decimal(2) ** 96
+    amount0, amount1 = amount0_raw / Decimal(10) ** decimals0, amount1_raw / Decimal(10) ** decimals1
+    asset_amount = amount0 if pengu_is_0 else amount1
+    quote_amount = amount1 if pengu_is_0 else amount0
+    liquidity_usd = asset_amount * current_price + quote_amount
+    # A conversão inversa mantém a posição monitorável quando ela está acima
+    # da faixa (100% USDG). Nesse caso o alvo de PENGU é naturalmente zero.
+    normalized_liquidity = (
+        asset_amount / base_target(Decimal(1), current_price, lower_price, upper_price)
+        if asset_amount
+        else lp_liquidity(liquidity_usd, current_price, lower_price, upper_price)
+    )
+    return {"source": "uniswap", "positionAddress": str(token_id), "personalPositionAddress": str(token_id), "poolAddress": "0x" + pool_id, "pair": "PENGU / USDG", "assetSymbol": "PENGU", "hedgeSymbol": "PENGU", "hedgeMode": "units", "quoteSymbol": "USDG", "liquidityUsd": liquidity_usd, "normalizedLiquidity": normalized_liquidity, "lowerPrice": lower_price, "upperPrice": upper_price, "currentPrice": current_price, "importable": bool(liquidity_usd > 0)}
+
+
+def uniswap_v4_positions(wallet: str, pool_id: str) -> list[dict[str, Any]]:
+    return [position for token_id in uniswap_v4_owner_tokens(wallet) if (position := uniswap_v4_position(token_id, pool_id)) is not None]
 
 
 def hyp_symbol(lp_symbol: str) -> str:
@@ -1011,6 +1163,7 @@ class NeutralisMonitor:
         defaults = {
             "source": "byreal",
             "solanaWallet": DEFAULT_SOLANA_WALLET,
+            "evmWallet": DEFAULT_HYP_ACCOUNT,
             "hyperliquidAccount": DEFAULT_HYP_ACCOUNT,
             "positionAddress": "",
             "maxPositionNotional": "600",
@@ -1027,17 +1180,22 @@ class NeutralisMonitor:
     def save_config(self, incoming: dict[str, Any]) -> dict[str, str]:
         source = str(incoming.get("source", self.config["source"])).lower()
         wallet = str(incoming.get("solanaWallet", self.config["solanaWallet"]))
+        evm_wallet = str(incoming.get("evmWallet", self.config["evmWallet"]))
         account = str(incoming.get("hyperliquidAccount", self.config["hyperliquidAccount"]))
         position = str(incoming.get("positionAddress", self.config["positionAddress"]))
         max_notional = decimal(incoming.get("maxPositionNotional", self.config["maxPositionNotional"]), "limite máximo do short")
         step_percent = decimal(incoming.get("stepPercent", self.config["stepPercent"]), "gatilho de ajuste")
-        if source not in {"byreal", "raydium", "orca"}:
+        if source not in {"byreal", "raydium", "orca", "uniswap"}:
             raise NeutralisError("Fonte de liquidez inválida")
-        if not SOLANA_PATTERN.fullmatch(wallet):
+        if source != "uniswap" and not SOLANA_PATTERN.fullmatch(wallet):
             raise NeutralisError("Carteira Solana inválida")
+        if source == "uniswap" and not EVM_PATTERN.fullmatch(evm_wallet):
+            raise NeutralisError("Carteira EVM inválida")
         if not EVM_PATTERN.fullmatch(account):
             raise NeutralisError("Conta Hyperliquid inválida")
-        if position and not SOLANA_PATTERN.fullmatch(position):
+        if source == "uniswap" and position and not re.fullmatch(r"0x[0-9a-fA-F]{64}", position):
+            raise NeutralisError("Pool ID Uniswap V4 inválido")
+        if source != "uniswap" and position and not SOLANA_PATTERN.fullmatch(position):
             raise NeutralisError("Endereço da posição inválido")
         if not Decimal("10") <= max_notional <= Decimal("100000"):
             raise NeutralisError("O limite máximo do short deve ficar entre US$ 10 e US$ 100.000")
@@ -1046,7 +1204,7 @@ class NeutralisMonitor:
         with self.lock:
             if self.state["mode"] == "running":
                 raise NeutralisError("Pare o monitor antes de alterar a configuração")
-            self.config = {"source": source, "solanaWallet": wallet, "hyperliquidAccount": account, "positionAddress": position, "maxPositionNotional": str(max_notional), "stepPercent": str(step_percent)}
+            self.config = {"source": source, "solanaWallet": wallet, "evmWallet": evm_wallet, "hyperliquidAccount": account, "positionAddress": position, "maxPositionNotional": str(max_notional), "stepPercent": str(step_percent)}
             self.config_file.write_text(json.dumps(self.config, indent=2), encoding="utf-8")
             os.chmod(self.config_file, 0o600)
         return dict(self.config)
@@ -1282,6 +1440,11 @@ class NeutralisMonitor:
                 raise NeutralisError("Monitor interrompido durante o ajuste")
 
     def positions(self) -> list[dict[str, Any]]:
+        if self.config["source"] == "uniswap":
+            pool_id = self.config["positionAddress"]
+            if not pool_id:
+                return []
+            return uniswap_v4_positions(self.config["evmWallet"], pool_id)
         if self.config["source"] == "raydium":
             position = self.config["positionAddress"]
             if not position:

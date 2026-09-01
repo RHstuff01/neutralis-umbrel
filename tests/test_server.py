@@ -418,6 +418,26 @@ class NeutralisTests(unittest.TestCase):
     def test_zec_and_sol_use_main_hyperliquid_market(self):
         self.assertIsNone(server.hyp_dex("ZEC"))
         self.assertIsNone(server.hyp_dex("SOL"))
+        self.assertIsNone(server.hyp_dex("PENGU"))
+
+    def test_uniswap_config_accepts_evm_wallet_and_v4_pool_id(self):
+        monitor = server.NeutralisMonitor("uniswap-test")
+        monitor.config_file = Path(TEST_DATA.name) / "uniswap-config.json"
+        pool_id = "0x6fd1e411116a0d3df88e6fec47ade148941e6e43ab886e43eb7f59b166e1ef0f"
+        result = monitor.save_config({
+            "source": "uniswap",
+            "evmWallet": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "positionAddress": pool_id,
+            "maxPositionNotional": "1000",
+            "stepPercent": "0.5",
+        })
+        self.assertEqual(result["source"], "uniswap")
+        self.assertEqual(result["positionAddress"], pool_id)
+
+    def test_uniswap_helpers_decode_signed_tick(self):
+        self.assertEqual(server.abi_int24(0x7FFFFF), 8388607)
+        self.assertEqual(server.abi_int24(0xFFFFFF), -1)
 
     def test_orca_skr_usdc_uses_main_hyperliquid_skr_market(self):
         skr = "SKRbvo6Gf7GondiT3BbTfuRDPqLWei4j2Qy2NPGZhW3"
