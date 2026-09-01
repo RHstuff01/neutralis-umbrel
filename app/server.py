@@ -15,7 +15,7 @@ import traceback
 from itertools import count
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1087,6 +1087,23 @@ def hyp_state(account: str, symbol: str) -> HypState:
     )
 
 
+def hyp_ioc_limit_price(mark: Decimal, slippage: Decimal, is_buy: bool, size_decimals: int) -> Decimal:
+    """Preço IOC válido para as regras de precisão da Hyperliquid.
+
+    A Hyp aceita no máximo cinco algarismos significativos e, para perps,
+    no máximo ``6 - szDecimals`` casas decimais no preço. O arredondamento
+    precisa ser agressivo: para compra arredonda para cima, para venda para
+    baixo, evitando transformar uma IOC em ordem inválida ou não executável.
+    """
+    if mark <= 0 or slippage < 0 or not 0 <= size_decimals <= 6:
+        raise NeutralisError("Parâmetros inválidos para preço IOC")
+    raw = mark * (Decimal("1") + slippage if is_buy else Decimal("1") - slippage)
+    significant_places = 4 - raw.adjusted()
+    decimal_places = max(0, min(6 - size_decimals, significant_places))
+    tick = Decimal(1).scaleb(-decimal_places)
+    return raw.quantize(tick, rounding=ROUND_UP if is_buy else ROUND_DOWN)
+
+
 
 
 def lp_liquidity(value: Decimal, price: Decimal, lower: Decimal, upper: Decimal) -> Decimal:
@@ -1421,8 +1438,7 @@ class NeutralisMonitor:
                     hyp = current
                     if not is_buy and (current_short + size) * hyp.mark > self.max_position_notional():
                         raise NeutralisError(f"Short-alvo ultrapassaria o limite total de US$ {self.max_position_notional():.2f}")
-                    limit_price = hyp.mark * (Decimal("1") + slippage if is_buy else Decimal("1") - slippage)
-                    limit_price = Decimal(f"{limit_price:.5g}")
+                    limit_price = hyp_ioc_limit_price(hyp.mark, slippage, is_buy, hyp.decimals)
                     response = self._exchange().order(
                         hyp.market,
                         is_buy,

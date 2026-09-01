@@ -458,6 +458,11 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(server.abi_int24(0x7FFFFF), 8388607)
         self.assertEqual(server.abi_int24(0xFFFFFF), -1)
 
+    def test_hyp_ioc_price_respects_asset_tick_and_direction(self):
+        # Com szDecimals=2, o preço pode ter no máximo quatro casas decimais.
+        self.assertEqual(server.hyp_ioc_limit_price(Decimal("0.028742"), Decimal("0.005"), True, 2), Decimal("0.0289"))
+        self.assertEqual(server.hyp_ioc_limit_price(Decimal("0.028742"), Decimal("0.005"), False, 2), Decimal("0.0285"))
+
     def test_uniswap_uses_second_rpc_when_official_rpc_fails(self):
         with patch.object(server, "json_request", side_effect=[server.NeutralisError("offline"), {"result": "0x123"}]) as request:
             self.assertEqual(server.robinhood_request("eth_chainId", []), "0x123")
