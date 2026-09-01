@@ -89,6 +89,9 @@ HYP_DEX_BY_SYMBOL["PENGU"] = None
 ROBINHOOD_RPC_URLS = (
     "https://rpc.mainnet.chain.robinhood.com",
     "https://robinhood-rpc.publicnode.com",
+    # O explorador oficial também expõe JSON-RPC de leitura e serve como
+    # terceira rota independente quando os nós públicos não resolvem no DNS.
+    "https://robinhoodchain.blockscout.com/api/eth-rpc",
 )
 ROBINHOOD_CHAIN_ID = 4663
 UNISWAP_V4_POSITION_MANAGER = "0x58daec3116aae6d93017baaea7749052e8a04fa7"
