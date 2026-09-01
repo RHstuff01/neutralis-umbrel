@@ -77,7 +77,7 @@ STABLE_SYMBOLS = {"USD", "USDC", "USDT", "USDS", "PYUSD"}
 # SPYx é a unidade de ETF próxima de US$ 770. O perp `mkts:US500` usa a
 # mesma escala. `xyz:SP500` é um índice próximo de US$ 7.700 e, portanto,
 # não pode ser usado como hedge 1:1 da quantidade de SPYx na LP.
-SYMBOL_ALIASES = {"AAPLX": "AAPL", "CRCLX": "CRCL", "COINX": "COIN", "SPYX": "US500"}
+SYMBOL_ALIASES = {"AAPLX": "AAPL", "CRCLX": "CRCL", "COINX": "COIN", "SPYX": "US500", "IBM": "IBMUSD"}
 # `None` representa o mercado perp principal da Hyperliquid.  Nos endpoints
 # da API ele não recebe o campo `dex` e o nome do contrato não tem prefixo.
 # Os RWAs tokenizados permanecem no DEX xyz; US500 usa mkts por ter a mesma
