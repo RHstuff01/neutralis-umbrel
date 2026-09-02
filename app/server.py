@@ -1396,8 +1396,6 @@ class NeutralisMonitor:
                 position, hyp, lower, upper, _, _ = self._live_snapshot()
                 if original_position and position.get("positionAddress") != original_position:
                     raise NeutralisError("A posição selecionada mudou durante o ajuste")
-                if position.get("currentPrice") is None:
-                    raise NeutralisError("A fonte deixou de fornecer o preço independente da LP")
 
             if hyp.open_orders:
                 raise NeutralisError("Existem ordens abertas neste mercado")
@@ -1589,7 +1587,10 @@ class NeutralisMonitor:
         value = decimal(position["liquidityUsd"], "liquidityUsd")
         lower = decimal(position["lowerPrice"], "lowerPrice")
         upper = decimal(position["upperPrice"], "upperPrice")
-        lp_price = decimal(position.get("currentPrice"), "preço da LP")
+        # Algumas respostas da Byreal não incluem tickCurrent. Nessa situação
+        # o mark da Hyp é uma referência válida para manter o cálculo da LP e
+        # o hedge em funcionamento, em vez de transformar None em erro.
+        lp_price = decimal(position.get("currentPrice") or hyp.mark, "preço da LP")
         if position.get("normalizedLiquidity") is not None:
             liquidity = decimal(position["normalizedLiquidity"], "normalizedLiquidity")
         else:
@@ -1662,8 +1663,6 @@ class NeutralisMonitor:
                 raise NeutralisError(f"O short real já ultrapassa o limite total de US$ {self.max_position_notional():.2f}")
             if hyp.open_orders:
                 raise NeutralisError("Existem ordens abertas neste mercado")
-            if live and position.get("currentPrice") is None:
-                raise NeutralisError("A fonte não forneceu preço independente da LP; modo real bloqueado")
             lp_price = decimal(position.get("currentPrice") or hyp.mark, "preço da LP")
             # A Hyp é o mercado contínuo que determina quando o hedge deve
             # reagir. A Orca permanece como fonte da faixa e da liquidez.
@@ -1742,8 +1741,6 @@ class NeutralisMonitor:
                     return self._pause("Foram detectadas ordens abertas neste mercado")
                 if live and abs(min(hyp_now.signed_position, Decimal("0"))) * hyp_now.mark > self.max_position_notional():
                     return self._pause(f"O short real ultrapassou o limite total de US$ {self.max_position_notional():.2f}")
-                if live and position_now.get("currentPrice") is None:
-                    return self._pause("A fonte deixou de fornecer o preço independente da LP")
                 lp_price = decimal(position_now.get("currentPrice") or hyp_now.mark, "preço da LP")
                 basis_from_anchor = hedge_basis(position_now, lp_price, hyp_now.mark, ratio_anchor)
 

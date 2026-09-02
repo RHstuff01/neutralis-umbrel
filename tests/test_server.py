@@ -297,6 +297,17 @@ class NeutralisTests(unittest.TestCase):
         mark = Decimal("176.79")
         self.assertEqual(server.decimal(position.get("currentPrice") or mark, "preço da LP"), mark)
 
+    def test_live_snapshot_falls_back_to_hyp_mark_when_byreal_has_no_tick_price(self):
+        monitor = server.NeutralisMonitor("byreal-mark-fallback-test")
+        position = {
+            "liquidityUsd": Decimal("1000"), "lowerPrice": Decimal("100"), "upperPrice": Decimal("200"),
+            "currentPrice": None, "normalizedLiquidity": Decimal("10"), "hedgeSymbol": "AAPL", "assetSymbol": "AAPLX",
+        }
+        hyp = server.HypState("xyz:AAPL", 3, Decimal("150"), Decimal("150"), Decimal("0"), 0)
+        with patch.object(monitor, "_selected_position", return_value=position), patch.object(server, "hyp_state", return_value=hyp):
+            _, _, _, _, _, target = monitor._live_snapshot()
+        self.assertGreater(target, 0)
+
     def test_byreal_mint_price_requires_exact_mint(self):
         mint = "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw"
         payload = {"result": {"data": {"records": [
