@@ -530,6 +530,14 @@ class NeutralisTests(unittest.TestCase):
             hyp = server.hyp_state(account, "AAPL")
         self.assertEqual(hyp.market, "xyz:AAPLUSD")
 
+    def test_hyp_finds_stock_after_it_moves_to_another_perp_dex(self):
+        account = "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF"
+        empty_meta, empty_contexts = {"universe": []}, []
+        active_meta, active_contexts = {"universe": [{"name": "AAPL", "szDecimals": 2}]}, [{"markPx": "240", "oraclePx": "240"}]
+        with patch.object(server, "json_request", side_effect=[(empty_meta, empty_contexts), [{"name": "other"}], (active_meta, active_contexts), {"assetPositions": []}, []]):
+            hyp = server.hyp_state(account, "AAPL")
+        self.assertEqual(hyp.market, "other:AAPL")
+
     def test_basis_guard_measures_drift_from_anchor_not_initial_spread(self):
         position = {"hedgeMode": "units"}
         anchor_ratio = Decimal("770.83") / Decimal("766.31")

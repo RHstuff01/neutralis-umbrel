@@ -1060,33 +1060,50 @@ def hyp_state(account: str, symbol: str) -> HypState:
     if not EVM_PATTERN.fullmatch(account):
         raise NeutralisError("Conta Hyperliquid inválida")
     symbol = hyp_symbol(symbol)
-    dex = hyp_dex(symbol)
-    market = f"{dex}:{symbol}" if dex else symbol
+    preferred_dex = hyp_dex(symbol)
+    candidates = HYP_MARKET_ALTERNATIVES.get(
+        symbol,
+        (symbol, f"{symbol}USD") if preferred_dex == "xyz" and not symbol.endswith("USD") else (symbol,),
+    )
 
-    # O perp principal (ZEC, SOL etc.) é consultado sem `dex`. Mandar
-    # `dex: "xyz"` faz a Hyperliquid procurar um contrato inexistente.
-    def info_payload(request_type: str, **values: str) -> dict[str, str]:
+    def info_payload(request_type: str, dex: str | None, **values: str) -> dict[str, str]:
         payload = {"type": request_type, **values}
         if dex:
             payload["dex"] = dex
         return payload
 
-    metadata, contexts = json_request(HYP_INFO_URL, info_payload("metaAndAssetCtxs"))
-    clearinghouse = json_request(HYP_INFO_URL, info_payload("clearinghouseState", user=account))
-    orders = json_request(HYP_INFO_URL, info_payload("frontendOpenOrders", user=account))
-    universe = metadata.get("universe", [])
-    # Alguns RWAs aparecem como AAPL e outros como AAPLUSD no catálogo da
-    # Hyp, embora a LP use apenas o ticker. Para DEX xyz, tentamos ambos e
-    # operamos o nome realmente listado, sem alterar o mapeamento da LP.
-    candidates = HYP_MARKET_ALTERNATIVES.get(
-        symbol,
-        (symbol, f"{symbol}USD") if dex == "xyz" and not symbol.endswith("USD") else (symbol,),
-    )
-    index = next((i for i, row in enumerate(universe) if str(row.get("name", "")).upper() in candidates), None)
+    def market_in_dex(dex: str | None) -> tuple[dict[str, Any], list[Any], int | None]:
+        metadata, contexts = json_request(HYP_INFO_URL, info_payload("metaAndAssetCtxs", dex))
+        universe = metadata.get("universe", []) if isinstance(metadata, dict) else []
+        index = next((i for i, row in enumerate(universe) if str(row.get("name", "")).upper() in candidates), None)
+        return metadata, contexts, index
+
+    metadata, contexts, index = market_in_dex(preferred_dex)
+    dex = preferred_dex
     if index is None:
-        raise NeutralisError(f"Contrato {market} não encontrado na Hyperliquid")
+        dex_rows = json_request(HYP_INFO_URL, {"type": "perpDexs"})
+        names = [str(row.get("name", "")) for row in dex_rows if isinstance(row, dict) and row.get("name")]
+        for candidate_dex in names:
+            if candidate_dex == preferred_dex:
+                continue
+            # Um DEX recém-publicado ou temporariamente indisponível não pode
+            # impedir a procura nos demais catálogos. Só a ausência do ativo
+            # em todos eles deve resultar em "contrato não encontrado".
+            try:
+                metadata, contexts, index = market_in_dex(candidate_dex)
+            except NeutralisError:
+                continue
+            if index is not None:
+                dex = candidate_dex
+                break
+    if index is None:
+        requested = f"{preferred_dex}:{symbol}" if preferred_dex else symbol
+        raise NeutralisError(f"Contrato {requested} não encontrado na Hyperliquid")
+    universe = metadata.get("universe", [])
     active_symbol = str(universe[index].get("name", symbol)).upper()
     market = f"{dex}:{active_symbol}" if dex else active_symbol
+    clearinghouse = json_request(HYP_INFO_URL, info_payload("clearinghouseState", dex, user=account))
+    orders = json_request(HYP_INFO_URL, info_payload("frontendOpenOrders", dex, user=account))
     context = contexts[index]
     signed = Decimal("0")
     for row in clearinghouse.get("assetPositions", []):
@@ -1361,7 +1378,7 @@ class NeutralisMonitor:
             raise NeutralisError("Chave da API Wallet armazenada é inválida")
         return key if key.startswith("0x") else f"0x{key}"
 
-    def _exchange(self):
+    def _exchange(self, active_dex: str | None = None):
         try:
             from eth_account import Account
             from hyperliquid.exchange import Exchange
@@ -1377,7 +1394,7 @@ class NeutralisMonitor:
             # A SDK só carrega o perp principal quando a lista inclui "".
             # Ao informar apenas DEXs HIP-3, ela não cria o mapa interno para
             # ZEC/SOL e `order("ZEC", ...)` termina em KeyError.
-            perp_dexs=["", "xyz", "mkts"],
+            perp_dexs=list(dict.fromkeys(["", "xyz", "mkts", active_dex or ""])),
         )
 
     @staticmethod
@@ -1456,7 +1473,7 @@ class NeutralisMonitor:
                     if not is_buy and (current_short + size) * hyp.mark > self.max_position_notional():
                         raise NeutralisError(f"Short-alvo ultrapassaria o limite total de US$ {self.max_position_notional():.2f}")
                     limit_price = hyp_ioc_limit_price(hyp.mark, slippage, is_buy, hyp.decimals)
-                    response = self._exchange().order(
+                    response = self._exchange(hyp.dex).order(
                         hyp.market,
                         is_buy,
                         float(size),
