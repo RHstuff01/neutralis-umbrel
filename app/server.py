@@ -1393,7 +1393,7 @@ class NeutralisMonitor:
 
         for attempt in count():
             if attempt:
-                position, hyp, lower, upper, _, _ = self._live_snapshot()
+                position, hyp, lower, upper, _, _ = self._retry_snapshot()
                 if original_position and position.get("positionAddress") != original_position:
                     raise NeutralisError("A posição selecionada mudou durante o ajuste")
 
@@ -1462,6 +1462,7 @@ class NeutralisMonitor:
                     or "IOCCANCEL" in error_text
                     or "COULD NOT IMMEDIATELY MATCH" in error_text
                     or "RESTING ORDERS" in error_text
+                    or self._is_transient_network_error(error)
                 )
                 if not retryable:
                     raise
@@ -1471,7 +1472,9 @@ class NeutralisMonitor:
                 # cada dez tentativas para manter o histórico legível.
                 if attempt_number <= max_attempt or attempt_number % 10 == 0:
                     suffix = (
-                        f"tentando novamente com slippage máximo de {slippage * 100:.2f}%"
+                        "conexão temporariamente indisponível; mantendo o monitor ativo"
+                        if self._is_transient_network_error(error)
+                        else f"tentando novamente com slippage máximo de {slippage * 100:.2f}%"
                         if attempt_number >= max_attempt
                         else f"nova tentativa {attempt_number + 1}/{max_attempt}"
                     )
@@ -1598,6 +1601,26 @@ class NeutralisMonitor:
         target = target_at_reference_price(position, liquidity, lp_price, lower, upper, hyp.mark)
         return position, hyp, lower, upper, liquidity, target
 
+    @staticmethod
+    def _is_transient_network_error(error: NeutralisError) -> bool:
+        return str(error).startswith("Falha de rede")
+
+    def _retry_snapshot(self) -> tuple[dict[str, Any], HypState, Decimal, Decimal, Decimal, Decimal]:
+        """Aguarda a rede voltar sem encerrar um hedge já ativo."""
+        failures = 0
+        while not self.stop_event.is_set():
+            try:
+                return self._live_snapshot()
+            except NeutralisError as error:
+                if not self._is_transient_network_error(error):
+                    raise
+                failures += 1
+                if failures == 1 or failures % 12 == 0:
+                    self._event("network-retry", f"Conexão temporariamente indisponível; tentando novamente ({failures})", reason=str(error))
+                if self.stop_event.wait(5):
+                    break
+        raise NeutralisError("Monitor interrompido pelo usuário")
+
     def _event(self, event: str, message: str, **details: Any) -> None:
         record = {"at": now_iso(), "event": event, "message": message, **json_safe(details)}
         with self.log_file.open("a", encoding="utf-8") as handle:
@@ -1617,7 +1640,7 @@ class NeutralisMonitor:
             if self.thread and self.thread.is_alive():
                 raise NeutralisError("O monitor já está em execução")
             if live:
-                position, hyp, _, _, _, _ = self._live_snapshot()
+                position, hyp, _, _, _, _ = self._retry_snapshot()
                 expected = "ATIVAR"
                 if confirmation.strip().upper() != expected:
                     raise NeutralisError("Confirmação incorreta. Digite exatamente: ATIVAR")
@@ -1655,7 +1678,7 @@ class NeutralisMonitor:
 
     def _run(self, live: bool = False) -> None:
         try:
-            position, hyp, lower, upper, liquidity, target = self._live_snapshot()
+            position, hyp, lower, upper, liquidity, target = self._retry_snapshot()
             step = self.rebalance_step(lower, upper)
             if hyp.signed_position > 0:
                 raise NeutralisError("A conta está long; o monitor exige posição zero ou short")
@@ -1682,7 +1705,7 @@ class NeutralisMonitor:
                 )
                 result = self._execute_auto_adjustment(position, hyp, target)
                 initial_adjusted = bool(result)
-                position, hyp, lower, upper, liquidity, target = self._live_snapshot()
+                position, hyp, lower, upper, liquidity, target = self._retry_snapshot()
                 lp_price = decimal(position.get("currentPrice"), "preço da LP")
                 lp_anchor = lp_price
                 hyp_anchor = hyp.mark
@@ -1729,7 +1752,7 @@ class NeutralisMonitor:
             below_range = lp_price <= lower
 
             while not self.stop_event.wait(AUTO_POLL_SECONDS):
-                position_now, hyp_now, lower, upper, liquidity, target = self._live_snapshot()
+                position_now, hyp_now, lower, upper, liquidity, target = self._retry_snapshot()
                 step = self.rebalance_step(lower, upper)
                 if position_now["positionAddress"] != position["positionAddress"]:
                     return self._pause("A posição selecionada mudou")

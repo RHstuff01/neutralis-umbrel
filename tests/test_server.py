@@ -297,6 +297,11 @@ class NeutralisTests(unittest.TestCase):
         mark = Decimal("176.79")
         self.assertEqual(server.decimal(position.get("currentPrice") or mark, "preço da LP"), mark)
 
+    def test_network_failures_are_treated_as_transient(self):
+        monitor = server.NeutralisMonitor("network-retry-test")
+        self.assertTrue(monitor._is_transient_network_error(server.NeutralisError("Falha de rede ao consultar api.hyperliquid.xyz")))
+        self.assertFalse(monitor._is_transient_network_error(server.NeutralisError("Contrato não encontrado na Hyperliquid")))
+
     def test_live_snapshot_falls_back_to_hyp_mark_when_byreal_has_no_tick_price(self):
         monitor = server.NeutralisMonitor("byreal-mark-fallback-test")
         position = {
