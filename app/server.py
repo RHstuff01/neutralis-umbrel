@@ -1706,7 +1706,7 @@ class NeutralisMonitor:
                 result = self._execute_auto_adjustment(position, hyp, target)
                 initial_adjusted = bool(result)
                 position, hyp, lower, upper, liquidity, target = self._retry_snapshot()
-                lp_price = decimal(position.get("currentPrice"), "preço da LP")
+                lp_price = decimal(position.get("currentPrice") or hyp.mark, "preço da LP")
                 lp_anchor = lp_price
                 hyp_anchor = hyp.mark
                 ratio_anchor = lp_anchor / hyp_anchor
