@@ -513,6 +513,14 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(hyp.signed_position, Decimal("-1.2"))
         self.assertTrue(all("dex" not in call.args[1] for call in request.call_args_list))
 
+    def test_ibm_uses_active_hyperliquid_catalog_name(self):
+        account = "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF"
+        metadata = {"universe": [{"name": "IBM", "szDecimals": 2}]}
+        contexts = [{"markPx": "240", "oraclePx": "240"}]
+        with patch.object(server, "json_request", side_effect=[(metadata, contexts), {"assetPositions": []}, []]):
+            hyp = server.hyp_state(account, "IBM")
+        self.assertEqual(hyp.market, "xyz:IBM")
+
     def test_basis_guard_measures_drift_from_anchor_not_initial_spread(self):
         position = {"hedgeMode": "units"}
         anchor_ratio = Decimal("770.83") / Decimal("766.31")

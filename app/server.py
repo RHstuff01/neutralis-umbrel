@@ -84,6 +84,10 @@ SYMBOL_ALIASES = {"AAPLX": "AAPL", "CRCLX": "CRCL", "COINX": "COIN", "SPYX": "US
 # escala unitária de SPYx na Orca.
 HYP_DEX_BY_SYMBOL: dict[str, str | None] = {"US500": "mkts", "ZEC": None, "SOL": None, "SKR": None}
 HYP_DEX_BY_SYMBOL["PENGU"] = None
+# Alguns emissores exibem o ativo com sufixo USD na interface, mas a API
+# pode publicar o mesmo perp sem sufixo. O monitor consulta o catálogo e usa
+# o nome que estiver efetivamente ativo para não enviar ordens inválidas.
+HYP_MARKET_ALTERNATIVES = {"IBMUSD": ("IBMUSD", "IBM")}
 # Ativos já homologados para as LPs Uniswap V4 da Robinhood Chain. Os demais
 # pares não são importados até terem um perp correspondente confirmado.
 ROBINHOOD_UNISWAP_ASSETS = {"PENGU", "IBM"}
@@ -1071,17 +1075,20 @@ def hyp_state(account: str, symbol: str) -> HypState:
     clearinghouse = json_request(HYP_INFO_URL, info_payload("clearinghouseState", user=account))
     orders = json_request(HYP_INFO_URL, info_payload("frontendOpenOrders", user=account))
     universe = metadata.get("universe", [])
-    index = next((i for i, row in enumerate(universe) if str(row.get("name", "")).upper() in {symbol, market.upper()}), None)
+    candidates = HYP_MARKET_ALTERNATIVES.get(symbol, (symbol,))
+    index = next((i for i, row in enumerate(universe) if str(row.get("name", "")).upper() in candidates), None)
     if index is None:
         raise NeutralisError(f"Contrato {market} não encontrado na Hyperliquid")
+    active_symbol = str(universe[index].get("name", symbol)).upper()
+    market = f"{dex}:{active_symbol}" if dex else active_symbol
     context = contexts[index]
     signed = Decimal("0")
     for row in clearinghouse.get("assetPositions", []):
         position = row.get("position", {})
-        if str(position.get("coin", "")).upper() in {symbol, market.upper()}:
+        if str(position.get("coin", "")).upper() in set(candidates) | {market.upper()}:
             signed = decimal(position.get("szi", 0), "Hyperliquid szi")
             break
-    open_orders = sum(1 for row in orders if str(row.get("coin", "")).upper() in {symbol, market.upper()})
+    open_orders = sum(1 for row in orders if str(row.get("coin", "")).upper() in set(candidates) | {market.upper()})
     return HypState(
         market=market,
         decimals=int(universe[index]["szDecimals"]),
