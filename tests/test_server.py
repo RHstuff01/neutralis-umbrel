@@ -520,6 +520,7 @@ class NeutralisTests(unittest.TestCase):
         with patch.object(server, "json_request", side_effect=[(metadata, contexts), {"assetPositions": []}, []]):
             hyp = server.hyp_state(account, "IBM")
         self.assertEqual(hyp.market, "xyz:IBM")
+        self.assertEqual(server.HYP_MARKET_ALTERNATIVES["IBM"], ("IBM",))
 
     def test_aapl_uses_usd_suffix_when_that_is_the_active_catalog_name(self):
         account = "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF"

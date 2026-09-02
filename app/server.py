@@ -87,7 +87,7 @@ HYP_DEX_BY_SYMBOL["PENGU"] = None
 # Alguns emissores exibem o ativo com sufixo USD na interface, mas a API
 # pode publicar o mesmo perp sem sufixo. O monitor consulta o catálogo e usa
 # o nome que estiver efetivamente ativo para não enviar ordens inválidas.
-HYP_MARKET_ALTERNATIVES = {}
+HYP_MARKET_ALTERNATIVES = {"IBM": ("IBM",)}
 # Ativos já homologados para as LPs Uniswap V4 da Robinhood Chain. Os demais
 # pares não são importados até terem um perp correspondente confirmado.
 ROBINHOOD_UNISWAP_ASSETS = {"PENGU", "IBM"}
