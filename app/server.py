@@ -77,7 +77,7 @@ STABLE_SYMBOLS = {"USD", "USDC", "USDT", "USDS", "PYUSD"}
 # SPYx é a unidade de ETF próxima de US$ 770. O perp `mkts:US500` usa a
 # mesma escala. `xyz:SP500` é um índice próximo de US$ 7.700 e, portanto,
 # não pode ser usado como hedge 1:1 da quantidade de SPYx na LP.
-SYMBOL_ALIASES = {"AAPLX": "AAPL", "CRCLX": "CRCL", "COINX": "COIN", "SPYX": "US500", "IBM": "IBMUSD"}
+SYMBOL_ALIASES = {"AAPLX": "AAPL", "CRCLX": "CRCL", "COINX": "COIN", "SPYX": "US500"}
 # `None` representa o mercado perp principal da Hyperliquid.  Nos endpoints
 # da API ele não recebe o campo `dex` e o nome do contrato não tem prefixo.
 # Os RWAs tokenizados permanecem no DEX xyz; US500 usa mkts por ter a mesma
@@ -87,7 +87,7 @@ HYP_DEX_BY_SYMBOL["PENGU"] = None
 # Alguns emissores exibem o ativo com sufixo USD na interface, mas a API
 # pode publicar o mesmo perp sem sufixo. O monitor consulta o catálogo e usa
 # o nome que estiver efetivamente ativo para não enviar ordens inválidas.
-HYP_MARKET_ALTERNATIVES = {"IBMUSD": ("IBMUSD", "IBM")}
+HYP_MARKET_ALTERNATIVES = {}
 # Ativos já homologados para as LPs Uniswap V4 da Robinhood Chain. Os demais
 # pares não são importados até terem um perp correspondente confirmado.
 ROBINHOOD_UNISWAP_ASSETS = {"PENGU", "IBM"}
@@ -1075,7 +1075,13 @@ def hyp_state(account: str, symbol: str) -> HypState:
     clearinghouse = json_request(HYP_INFO_URL, info_payload("clearinghouseState", user=account))
     orders = json_request(HYP_INFO_URL, info_payload("frontendOpenOrders", user=account))
     universe = metadata.get("universe", [])
-    candidates = HYP_MARKET_ALTERNATIVES.get(symbol, (symbol,))
+    # Alguns RWAs aparecem como AAPL e outros como AAPLUSD no catálogo da
+    # Hyp, embora a LP use apenas o ticker. Para DEX xyz, tentamos ambos e
+    # operamos o nome realmente listado, sem alterar o mapeamento da LP.
+    candidates = HYP_MARKET_ALTERNATIVES.get(
+        symbol,
+        (symbol, f"{symbol}USD") if dex == "xyz" and not symbol.endswith("USD") else (symbol,),
+    )
     index = next((i for i, row in enumerate(universe) if str(row.get("name", "")).upper() in candidates), None)
     if index is None:
         raise NeutralisError(f"Contrato {market} não encontrado na Hyperliquid")

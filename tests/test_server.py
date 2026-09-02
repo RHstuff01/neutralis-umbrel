@@ -437,7 +437,7 @@ class NeutralisTests(unittest.TestCase):
         self.assertIsNone(server.hyp_dex("PENGU"))
 
     def test_ibm_uses_xyz_hyperliquid_market(self):
-        self.assertEqual(server.hyp_symbol("IBM"), "IBMUSD")
+        self.assertEqual(server.hyp_symbol("IBM"), "IBM")
         self.assertEqual(server.hyp_dex("IBM"), "xyz")
 
     def test_uniswap_config_accepts_evm_wallet_and_v4_pool_id(self):
@@ -520,6 +520,14 @@ class NeutralisTests(unittest.TestCase):
         with patch.object(server, "json_request", side_effect=[(metadata, contexts), {"assetPositions": []}, []]):
             hyp = server.hyp_state(account, "IBM")
         self.assertEqual(hyp.market, "xyz:IBM")
+
+    def test_aapl_uses_usd_suffix_when_that_is_the_active_catalog_name(self):
+        account = "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF"
+        metadata = {"universe": [{"name": "AAPLUSD", "szDecimals": 2}]}
+        contexts = [{"markPx": "240", "oraclePx": "240"}]
+        with patch.object(server, "json_request", side_effect=[(metadata, contexts), {"assetPositions": []}, []]):
+            hyp = server.hyp_state(account, "AAPL")
+        self.assertEqual(hyp.market, "xyz:AAPLUSD")
 
     def test_basis_guard_measures_drift_from_anchor_not_initial_spread(self):
         position = {"hedgeMode": "units"}
