@@ -538,6 +538,16 @@ class NeutralisTests(unittest.TestCase):
             hyp = server.hyp_state(account, "AAPL")
         self.assertEqual(hyp.market, "other:AAPL")
 
+    def test_hyp_accepts_fully_qualified_hip3_catalog_name(self):
+        account = "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF"
+        metadata = {"universe": [{"name": "xyz:AAPL", "szDecimals": 2}]}
+        contexts = [{"markPx": "240", "oraclePx": "240"}]
+        clearinghouse = {"assetPositions": [{"position": {"coin": "xyz:AAPL", "szi": "-2"}}]}
+        with patch.object(server, "json_request", side_effect=[(metadata, contexts), clearinghouse, []]):
+            hyp = server.hyp_state(account, "AAPL")
+        self.assertEqual(hyp.market, "xyz:AAPL")
+        self.assertEqual(hyp.signed_position, Decimal("-2"))
+
     def test_basis_guard_measures_drift_from_anchor_not_initial_spread(self):
         position = {"hedgeMode": "units"}
         anchor_ratio = Decimal("770.83") / Decimal("766.31")

@@ -1075,7 +1075,19 @@ def hyp_state(account: str, symbol: str) -> HypState:
     def market_in_dex(dex: str | None) -> tuple[dict[str, Any], list[Any], int | None]:
         metadata, contexts = json_request(HYP_INFO_URL, info_payload("metaAndAssetCtxs", dex))
         universe = metadata.get("universe", []) if isinstance(metadata, dict) else []
-        index = next((i for i, row in enumerate(universe) if str(row.get("name", "")).upper() in candidates), None)
+        # Em mercados HIP-3 a própria API pode devolver o nome qualificado
+        # (por exemplo ``xyz:AAPL``), mesmo quando o catálogo foi consultado
+        # com ``dex=xyz``. Comparamos tanto o nome completo quanto a parte
+        # posterior aos dois-pontos.
+        index = next(
+            (
+                i
+                for i, row in enumerate(universe)
+                if str(row.get("name", "")).upper() in candidates
+                or str(row.get("name", "")).upper().rsplit(":", 1)[-1] in candidates
+            ),
+            None,
+        )
         return metadata, contexts, index
 
     metadata, contexts, index = market_in_dex(preferred_dex)
@@ -1100,8 +1112,13 @@ def hyp_state(account: str, symbol: str) -> HypState:
         requested = f"{preferred_dex}:{symbol}" if preferred_dex else symbol
         raise NeutralisError(f"Contrato {requested} não encontrado na Hyperliquid")
     universe = metadata.get("universe", [])
-    active_symbol = str(universe[index].get("name", symbol)).upper()
-    market = f"{dex}:{active_symbol}" if dex else active_symbol
+    active_symbol = str(universe[index].get("name", symbol))
+    # Não duplique o DEX quando a API já devolveu ``xyz:AAPL``.
+    if ":" in active_symbol:
+        catalog_dex, catalog_symbol = active_symbol.rsplit(":", 1)
+        market = f"{catalog_dex.lower()}:{catalog_symbol.upper()}"
+    else:
+        market = active_symbol.upper() if not dex else f"{dex}:{active_symbol.upper()}"
     clearinghouse = json_request(HYP_INFO_URL, info_payload("clearinghouseState", dex, user=account))
     orders = json_request(HYP_INFO_URL, info_payload("frontendOpenOrders", dex, user=account))
     context = contexts[index]
