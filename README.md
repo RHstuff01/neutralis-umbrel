@@ -7,9 +7,16 @@ O modo real fica desligado após cada inicialização e exige API Wallet armazen
 localmente e confirmação textual exata. Ao ativar o modo real, o robô corrige
 automaticamente o delta inicial quando o residual for negociável.
 
-## Nvidia, SpaceX e Alphabet (0.8.26)
+## Uniswap V3 e V4 na Robinhood Chain (0.8.27)
 
-Nas integrações existentes (Byreal, Orca e Raydium na Solana; Uniswap V4
+O mesmo formulário reconhece automaticamente o tipo da pool: um endereço EVM
+de 40 caracteres seleciona o leitor Uniswap V3; um Pool ID de 64 caracteres
+seleciona o leitor V4. O Token ID numérico continua sendo informado no campo
+`NFT Uniswap (Token ID)` já existente.
+
+## Nvidia, SpaceX e Alphabet
+
+Nas integrações existentes (Byreal, Orca e Raydium na Solana; Uniswap V3/V4
 na Robinhood), `NVDA`, `NVDAx` e `NVIDIA` são mapeados para `NVDA`;
 `SPCX`, `SPCXx`, `SpaceX` e `SpaceXx` para `SPCX`. Os contratos confirmados
 no catálogo público da Hyperliquid são `xyz:NVDA` e `xyz:SPCX`. `GOOGL`,

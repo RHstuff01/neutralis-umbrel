@@ -465,6 +465,22 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(result["positionAddress"], pool_id)
         self.assertEqual(result["uniswapTokenId"], "42")
 
+    def test_uniswap_config_accepts_v3_pool_address_in_same_field(self):
+        monitor = server.NeutralisMonitor("uniswap-v3-config-test")
+        monitor.config_file = Path(TEST_DATA.name) / "uniswap-v3-config.json"
+        pool = "0x34D0dC122CF9A8Eb296fC5e0D3A233625D7d19b7"
+        result = monitor.save_config({
+            "source": "uniswap",
+            "evmWallet": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "positionAddress": pool,
+            "uniswapTokenId": "729115",
+            "maxPositionNotional": "1000",
+            "stepPercent": "0.5",
+        })
+        self.assertEqual(result["positionAddress"], pool)
+        self.assertEqual(result["uniswapTokenId"], "729115")
+
     def test_uniswap_manual_token_id_skips_blockscout_discovery(self):
         monitor = server.NeutralisMonitor("uniswap-manual-token-test")
         pool_id = "0x" + "a" * 64
@@ -474,6 +490,33 @@ class NeutralisTests(unittest.TestCase):
             self.assertEqual(monitor.positions(), [position])
         direct.assert_called_once_with(42, pool_id)
         discovery.assert_not_called()
+
+    def test_uniswap_v3_address_routes_to_v3_reader(self):
+        monitor = server.NeutralisMonitor("uniswap-v3-route-test")
+        pool = "0x34D0dC122CF9A8Eb296fC5e0D3A233625D7d19b7"
+        monitor.config.update({"source": "uniswap", "positionAddress": pool, "uniswapTokenId": "729115"})
+        position = {"source": "uniswap", "positionAddress": "729115", "poolAddress": pool}
+        with patch.object(server, "uniswap_v3_position", return_value=position) as v3, patch.object(server, "uniswap_v4_position") as v4:
+            self.assertEqual(monitor.positions(), [position])
+        v3.assert_called_once_with(729115, pool)
+        v4.assert_not_called()
+
+    def test_uniswap_v3_position_decodes_position_and_pool(self):
+        pool = "0x34D0dC122CF9A8Eb296fC5e0D3A233625D7d19b7"
+        token0 = "0x" + "11" * 20
+        token1 = "0x" + "22" * 20
+        words = [0, 0, int(token0, 16), int(token1, 16), 500, (-100) & ((1 << 256) - 1), 100, 123456, 0, 0, 0, 0]
+        position_data = "".join(f"{word:064x}" for word in words)
+        address_word = lambda address: int(address, 16).to_bytes(32, "big").hex()
+        calls = [position_data, address_word(token0), address_word(token1), f"{500:064x}", f"{2**96:064x}"]
+        normalized = {"source": "uniswap", "poolAddress": pool}
+        with patch.object(server, "robinhood_call", side_effect=calls), patch.object(
+            server, "erc20_metadata", side_effect=[("GOOGL", 18), ("USDG", 6)]
+        ), patch.object(server, "concentrated_position_result", return_value=normalized) as convert:
+            self.assertEqual(server.uniswap_v3_position(729115, pool), normalized)
+        args = convert.call_args.args
+        self.assertEqual(args[:7], ("uniswap", 729115, pool, "GOOGL", 18, "USDG", 6))
+        self.assertEqual(args[8:], (-100, 100, 123456))
 
     def test_uniswap_manual_token_id_reports_unreadable_position(self):
         monitor = server.NeutralisMonitor("uniswap-manual-token-error-test")
