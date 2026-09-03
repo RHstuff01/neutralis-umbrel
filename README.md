@@ -7,6 +7,22 @@ O modo real fica desligado após cada inicialização e exige API Wallet armazen
 localmente e confirmação textual exata. Ao ativar o modo real, o robô corrige
 automaticamente o delta inicial quando o residual for negociável.
 
+## Nvidia, SpaceX e Alphabet (0.8.26)
+
+Nas integrações existentes (Byreal, Orca e Raydium na Solana; Uniswap V4
+na Robinhood), `NVDA`, `NVDAx` e `NVIDIA` são mapeados para `NVDA`;
+`SPCX`, `SPCXx`, `SpaceX` e `SpaceXx` para `SPCX`. Os contratos confirmados
+no catálogo público da Hyperliquid são `xyz:NVDA` e `xyz:SPCX`. `GOOGL`,
+`GOOGLx`, `Google` e `Alphabet` são mapeados para `xyz:GOOGL`. `GOOG` não é
+convertido para `GOOGL`, pois representa uma classe de ação diferente.
+
+O símbolo e as quantidades originais da LP são preservados. O mapeamento é
+destinado a tokens com exposição unitária correspondente ao perp: não prova
+autenticidade pelo ticker nem converte wrappers, tokens alavancados ou
+participações em fundos. Confirme o contrato do token e a escala antes de
+ativar o modo real. Teste a LP em dry-run primeiro. Esta versão não adiciona
+outras blockchains nem executa transações na LP; o hedge é na Hyperliquid.
+
 ## Instalação inicial por SSH
 
 Esta é a forma indicada para validar a primeira versão antes de publicar uma

@@ -77,7 +77,12 @@ STABLE_SYMBOLS = {"USD", "USDC", "USDT", "USDS", "PYUSD"}
 # SPYx é a unidade de ETF próxima de US$ 770. O perp `mkts:US500` usa a
 # mesma escala. `xyz:SP500` é um índice próximo de US$ 7.700 e, portanto,
 # não pode ser usado como hedge 1:1 da quantidade de SPYx na LP.
-SYMBOL_ALIASES = {"AAPLX": "AAPL", "CRCLX": "CRCL", "COINX": "COIN", "SPYX": "US500"}
+SYMBOL_ALIASES = {
+    "AAPLX": "AAPL", "CRCLX": "CRCL", "COINX": "COIN", "SPYX": "US500",
+    "NVDAX": "NVDA", "NVIDIA": "NVDA",
+    "SPACEX": "SPCX", "SPACEXX": "SPCX", "SPCXX": "SPCX",
+    "GOOGLX": "GOOGL", "GOOGLE": "GOOGL", "ALPHABET": "GOOGL",
+}
 # `None` representa o mercado perp principal da Hyperliquid.  Nos endpoints
 # da API ele não recebe o campo `dex` e o nome do contrato não tem prefixo.
 # Os RWAs tokenizados permanecem no DEX xyz; US500 usa mkts por ter a mesma
@@ -87,10 +92,12 @@ HYP_DEX_BY_SYMBOL["PENGU"] = None
 # Alguns emissores exibem o ativo com sufixo USD na interface, mas a API
 # pode publicar o mesmo perp sem sufixo. O monitor consulta o catálogo e usa
 # o nome que estiver efetivamente ativo para não enviar ordens inválidas.
-HYP_MARKET_ALTERNATIVES = {"IBM": ("IBM",)}
+HYP_MARKET_ALTERNATIVES = {
+    "IBM": ("IBM",), "NVDA": ("NVDA",), "SPCX": ("SPCX",), "GOOGL": ("GOOGL",),
+}
 # Ativos já homologados para as LPs Uniswap V4 da Robinhood Chain. Os demais
 # pares não são importados até terem um perp correspondente confirmado.
-ROBINHOOD_UNISWAP_ASSETS = {"PENGU", "IBM"}
+ROBINHOOD_UNISWAP_ASSETS = {"PENGU", "IBM", "NVDA", "SPCX", "GOOGL"}
 # O RPC oficial é o preferencial. Ele é público e pode ficar indisponível ou
 # limitado; o segundo endpoint permite que a leitura da LP continue no Umbrel
 # sem depender de uma única infraestrutura.
@@ -307,7 +314,9 @@ def uniswap_v4_position(token_id: int, pool_id: str) -> dict[str, Any] | None:
     if "USDG" not in {symbol0, symbol1}:
         return None
     asset_symbol = symbol1 if symbol0 == "USDG" else symbol0
-    if asset_symbol not in ROBINHOOD_UNISWAP_ASSETS:
+    # A permissão usa o símbolo do hedge, mas a posição mantém o símbolo
+    # original do token (NVDAx/SPCXx/SpaceXx) para exibição e quantidades.
+    if hyp_symbol(asset_symbol) not in ROBINHOOD_UNISWAP_ASSETS:
         return None
     slot = robinhood_call(UNISWAP_V4_STATE_VIEW, "getSlot0(bytes32)", "0x" + pool_id)
     sqrt_price_x96 = int(slot[:64], 16)

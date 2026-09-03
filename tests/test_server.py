@@ -24,6 +24,14 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(server.hyp_symbol("CRCLX"), "CRCL")
         self.assertEqual(server.hyp_symbol("COINX"), "COIN")
         self.assertEqual(server.hyp_symbol("SPCX"), "SPCX")
+        self.assertEqual(server.hyp_symbol("SPCXx"), "SPCX")
+        self.assertEqual(server.hyp_symbol("SpaceX"), "SPCX")
+        self.assertEqual(server.hyp_symbol("SpaceXx"), "SPCX")
+        self.assertEqual(server.hyp_symbol("NVDAx"), "NVDA")
+        self.assertEqual(server.hyp_symbol("NVIDIA"), "NVDA")
+        self.assertEqual(server.hyp_symbol("GOOGLx"), "GOOGL")
+        self.assertEqual(server.hyp_symbol("Google"), "GOOGL")
+        self.assertEqual(server.hyp_symbol("Alphabet"), "GOOGL")
         self.assertEqual(server.hyp_symbol("SPYx"), "US500")
         self.assertEqual(server.hedge_mode("SPYx"), "units")
         self.assertEqual(server.hyp_symbol("crcl"), "CRCL")
@@ -547,6 +555,35 @@ class NeutralisTests(unittest.TestCase):
             hyp = server.hyp_state(account, "AAPL")
         self.assertEqual(hyp.market, "xyz:AAPL")
         self.assertEqual(hyp.signed_position, Decimal("-2"))
+
+    def test_hyp_finds_spacex_nvidia_and_google_contracts(self):
+        account = "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF"
+        metadata = {"universe": [
+            {"name": "xyz:NVDA", "szDecimals": 3},
+            {"name": "xyz:SPCX", "szDecimals": 2},
+            {"name": "xyz:GOOGL", "szDecimals": 3},
+        ]}
+        contexts = [
+            {"markPx": "227.73", "oraclePx": "227.73"},
+            {"markPx": "149.29", "oraclePx": "149.29"},
+            {"markPx": "342.86", "oraclePx": "342.86"},
+        ]
+        for source_symbol, expected_market in (
+            ("NVDAx", "xyz:NVDA"), ("SpaceXx", "xyz:SPCX"), ("GOOGLx", "xyz:GOOGL")
+        ):
+            with self.subTest(source_symbol=source_symbol), patch.object(
+                server, "json_request", side_effect=[(metadata, contexts), {"assetPositions": []}, []]
+            ):
+                hyp = server.hyp_state(account, source_symbol)
+                self.assertEqual(hyp.market, expected_market)
+
+    def test_robinhood_accepts_equity_aliases(self):
+        for symbol in (
+            "NVDA", "NVDAx", "NVIDIA", "SPCX", "SPCXx", "SpaceX", "SpaceXx",
+            "GOOGL", "GOOGLx", "Google", "Alphabet",
+        ):
+            with self.subTest(symbol=symbol):
+                self.assertIn(server.hyp_symbol(symbol), server.ROBINHOOD_UNISWAP_ASSETS)
 
     def test_basis_guard_measures_drift_from_anchor_not_initial_spread(self):
         position = {"hedgeMode": "units"}
