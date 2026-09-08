@@ -310,6 +310,19 @@ class NeutralisTests(unittest.TestCase):
         self.assertTrue(monitor._is_transient_network_error(server.NeutralisError("Falha de rede ao consultar api.hyperliquid.xyz")))
         self.assertFalse(monitor._is_transient_network_error(server.NeutralisError("Contrato não encontrado na Hyperliquid")))
 
+    def test_retry_snapshot_records_network_recovery(self):
+        monitor = server.NeutralisMonitor("network-recovery-test")
+        expected = ({}, Mock(), Decimal("1"), Decimal("2"), Decimal("3"), Decimal("4"))
+        events = []
+        with patch.object(
+            monitor, "_live_snapshot", side_effect=[server.NeutralisError("Falha de rede ao consultar api.hyperliquid.xyz"), expected]
+        ), patch.object(monitor.stop_event, "wait", return_value=False), patch.object(
+            monitor, "_event", side_effect=lambda event, message, **details: events.append((event, message, details))
+        ):
+            self.assertEqual(monitor._retry_snapshot(), expected)
+        self.assertEqual([item[0] for item in events], ["network-retry", "network-recovered"])
+        self.assertIn("api.hyperliquid.xyz", events[0][1])
+
     def test_live_snapshot_falls_back_to_hyp_mark_when_byreal_has_no_tick_price(self):
         monitor = server.NeutralisMonitor("byreal-mark-fallback-test")
         position = {
@@ -645,6 +658,24 @@ class NeutralisTests(unittest.TestCase):
         with patch.object(server.MONITOR, "_live_snapshot", return_value=(position, hyp, Decimal("1"), Decimal("2"), Decimal("1"), Decimal("1"))), patch.object(server, "API_KEY_FILE", api_key_file), patch.object(server.threading, "Thread") as thread:
             server.MONITOR.start(live=True, confirmation="ATIVAR")
         thread.assert_called_once()
+
+    def test_live_monitor_can_restart_after_manual_stop(self):
+        monitor = server.NeutralisMonitor("restart-after-stop-test")
+        monitor.stop_event.set()
+        monitor.manual_stop_requested = True
+        position = {"assetSymbol": "COINX", "hedgeSymbol": "COIN"}
+        hyp = server.HypState("xyz:COIN", 3, Decimal("176"), Decimal("176"), Decimal("0"), 0)
+        api_key_file = Mock()
+        api_key_file.exists.return_value = True
+        snapshot = (position, hyp, Decimal("1"), Decimal("2"), Decimal("1"), Decimal("1"))
+        with patch.object(monitor, "_live_snapshot", return_value=snapshot) as live_snapshot, patch.object(
+            server, "API_KEY_FILE", api_key_file
+        ), patch.object(server.threading, "Thread"):
+            monitor.start(live=True, confirmation="ATIVAR")
+        live_snapshot.assert_called_once()
+        self.assertFalse(monitor.stop_event.is_set())
+        self.assertFalse(monitor.manual_stop_requested)
+        self.assertEqual(monitor.state["mode"], "starting")
 
     def test_api_wallet_key_is_never_returned(self):
         key = "11" * 32

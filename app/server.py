@@ -1781,13 +1781,16 @@ class NeutralisMonitor:
         failures = 0
         while not self.stop_event.is_set():
             try:
-                return self._live_snapshot()
+                snapshot = self._live_snapshot()
+                if failures:
+                    self._event("network-recovered", f"Conexão restabelecida após {failures} tentativa(s)")
+                return snapshot
             except NeutralisError as error:
                 if not self._is_transient_network_error(error):
                     raise
                 failures += 1
                 if failures == 1 or failures % 12 == 0:
-                    self._event("network-retry", f"Conexão temporariamente indisponível; tentando novamente ({failures})", reason=str(error))
+                    self._event("network-retry", f"{error}; tentando novamente ({failures})", reason=str(error))
                 if self.stop_event.wait(5):
                     break
         raise NeutralisError("Monitor interrompido pelo usuário")
@@ -1810,6 +1813,12 @@ class NeutralisMonitor:
         with self.lock:
             if self.thread and self.thread.is_alive():
                 raise NeutralisError("O monitor já está em execução")
+            # A parada manual deixa o evento sinalizado para encerrar a thread.
+            # Limpe-o antes da validação do próximo início; o modo real usa
+            # _retry_snapshot() nessa fase e não deve interpretar o sinal
+            # antigo como uma nova interrupção do usuário.
+            self.manual_stop_requested = False
+            self.stop_event.clear()
             if live:
                 position, hyp, _, _, _, _ = self._retry_snapshot()
                 expected = "ATIVAR"
@@ -1819,8 +1828,6 @@ class NeutralisMonitor:
                     raise NeutralisError("Cadastre a chave da API Wallet antes de ativar o modo real")
                 if position["hedgeSymbol"] != hyp_symbol(position["assetSymbol"]):
                     raise NeutralisError("Mapeamento do contrato não pôde ser validado")
-            self.manual_stop_requested = False
-            self.stop_event.clear()
             self.state.update({"mode": "starting", "message": "Validando fontes de dados", "updatedAt": now_iso()})
             self.thread = threading.Thread(target=self._run, args=(live,), name="neutralis-live" if live else "neutralis-dry-run", daemon=True)
             self.thread.start()
