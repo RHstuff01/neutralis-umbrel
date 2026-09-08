@@ -78,7 +78,7 @@ STABLE_SYMBOLS = {"USD", "USDC", "USDT", "USDS", "PYUSD"}
 # mesma escala. `xyz:SP500` é um índice próximo de US$ 7.700 e, portanto,
 # não pode ser usado como hedge 1:1 da quantidade de SPYx na LP.
 SYMBOL_ALIASES = {
-    "AAPLX": "AAPL", "CRCLX": "CRCL", "COINX": "COIN", "SPYX": "US500",
+    "AAPLX": "AAPL", "AMZNX": "AMZN", "CRCLX": "CRCL", "COINX": "COIN", "SPYX": "US500",
     "NVDAX": "NVDA", "NVIDIA": "NVDA",
     "SPACEX": "SPCX", "SPACEXX": "SPCX", "SPCXX": "SPCX",
     "GOOGLX": "GOOGL", "GOOGLE": "GOOGL", "ALPHABET": "GOOGL",
@@ -93,7 +93,7 @@ HYP_DEX_BY_SYMBOL["PENGU"] = None
 # pode publicar o mesmo perp sem sufixo. O monitor consulta o catálogo e usa
 # o nome que estiver efetivamente ativo para não enviar ordens inválidas.
 HYP_MARKET_ALTERNATIVES = {
-    "IBM": ("IBM",), "NVDA": ("NVDA",), "SPCX": ("SPCX",), "GOOGL": ("GOOGL",),
+    "IBM": ("IBM",), "AMZN": ("AMZN",), "NVDA": ("NVDA",), "SPCX": ("SPCX",), "GOOGL": ("GOOGL",),
 }
 # Ativos já homologados para as LPs Uniswap V3/V4 da Robinhood Chain. Os demais
 # pares não são importados até terem um perp correspondente confirmado.

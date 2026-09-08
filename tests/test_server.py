@@ -21,6 +21,7 @@ SPEC.loader.exec_module(server)
 class NeutralisTests(unittest.TestCase):
     def test_xstock_symbol_maps_to_hyperliquid(self):
         self.assertEqual(server.hyp_symbol("AAPLX"), "AAPL")
+        self.assertEqual(server.hyp_symbol("AMZNx"), "AMZN")
         self.assertEqual(server.hyp_symbol("CRCLX"), "CRCL")
         self.assertEqual(server.hyp_symbol("COINX"), "COIN")
         self.assertEqual(server.hyp_symbol("SPCX"), "SPCX")
@@ -632,6 +633,23 @@ class NeutralisTests(unittest.TestCase):
             ):
                 hyp = server.hyp_state(account, source_symbol)
                 self.assertEqual(hyp.market, expected_market)
+
+    def test_byreal_amazon_maps_to_active_xyz_contract(self):
+        position = {"lowerTick": -100, "upperTick": 100, "liquidityUsd": 1000}
+        pool = {
+            "poolAddress": "pool", "tickCurrent": 0,
+            "mintA": {"symbol": "AMZNx", "decimals": 6},
+            "mintB": {"symbol": "USDC", "decimals": 6},
+        }
+        normalized = server.normalize_position(position, pool)
+        self.assertEqual(normalized["assetSymbol"], "AMZNX")
+        self.assertEqual(normalized["hedgeSymbol"], "AMZN")
+        metadata = {"universe": [{"name": "xyz:AMZN", "szDecimals": 3}]}
+        contexts = [{"markPx": "245.50", "oraclePx": "245.45"}]
+        with patch.object(server, "json_request", side_effect=[(metadata, contexts), {"assetPositions": []}, []]):
+            hyp = server.hyp_state("0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF", "AMZNx")
+        self.assertEqual(hyp.market, "xyz:AMZN")
+        self.assertEqual(hyp.decimals, 3)
 
     def test_robinhood_accepts_equity_aliases(self):
         for symbol in (
