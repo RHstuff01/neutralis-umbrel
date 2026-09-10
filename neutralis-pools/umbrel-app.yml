@@ -4,7 +4,7 @@ name: Neutralis Pools
 tagline: Evolução diária, liquidez e taxas das suas LPs
 icon: https://raw.githubusercontent.com/RHstuff01/neutralis-pools/main/neutralis-pools/icon.svg
 category: finance
-version: "1.0.1"
+version: "1.0.2"
 port: 8788
 description: >-
   Acompanha posições de liquidez diariamente, consolida liquidez, taxas, PnL e APR,
@@ -16,7 +16,7 @@ submission: https://github.com/RHstuff01/neutralis-pools
 repo: https://github.com/RHstuff01/neutralis-pools
 support: https://github.com/RHstuff01/neutralis-pools/issues
 gallery: []
-releaseNotes: Corrige a gravação de dados no Umbrel e garante certificados HTTPS para consultar a Byreal.
+releaseNotes: Corrige a mensagem da interface após sincronizar a carteira ou salvar uma atualização.
 dependencies: []
 path: ""
 defaultUsername: ""
