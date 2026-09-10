@@ -1,0 +1,23 @@
+manifestVersion: 1
+id: neutralis-pools
+name: Neutralis Pools
+tagline: Evolução diária, liquidez e taxas das suas LPs
+icon: https://raw.githubusercontent.com/RHstuff01/neutralis-pools/main/neutralis-pools/icon.svg
+category: finance
+version: "1.0.0"
+port: 8788
+description: >-
+  Acompanha posições de liquidez diariamente, consolida liquidez, taxas, PnL e APR,
+  mantém histórico local e importa automaticamente posições abertas da Byreal por carteira Solana.
+developer: Neutralis
+website: https://github.com/RHstuff01/neutralis-pools
+submitter: Neutralis
+submission: https://github.com/RHstuff01/neutralis-pools
+repo: https://github.com/RHstuff01/neutralis-pools
+support: https://github.com/RHstuff01/neutralis-pools/issues
+gallery: []
+releaseNotes: Primeira versão com sincronização diária automática da Byreal, histórico e modo manual.
+dependencies: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
