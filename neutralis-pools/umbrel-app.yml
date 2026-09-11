@@ -4,7 +4,7 @@ name: Neutralis Pools
 tagline: Evolução diária, liquidez e taxas das suas LPs
 icon: https://raw.githubusercontent.com/RHstuff01/neutralis-pools/main/neutralis-pools/icon.svg
 category: finance
-version: "1.0.2"
+version: "1.0.3"
 port: 8788
 description: >-
   Acompanha posições de liquidez diariamente, consolida liquidez, taxas, PnL e APR,
@@ -16,7 +16,7 @@ submission: https://github.com/RHstuff01/neutralis-pools
 repo: https://github.com/RHstuff01/neutralis-pools
 support: https://github.com/RHstuff01/neutralis-pools/issues
 gallery: []
-releaseNotes: Corrige a mensagem da interface após sincronizar a carteira ou salvar uma atualização.
+releaseNotes: Executa a coleta diária no horário programado, com tolerância máxima aproximada de um minuto.
 dependencies: []
 path: ""
 defaultUsername: ""
