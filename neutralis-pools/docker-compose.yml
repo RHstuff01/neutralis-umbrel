@@ -5,7 +5,7 @@ services:
       APP_PORT: 8788
 
   server:
-    image: ghcr.io/rhstuff01/neutralis-pools:1.0.2
+    image: ghcr.io/rhstuff01/neutralis-pools:1.0.3
     restart: on-failure
     stop_grace_period: 15s
     volumes:
@@ -13,6 +13,7 @@ services:
     environment:
       PORT: "8788"
       NEUTRALIS_POOLS_DATA_DIR: /data
+      SYNC_CHECK_SECONDS: "60"
     read_only: true
     tmpfs:
       - /tmp:size=16m,noexec,nosuid
