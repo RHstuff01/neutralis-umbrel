@@ -114,6 +114,13 @@ UNISWAP_V4_STATE_VIEW = "0xf3334192d15450cdd385c8b70e03f9a6bd9e673b"
 # Implantação canônica V3 na Robinhood Chain (chain ID 4663).
 UNISWAP_V3_POSITION_MANAGER = "0x73991a25c818bf1f1128deaab1492d45638de0d3"
 ROBINHOOD_BLOCKSCOUT_API = "https://robinhoodchain.blockscout.com/api/v2"
+# Arc Mainnet (chain ID 5042). A implantação V4 é canônica e usa a mesma
+# interface da Robinhood, mas a cotação desta LP é USDC.
+ARC_RPC_URLS = ("https://rpc.mainnet.arc.io", "https://rpc.arc-scan.org")
+ARC_CHAIN_ID = 5042
+ARC_UNISWAP_V4_POSITION_MANAGER = "0x6049c9a0e26405c0985f9e3685c87d0ae917f82b"
+ARC_UNISWAP_V4_STATE_VIEW = "0xf3334192d15450cdd385c8b70e03f9a6bd9e673b"
+ARC_UNISWAP_ASSETS = {"CRCL"}
 KNOWN_MINTS = {
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
     "XsueG8BtpquVJX9LVLLEGuViXUungE6WmK5YZ3p3bd1": "CRCLX",
@@ -173,7 +180,13 @@ def json_request(url: str, payload: dict[str, Any] | None = None) -> Any:
     request = Request(
         url,
         data=data,
-        headers={"accept": "application/json", "content-type": "application/json"},
+        headers={
+            "accept": "application/json",
+            "content-type": "application/json",
+            # Alguns RPCs públicos (incluindo Arc) bloqueiam o User-Agent
+            # padrão do urllib mesmo para chamadas JSON-RPC válidas.
+            "user-agent": "Neutralis-Hedge/0.8",
+        },
         method="GET" if payload is None else "POST",
     )
     try:
@@ -231,6 +244,29 @@ def robinhood_request(method: str, params: list[Any]) -> Any:
     raise NeutralisError("Falha de rede nos RPCs da Robinhood Chain") from last_error
 
 
+def evm_request(rpc_urls: tuple[str, ...], chain_name: str, method: str, params: list[Any]) -> Any:
+    last_error: NeutralisError | None = None
+    for rpc_url in rpc_urls:
+        try:
+            root = json_request(rpc_url, {"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+            if not isinstance(root, dict) or root.get("error") or "result" not in root:
+                raise NeutralisError(f"Resposta inválida do RPC da {chain_name}")
+            return root["result"]
+        except NeutralisError as error:
+            last_error = error
+    raise NeutralisError(f"Falha de rede nos RPCs da {chain_name}") from last_error
+
+
+def evm_call(rpc_urls: tuple[str, ...], chain_name: str, contract: str, signature: str, *arguments: int | str) -> str:
+    if not EVM_PATTERN.fullmatch(contract):
+        raise NeutralisError(f"Contrato {chain_name} inválido")
+    data = "0x" + evm_selector(signature) + "".join(evm_word(argument) for argument in arguments)
+    result = evm_request(rpc_urls, chain_name, "eth_call", [{"to": contract, "data": data}, "latest"])
+    if not isinstance(result, str) or not result.startswith("0x"):
+        raise NeutralisError(f"Resposta inválida da {chain_name}")
+    return result[2:]
+
+
 def robinhood_call(contract: str, signature: str, *arguments: int | str) -> str:
     if not EVM_PATTERN.fullmatch(contract):
         raise NeutralisError("Contrato Robinhood inválido")
@@ -261,6 +297,14 @@ def erc20_metadata(address: str) -> tuple[str, int]:
     decimals = int(robinhood_call(address, "decimals()") or "0", 16)
     if not symbol or not 0 <= decimals <= 36:
         raise NeutralisError("Token ERC-20 inválido na Robinhood Chain")
+    return symbol.upper(), decimals
+
+
+def evm_erc20_metadata(call: Any, address: str, chain_name: str) -> tuple[str, int]:
+    symbol = abi_string(call(address, "symbol()"))
+    decimals = int(call(address, "decimals()") or "0", 16)
+    if not symbol or not 0 <= decimals <= 36:
+        raise NeutralisError(f"Token ERC-20 inválido na {chain_name}")
     return symbol.upper(), decimals
 
 
@@ -312,14 +356,18 @@ def concentrated_position_result(
     tick_lower: int,
     tick_upper: int,
     liquidity: int,
+    quote_symbols: set[str] | None = None,
+    allowed_assets: set[str] | None = None,
 ) -> dict[str, Any] | None:
     """Normaliza uma posição concentrada EVM V3/V4 para o cálculo do hedge."""
     if sqrt_price_x96 <= 0 or liquidity <= 0 or not tick_lower < tick_upper:
         return None
-    if "USDG" not in {symbol0, symbol1}:
+    quotes = quote_symbols or {"USDG"}
+    quote_symbol = next((symbol for symbol in (symbol0, symbol1) if symbol in quotes), None)
+    if quote_symbol is None:
         return None
-    asset_symbol = symbol1 if symbol0 == "USDG" else symbol0
-    if hyp_symbol(asset_symbol) not in ROBINHOOD_UNISWAP_ASSETS:
+    asset_symbol = symbol1 if symbol0 == quote_symbol else symbol0
+    if hyp_symbol(asset_symbol) not in (allowed_assets or ROBINHOOD_UNISWAP_ASSETS):
         return None
     raw_price_1_per_0 = Decimal(sqrt_price_x96) ** 2 / Decimal(2) ** 192
     price_1_per_0 = raw_price_1_per_0 * Decimal(10) ** (decimals0 - decimals1)
@@ -352,11 +400,11 @@ def concentrated_position_result(
         "positionAddress": str(token_id),
         "personalPositionAddress": str(token_id),
         "poolAddress": pool_address,
-        "pair": f"{asset_symbol} / USDG",
+        "pair": f"{asset_symbol} / {quote_symbol}",
         "assetSymbol": asset_symbol,
         "hedgeSymbol": hyp_symbol(asset_symbol),
         "hedgeMode": "units",
-        "quoteSymbol": "USDG",
+        "quoteSymbol": quote_symbol,
         "liquidityUsd": liquidity_usd,
         "normalizedLiquidity": normalized_liquidity,
         "lowerPrice": lower_price,
@@ -465,6 +513,49 @@ def uniswap_v4_position(token_id: int, pool_id: str) -> dict[str, Any] | None:
 
 def uniswap_v4_positions(wallet: str, pool_id: str) -> list[dict[str, Any]]:
     return [position for token_id in uniswap_v4_owner_tokens(wallet) if (position := uniswap_v4_position(token_id, pool_id)) is not None]
+
+
+def arc_call(contract: str, signature: str, *arguments: int | str) -> str:
+    return evm_call(ARC_RPC_URLS, "Arc", contract, signature, *arguments)
+
+
+def arc_uniswap_v4_position(token_id: int, expected_pool_id: str = "") -> dict[str, Any] | None:
+    """Lê uma posição Uniswap V4 na Arc diretamente pelo Token ID."""
+    expected = expected_pool_id.lower().removeprefix("0x")
+    if expected and not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise NeutralisError("Pool ID Uniswap V4 da Arc inválido")
+    encoded = arc_call(ARC_UNISWAP_V4_POSITION_MANAGER, "getPoolAndPositionInfo(uint256)", token_id)
+    if len(encoded) < 384:
+        return None
+    words = [int(encoded[i : i + 64], 16) for i in range(0, 384, 64)]
+    token0 = f"0x{words[0] & ((1 << 160) - 1):040x}"
+    token1 = f"0x{words[1] & ((1 << 160) - 1):040x}"
+    packed = words[5]
+    tick_lower, tick_upper = abi_int24(packed >> 8), abi_int24(packed >> 32)
+    pool_key_encoded = "".join(evm_word(item) for item in (
+        token0, token1, words[2], words[3] & ((1 << 256) - 1),
+        f"0x{words[4] & ((1 << 160) - 1):040x}",
+    ))
+    pool_id = keccak(hexstr="0x" + pool_key_encoded).hex()
+    if expected and pool_id.lower() != expected:
+        return None
+    symbol0, decimals0 = evm_erc20_metadata(arc_call, token0, "Arc")
+    symbol1, decimals1 = evm_erc20_metadata(arc_call, token1, "Arc")
+    slot = arc_call(ARC_UNISWAP_V4_STATE_VIEW, "getSlot0(bytes32)", "0x" + pool_id)
+    liquidity = int(arc_call(
+        ARC_UNISWAP_V4_POSITION_MANAGER, "getPositionLiquidity(uint256)", token_id
+    )[:64], 16)
+    return concentrated_position_result(
+        "uniswap", token_id, "0x" + pool_id,
+        symbol0, decimals0, symbol1, decimals1,
+        int(slot[:64], 16), tick_lower, tick_upper, liquidity,
+        quote_symbols={"USDC"}, allowed_assets=ARC_UNISWAP_ASSETS,
+    )
+
+
+def arc_uniswap_owner(token_id: int) -> str:
+    encoded = arc_call(ARC_UNISWAP_V4_POSITION_MANAGER, "ownerOf(uint256)", token_id)
+    return "0x" + encoded[-40:]
 
 
 def hyp_symbol(lp_symbol: str) -> str:
@@ -1400,26 +1491,34 @@ class NeutralisMonitor:
         wallet = str(incoming.get("solanaWallet", self.config["solanaWallet"]))
         evm_wallet = str(incoming.get("evmWallet", self.config["evmWallet"]))
         uniswap_token_id = str(incoming.get("uniswapTokenId", self.config.get("uniswapTokenId", ""))).strip()
+        # A interface não preenche novamente campos sensíveis/operacionais
+        # durante a atualização periódica. Na Arc o Token ID é obrigatório;
+        # portanto um envio vazio não deve apagar o NFT já salvo.
+        if not uniswap_token_id and source == "uniswap_arc":
+            uniswap_token_id = str(self.config.get("uniswapTokenId", "")).strip()
         account = str(incoming.get("hyperliquidAccount", self.config["hyperliquidAccount"]))
         position = str(incoming.get("positionAddress", self.config["positionAddress"]))
         max_notional = decimal(incoming.get("maxPositionNotional", self.config["maxPositionNotional"]), "limite máximo do short")
         step_percent = decimal(incoming.get("stepPercent", self.config["stepPercent"]), "gatilho de ajuste")
-        if source not in {"byreal", "raydium", "orca", "uniswap"}:
+        evm_source = source in {"uniswap", "uniswap_arc"}
+        if source not in {"byreal", "raydium", "orca", "uniswap", "uniswap_arc"}:
             raise NeutralisError("Fonte de liquidez inválida")
-        if source != "uniswap" and not SOLANA_PATTERN.fullmatch(wallet):
+        if not evm_source and not SOLANA_PATTERN.fullmatch(wallet):
             raise NeutralisError("Carteira Solana inválida")
-        if source == "uniswap" and not EVM_PATTERN.fullmatch(evm_wallet):
+        if evm_source and not EVM_PATTERN.fullmatch(evm_wallet):
             raise NeutralisError("Carteira EVM inválida")
         if not EVM_PATTERN.fullmatch(account):
             raise NeutralisError("Conta Hyperliquid inválida")
-        if source == "uniswap" and position and not (
+        if evm_source and position and not (
             EVM_PATTERN.fullmatch(position) or re.fullmatch(r"0x[0-9a-fA-F]{64}", position)
         ):
             raise NeutralisError("Pool Uniswap inválida; use o endereço V3 ou o Pool ID V4")
-        if source == "uniswap" and uniswap_token_id and not re.fullmatch(r"[1-9][0-9]{0,77}", uniswap_token_id):
+        if evm_source and uniswap_token_id and not re.fullmatch(r"[1-9][0-9]{0,77}", uniswap_token_id):
             raise NeutralisError("NFT Uniswap inválido; use somente o número do Token ID")
-        if source != "uniswap" and position and not SOLANA_PATTERN.fullmatch(position):
+        if not evm_source and position and not SOLANA_PATTERN.fullmatch(position):
             raise NeutralisError("Endereço da posição inválido")
+        if source == "uniswap_arc" and not uniswap_token_id:
+            raise NeutralisError("Informe o Token ID numérico do NFT Uniswap na Arc")
         if not Decimal("10") <= max_notional <= Decimal("100000"):
             raise NeutralisError("O limite máximo do short deve ficar entre US$ 10 e US$ 100.000")
         if not Decimal("0.05") <= step_percent <= Decimal("5"):
@@ -1674,6 +1773,17 @@ class NeutralisMonitor:
                 raise NeutralisError("Monitor interrompido durante o ajuste")
 
     def positions(self) -> list[dict[str, Any]]:
+        if self.config["source"] == "uniswap_arc":
+            token_id = int(self.config["uniswapTokenId"])
+            owner = arc_uniswap_owner(token_id)
+            if owner.lower() != self.config["evmWallet"].lower():
+                raise NeutralisError("O NFT Uniswap da Arc não pertence à carteira EVM informada")
+            position = arc_uniswap_v4_position(token_id, self.config["positionAddress"])
+            if position is None:
+                raise NeutralisError(
+                    "NFT Uniswap da Arc sem liquidez ou não correspondente ao Pool ID informado"
+                )
+            return [position]
         if self.config["source"] == "uniswap":
             pool_id = self.config["positionAddress"]
             if not pool_id:

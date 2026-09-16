@@ -831,6 +831,36 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(server.MONITOR.state["snapshot"]["anchor"], 176.0)
         self.assertEqual(server.MONITOR.state["snapshot"]["realShort"], 2.6)
 
+    def test_arc_crcl_usdc_position_uses_crcl_units_for_hedge(self):
+        result = server.concentrated_position_result(
+            "uniswap", 57757, "0x" + "12" * 32,
+            "CRCL", 18, "USDC", 6,
+            707448682476069171114990, -232696, -231251,
+            4069783452985025,
+            quote_symbols={"USDC"}, allowed_assets={"CRCL"},
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "CRCL / USDC")
+        self.assertEqual(result["hedgeSymbol"], "CRCL")
+        self.assertEqual(result["quoteSymbol"], "USDC")
+        self.assertGreater(result["assetAmount"], Decimal("0"))
+        self.assertTrue(result["importable"])
+
+    def test_arc_source_requires_numeric_nft_and_accepts_empty_pool_id(self):
+        monitor = server.NeutralisMonitor("arc-test")
+        monitor.config_file = Path(TEST_DATA.name) / "arc-test-config.json"
+        saved = monitor.save_config({
+            "source": "uniswap_arc",
+            "evmWallet": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "uniswapTokenId": "57757",
+            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "positionAddress": "",
+            "maxPositionNotional": "5000",
+            "stepPercent": "0.5",
+        })
+        self.assertEqual(saved["source"], "uniswap_arc")
+        self.assertEqual(saved["uniswapTokenId"], "57757")
+
 
 if __name__ == "__main__":
     unittest.main()
