@@ -55,7 +55,7 @@
         <div class="notice"><b>Alerta:</b> o Telegram recebe uma mensagem se esta pool pausar automaticamente ou sair da faixa superior/inferior. Parar pelo botão não envia alerta.</div>
         <label class="field"><span>Confirmação para modo real</span><input id="liveConfirmation" autocomplete="off" placeholder="Digite ATIVAR"></label>
         <div class="actions"><button id="startLive">Ativar monitor real</button></div>
-        <div class="notice"><b>Modo real:</b> corrige o delta inicial ao ativar e depois consulta a cada 2 segundos, com novos ajustes após cruzar o gatilho configurado. Se houver execução parcial, relê a posição e tenta o residual até três vezes. Compra sempre usa reduce-only e nunca abre long. O limite total é definido pelo usuário e aparece na confirmação textual.</div>
+        <div class="notice"><b>Modo real:</b> usa uma banda simétrica ao redor do preço médio do short. Fecha toda a proteção em entrada + gatilho para participar da alta e reabre 100% em entrada − gatilho. Cada mudança exige duas leituras consecutivas. Compra sempre usa reduce-only e nunca abre long.</div>
       </article>
     </section>
     <section class="panel logs"><h2>03 · Registro do monitor</h2><div id="events" class="empty">Nenhum evento registrado.</div></section>

@@ -1260,6 +1260,7 @@ class HypState:
     signed_position: Decimal
     open_orders: int
     dex: str | None = "xyz"
+    entry_price: Decimal = Decimal("0")
 
 
 def hyp_state(account: str, symbol: str) -> HypState:
@@ -1329,10 +1330,12 @@ def hyp_state(account: str, symbol: str) -> HypState:
     orders = json_request(HYP_INFO_URL, info_payload("frontendOpenOrders", dex, user=account))
     context = contexts[index]
     signed = Decimal("0")
+    entry_price = Decimal("0")
     for row in clearinghouse.get("assetPositions", []):
         position = row.get("position", {})
         if str(position.get("coin", "")).upper() in set(candidates) | {market.upper()}:
             signed = decimal(position.get("szi", 0), "Hyperliquid szi")
+            entry_price = decimal(position.get("entryPx") or 0, "Hyperliquid entryPx")
             break
     open_orders = sum(1 for row in orders if str(row.get("coin", "")).upper() in set(candidates) | {market.upper()})
     return HypState(
@@ -1343,6 +1346,7 @@ def hyp_state(account: str, symbol: str) -> HypState:
         signed_position=signed,
         open_orders=open_orders,
         dex=dex,
+        entry_price=entry_price,
     )
 
 
@@ -1436,6 +1440,17 @@ def hedge_basis(position: dict[str, Any], lp_price: Decimal, hyp_mark: Decimal, 
     return abs(ratio / reference_ratio - Decimal("1"))
 
 
+def upside_hedge_signal(regime: str, mark: Decimal, entry_price: Decimal, step: Decimal) -> str | None:
+    """Indica a troca de regime fora da banda simétrica da entrada."""
+    if mark <= 0 or entry_price <= 0 or step <= 0:
+        return None
+    if regime == "protected" and mark >= entry_price * (Decimal("1") + step):
+        return "close"
+    if regime == "upside" and mark <= entry_price * (Decimal("1") - step):
+        return "open"
+    return None
+
+
 def json_safe(value: Any) -> Any:
     if isinstance(value, Decimal):
         return float(value)
@@ -1477,6 +1492,7 @@ class NeutralisMonitor:
             "positionAddress": "",
             "maxPositionNotional": "600",
             "stepPercent": "0.5",
+            "hedgeStrategy": "upside",
         }
         try:
             stored = json.loads(self.config_file.read_text(encoding="utf-8"))
@@ -1500,6 +1516,7 @@ class NeutralisMonitor:
         position = str(incoming.get("positionAddress", self.config["positionAddress"]))
         max_notional = decimal(incoming.get("maxPositionNotional", self.config["maxPositionNotional"]), "limite máximo do short")
         step_percent = decimal(incoming.get("stepPercent", self.config["stepPercent"]), "gatilho de ajuste")
+        hedge_strategy = str(incoming.get("hedgeStrategy", self.config.get("hedgeStrategy", "upside"))).lower()
         evm_source = source in {"uniswap", "uniswap_arc"}
         if source not in {"byreal", "raydium", "orca", "uniswap", "uniswap_arc"}:
             raise NeutralisError("Fonte de liquidez inválida")
@@ -1523,10 +1540,12 @@ class NeutralisMonitor:
             raise NeutralisError("O limite máximo do short deve ficar entre US$ 10 e US$ 100.000")
         if not Decimal("0.05") <= step_percent <= Decimal("5"):
             raise NeutralisError("O gatilho de ajuste deve ficar entre 0,05% e 5,00%")
+        if hedge_strategy not in {"neutral", "upside"}:
+            raise NeutralisError("Estratégia de hedge inválida")
         with self.lock:
             if self.state["mode"] == "running":
                 raise NeutralisError("Pare o monitor antes de alterar a configuração")
-            self.config = {"source": source, "solanaWallet": wallet, "evmWallet": evm_wallet, "uniswapTokenId": uniswap_token_id, "hyperliquidAccount": account, "positionAddress": position, "maxPositionNotional": str(max_notional), "stepPercent": str(step_percent)}
+            self.config = {"source": source, "solanaWallet": wallet, "evmWallet": evm_wallet, "uniswapTokenId": uniswap_token_id, "hyperliquidAccount": account, "positionAddress": position, "maxPositionNotional": str(max_notional), "stepPercent": str(step_percent), "hedgeStrategy": hedge_strategy}
             self.config_file.write_text(json.dumps(self.config, indent=2), encoding="utf-8")
             os.chmod(self.config_file, 0o600)
         return dict(self.config)
@@ -1980,18 +1999,32 @@ class NeutralisMonitor:
             lp_anchor = lp_price
             hyp_anchor = hyp.mark
             ratio_anchor = lp_anchor / hyp_anchor
-            initial_adjusted = False
+            hedge_strategy = self.config.get("hedgeStrategy", "upside")
             current_short = abs(min(hyp.signed_position, Decimal("0")))
-            initial_residual = abs(target - current_short) * hyp.mark
+            hedge_regime = "protected" if current_short > 0 else "upside"
+            protection_reference = hyp.entry_price if hyp.entry_price > 0 else hyp.mark
+            regime_confirmation: str | None = None
+            regime_confirmation_count = 0
+            initial_adjusted = False
+            initial_target = target
+            if hedge_strategy == "upside":
+                # Sem short, começa participando da alta e só abre proteção
+                # depois da queda confirmada. Se o short já estiver acima da
+                # banda de saída, não aumente a posição antes de fechá-la.
+                if hedge_regime == "upside":
+                    initial_target = Decimal("0")
+                elif upside_hedge_signal(hedge_regime, hyp.mark, protection_reference, step) == "close":
+                    initial_target = current_short
+            initial_residual = abs(initial_target - current_short) * hyp.mark
             if live and initial_residual >= AUTO_MIN_ORDER_NOTIONAL:
                 self._event(
                     "initial-reconciliation",
                     f"CORRIGIR DELTA INICIAL · residual US$ {initial_residual:.2f}",
                     currentShort=current_short,
-                    target=target,
+                    target=initial_target,
                     mark=hyp.mark,
                 )
-                result = self._execute_auto_adjustment(position, hyp, target)
+                result = self._execute_auto_adjustment(position, hyp, initial_target)
                 initial_adjusted = bool(result)
                 position, hyp, lower, upper, liquidity, target = self._retry_snapshot()
                 lp_price = decimal(position.get("currentPrice") or hyp.mark, "preço da LP")
@@ -2017,17 +2050,23 @@ class NeutralisMonitor:
                 "hedgeMode": position.get("hedgeMode", "units"),
                 "realShort": abs(min(hyp.signed_position, Decimal("0"))),
                 "virtualShort": virtual_short,
-                "targetShort": target,
+                "targetShort": initial_target,
                 "anchor": anchor,
                 "lower": lower,
                 "upper": upper,
                 "stepPercent": step * 100,
+                "hedgeStrategy": hedge_strategy,
+                "hedgeRegime": hedge_regime,
+                "protectionReference": protection_reference,
+                "closeThreshold": protection_reference * (Decimal("1") + step),
+                "openThreshold": protection_reference * (Decimal("1") - step),
                 "live": live,
-                "pendingNotional": abs(target - virtual_short) * hyp.mark,
+                "pendingNotional": abs(initial_target - virtual_short) * hyp.mark,
             }
             with self.lock:
                 label = "MODO REAL ativo" if live else "Dry-run ativo"
-                self.state.update({"mode": "running", "message": f"{label} · aguardando nível de {step * 100:.2f}%", "snapshot": json_safe(initial_snapshot), "updatedAt": now_iso()})
+                regime_label = "protegido" if hedge_regime == "protected" else "participando da alta"
+                self.state.update({"mode": "running", "message": f"{label} · {regime_label} · banda de {step * 100:.2f}%", "snapshot": json_safe(initial_snapshot), "updatedAt": now_iso()})
             start_message = (
                 f"MODO REAL iniciado em {hyp.market}; delta inicial corrigido"
                 if live and initial_adjusted
@@ -2061,6 +2100,64 @@ class NeutralisMonitor:
                 movement = hyp_now.mark / hyp_anchor - Decimal("1")
                 projected_lp_price = lp_anchor * hyp_now.mark / hyp_anchor
                 target = target_at_reference_price(position_now, liquidity, projected_lp_price, lower, upper, hyp_now.mark)
+                if hedge_strategy == "upside":
+                    # Enquanto existe short, acompanhe o preço médio real da
+                    # posição. A banda só muda quando uma execução altera a
+                    # entrada média; oscilações do mark não movem a referência.
+                    if hedge_regime == "protected" and hyp_now.entry_price > 0:
+                        protection_reference = hyp_now.entry_price
+                    signal = upside_hedge_signal(hedge_regime, hyp_now.mark, protection_reference, step)
+                    if signal == regime_confirmation:
+                        regime_confirmation_count += 1
+                    else:
+                        regime_confirmation = signal
+                        regime_confirmation_count = 1 if signal else 0
+
+                    # Duas leituras eliminam um tick isolado; a proteção
+                    # principal contra falsos rompimentos é a banda ±gatilho.
+                    if signal and regime_confirmation_count >= 2:
+                        next_target = Decimal("0") if signal == "close" else target
+                        if live:
+                            result = self._execute_auto_adjustment(position_now, hyp_now, next_target)
+                            if result:
+                                virtual_short = result["currentShort"]
+                            position_now, hyp_now, lower, upper, liquidity, target = self._retry_snapshot()
+                            lp_price = decimal(position_now.get("currentPrice") or hyp_now.mark, "preço da LP")
+                        else:
+                            before = virtual_short
+                            virtual_short = next_target
+                            self._event(
+                                "upside-close" if signal == "close" else "downside-open",
+                                f"SIMULAR {'FECHAR TODO O SHORT' if signal == 'close' else 'REABRIR HEDGE DE 100%'}",
+                                before=before,
+                                after=virtual_short,
+                                mark=hyp_now.mark,
+                                reference=protection_reference,
+                                stepPercent=step * 100,
+                            )
+                        hedge_regime = "upside" if signal == "close" else "protected"
+                        if signal == "open":
+                            protection_reference = (
+                                hyp_now.entry_price if live and hyp_now.entry_price > 0 else hyp_now.mark
+                            )
+                        self._event(
+                            "hedge-regime",
+                            "Short zerado; participando da alta" if signal == "close" else "Queda confirmada; hedge de 100% reativado",
+                            regime=hedge_regime,
+                            mark=hyp_now.mark,
+                            reference=protection_reference,
+                            live=live,
+                        )
+                        lp_anchor, hyp_anchor, anchor = lp_price, hyp_now.mark, lp_price
+                        ratio_anchor, movement, basis_from_anchor = lp_price / hyp_anchor, Decimal("0"), Decimal("0")
+                        projected_lp_price = lp_anchor
+                        regime_confirmation = None
+                        regime_confirmation_count = 0
+
+                    if hedge_regime == "upside":
+                        # Exibição e cálculo de pendência devem refletir que,
+                        # neste regime, o alvo deliberado é zero.
+                        target = Decimal("0")
                 # A saída inferior deixa a LP 100% no ativo. O hedge segue
                 # normalmente, mas o aviso é útil para o usuário reavaliar a
                 # faixa. Só avisamos na transição para não gerar spam a cada
@@ -2090,6 +2187,8 @@ class NeutralisMonitor:
                         virtual_short = Decimal("0")
                     if not awaiting_upper_reentry:
                         awaiting_upper_reentry = True
+                        if hedge_strategy == "upside":
+                            hedge_regime = "upside"
                         self._event(
                             "upper-exit",
                             "Faixa superior atingida; short zerado e aguardando reentrada automática",
@@ -2113,16 +2212,21 @@ class NeutralisMonitor:
                         target=target,
                         live=live,
                     )
-                    if live:
+                    if live and (hedge_strategy == "neutral" or hedge_regime == "protected"):
                         result = self._execute_auto_adjustment(position_now, hyp_now, target)
                         if result:
                             virtual_short = result["currentShort"]
-                    else:
+                    elif hedge_strategy == "neutral" or hedge_regime == "protected":
                         virtual_short = target
+                    else:
+                        target = Decimal("0")
                     lp_anchor, hyp_anchor, anchor = projected_lp_price, hyp_now.mark, projected_lp_price
                     ratio_anchor, movement, basis_from_anchor = lp_price / hyp_anchor, Decimal("0"), Decimal("0")
                     projected_lp_price = lp_anchor
-                if abs(movement) >= step:
+                if abs(movement) >= step and (
+                    hedge_strategy == "neutral"
+                    or (hedge_regime == "protected" and regime_confirmation_count == 0)
+                ):
                     current_short = abs(min(hyp_now.signed_position, Decimal("0")))
                     difference = target - (current_short if live else virtual_short)
                     size = abs(difference).quantize(quantum, rounding=ROUND_DOWN)
@@ -2177,11 +2281,21 @@ class NeutralisMonitor:
                     "lower": lower,
                     "upper": upper,
                     "stepPercent": step * 100,
+                    "hedgeStrategy": hedge_strategy,
+                    "hedgeRegime": hedge_regime,
+                    "protectionReference": protection_reference,
+                    "closeThreshold": protection_reference * (Decimal("1") + step),
+                    "openThreshold": protection_reference * (Decimal("1") - step),
                     "live": live,
                     "pendingNotional": abs(target - (abs(min(hyp_now.signed_position, Decimal('0'))) if live else virtual_short)) * hyp_now.mark,
                 }
                 with self.lock:
-                    self.state.update({"snapshot": json_safe(snapshot), "updatedAt": now_iso()})
+                    regime_label = "protegido" if hedge_regime == "protected" else "participando da alta"
+                    self.state.update({
+                        "message": f"{'MODO REAL' if live else 'Dry-run'} ativo · {regime_label} · banda de {step * 100:.2f}%",
+                        "snapshot": json_safe(snapshot),
+                        "updatedAt": now_iso(),
+                    })
         except NeutralisError as error:
             self._pause(str(error))
         except Exception as error:

@@ -571,11 +571,12 @@ class NeutralisTests(unittest.TestCase):
         account = "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF"
         metadata = {"universe": [{"name": "ZEC", "szDecimals": 3}]}
         contexts = [{"markPx": "42", "oraclePx": "42"}]
-        clearinghouse = {"assetPositions": [{"position": {"coin": "ZEC", "szi": "-1.2"}}]}
+        clearinghouse = {"assetPositions": [{"position": {"coin": "ZEC", "szi": "-1.2", "entryPx": "41.75"}}]}
         with patch.object(server, "json_request", side_effect=[(metadata, contexts), clearinghouse, []]) as request:
             hyp = server.hyp_state(account, "ZEC")
         self.assertEqual(hyp.market, "ZEC")
         self.assertEqual(hyp.signed_position, Decimal("-1.2"))
+        self.assertEqual(hyp.entry_price, Decimal("41.75"))
         self.assertTrue(all("dex" not in call.args[1] for call in request.call_args_list))
 
     def test_ibm_uses_active_hyperliquid_catalog_name(self):
@@ -860,6 +861,67 @@ class NeutralisTests(unittest.TestCase):
         })
         self.assertEqual(saved["source"], "uniswap_arc")
         self.assertEqual(saved["uniswapTokenId"], "57757")
+
+    def test_upside_strategy_uses_symmetric_trigger_band(self):
+        step = Decimal("0.005")
+        self.assertIsNone(server.upside_hedge_signal("protected", Decimal("80.39"), Decimal("80"), step))
+        self.assertEqual(server.upside_hedge_signal("protected", Decimal("80.40"), Decimal("80"), step), "close")
+        self.assertIsNone(server.upside_hedge_signal("upside", Decimal("79.61"), Decimal("80"), step))
+        self.assertEqual(server.upside_hedge_signal("upside", Decimal("79.60"), Decimal("80"), step), "open")
+
+    def test_dry_run_closes_short_after_two_confirmed_readings_above_band(self):
+        position = {
+            "positionAddress": "position", "hedgeSymbol": "CRCL", "currentPrice": Decimal("80"),
+            "hedgeMode": "units",
+        }
+        initial = server.HypState("xyz:CRCL", 3, Decimal("80"), Decimal("80"), Decimal("-30"), 0, "xyz", Decimal("80"))
+        first = server.HypState("xyz:CRCL", 3, Decimal("80.41"), Decimal("80.41"), Decimal("-30"), 0, "xyz", Decimal("80"))
+        second = server.HypState("xyz:CRCL", 3, Decimal("80.42"), Decimal("80.42"), Decimal("-30"), 0, "xyz", Decimal("80"))
+        snapshots = [
+            (position, initial, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("30")),
+            (position, first, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("29")),
+            (position, second, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("29")),
+        ]
+        original = dict(server.MONITOR.config)
+        events = []
+        try:
+            server.MONITOR.config = {**original, "hedgeStrategy": "upside", "stepPercent": "0.5"}
+            with patch.object(server.MONITOR, "_retry_snapshot", side_effect=snapshots), patch.object(
+                server.MONITOR.stop_event, "wait", side_effect=[False, False, True]
+            ), patch.object(server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)):
+                server.MONITOR._run(live=False)
+            self.assertEqual(server.MONITOR.state["snapshot"]["virtualShort"], 0)
+            self.assertEqual(server.MONITOR.state["snapshot"]["hedgeRegime"], "upside")
+            self.assertIn("upside-close", events)
+        finally:
+            server.MONITOR.config = original
+
+    def test_dry_run_reopens_full_hedge_after_two_readings_below_band(self):
+        position = {
+            "positionAddress": "position", "hedgeSymbol": "CRCL", "currentPrice": Decimal("80"),
+            "hedgeMode": "units",
+        }
+        initial = server.HypState("xyz:CRCL", 3, Decimal("80"), Decimal("80"), Decimal("0"), 0)
+        first = server.HypState("xyz:CRCL", 3, Decimal("79.59"), Decimal("79.59"), Decimal("0"), 0)
+        second = server.HypState("xyz:CRCL", 3, Decimal("79.58"), Decimal("79.58"), Decimal("0"), 0)
+        snapshots = [
+            (position, initial, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("30")),
+            (position, first, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("30")),
+            (position, second, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("30")),
+        ]
+        original = dict(server.MONITOR.config)
+        events = []
+        try:
+            server.MONITOR.config = {**original, "hedgeStrategy": "upside", "stepPercent": "0.5"}
+            with patch.object(server.MONITOR, "_retry_snapshot", side_effect=snapshots), patch.object(
+                server.MONITOR.stop_event, "wait", side_effect=[False, False, True]
+            ), patch.object(server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)):
+                server.MONITOR._run(live=False)
+            self.assertGreater(server.MONITOR.state["snapshot"]["virtualShort"], 0)
+            self.assertEqual(server.MONITOR.state["snapshot"]["hedgeRegime"], "protected")
+            self.assertIn("downside-open", events)
+        finally:
+            server.MONITOR.config = original
 
 
 if __name__ == "__main__":
