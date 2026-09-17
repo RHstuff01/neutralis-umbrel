@@ -82,12 +82,15 @@ SYMBOL_ALIASES = {
     "NVDAX": "NVDA", "NVIDIA": "NVDA",
     "SPACEX": "SPCX", "SPACEXX": "SPCX", "SPCXX": "SPCX",
     "GOOGLX": "GOOGL", "GOOGLE": "GOOGL", "ALPHABET": "GOOGL",
+    "WNEAR": "NEAR", "WNEARX": "NEAR",
 }
 # `None` representa o mercado perp principal da Hyperliquid.  Nos endpoints
 # da API ele não recebe o campo `dex` e o nome do contrato não tem prefixo.
 # Os RWAs tokenizados permanecem no DEX xyz; US500 usa mkts por ter a mesma
 # escala unitária de SPYx na Orca.
-HYP_DEX_BY_SYMBOL: dict[str, str | None] = {"US500": "mkts", "ZEC": None, "SOL": None, "SKR": None}
+HYP_DEX_BY_SYMBOL: dict[str, str | None] = {
+    "US500": "mkts", "ZEC": None, "SOL": None, "SKR": None, "NEAR": None,
+}
 HYP_DEX_BY_SYMBOL["PENGU"] = None
 # Alguns emissores exibem o ativo com sufixo USD na interface, mas a API
 # pode publicar o mesmo perp sem sufixo. O monitor consulta o catálogo e usa
@@ -1469,18 +1472,110 @@ class NeutralisMonitor:
         # arquivos próprios: configuração e registro jamais se misturam.
         self.config_file = CONFIG_FILE if slot == "1" else DATA_DIR / f"config-{slot}.json"
         self.log_file = LOG_FILE if slot == "1" else DATA_DIR / f"events-{slot}.jsonl"
+        self.strategy_state_file = DATA_DIR / ("strategy-state.json" if slot == "1" else f"strategy-state-{slot}.json")
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.execution_lock = threading.Lock()
         self.manual_stop_requested = False
         self.config = self._load_config()
+        self.persisted_strategy = self._load_strategy_state()
         self.state: dict[str, Any] = {
             "mode": "stopped",
             "message": "Pronto para iniciar",
             "updatedAt": now_iso(),
             "snapshot": None,
         }
+
+    def _load_strategy_state(self) -> dict[str, Any] | None:
+        try:
+            stored = json.loads(self.strategy_state_file.read_text(encoding="utf-8"))
+            return stored if isinstance(stored, dict) and stored.get("version") == 1 else None
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _clear_strategy_state(self) -> None:
+        self.persisted_strategy = None
+        try:
+            self.strategy_state_file.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _persist_strategy_state(self, snapshot: dict[str, Any]) -> None:
+        """Salva apenas o estado necessário para retomar a estratégia.
+
+        O arquivo é substituído atomicamente. Assim, uma queda de energia não
+        deixa JSON parcial e uma atualização do mark, por si só, não desgasta
+        o armazenamento do Umbrel.
+        """
+        position = snapshot.get("position") or {}
+        payload = {
+            "version": 1,
+            "source": self.config.get("source"),
+            "positionAddress": position.get("positionAddress"),
+            "market": snapshot.get("market"),
+            "hyperliquidAccount": self.config.get("hyperliquidAccount"),
+            "hedgeStrategy": snapshot.get("hedgeStrategy"),
+            "hedgeRegime": snapshot.get("hedgeRegime"),
+            "protectionReference": str(snapshot.get("protectionReference")),
+            "realShort": str(snapshot.get("realShort")),
+        }
+        previous = self.persisted_strategy or {}
+        if all(previous.get(key) == value for key, value in payload.items()):
+            return
+        stored = {**payload, "updatedAt": now_iso()}
+        temporary = self.strategy_state_file.with_suffix(self.strategy_state_file.suffix + ".tmp")
+        temporary.write_text(json.dumps(stored, indent=2), encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, self.strategy_state_file)
+        self.persisted_strategy = stored
+
+    def _restore_strategy_state(
+        self,
+        position: dict[str, Any],
+        hyp: HypState,
+        hedge_strategy: str,
+    ) -> tuple[str, Decimal] | None:
+        stored = self.persisted_strategy
+        if not stored or hedge_strategy != "upside":
+            return None
+        identity_matches = (
+            stored.get("source") == self.config.get("source")
+            and stored.get("positionAddress") == position.get("positionAddress")
+            and str(stored.get("market", "")).upper() == hyp.market.upper()
+            and str(stored.get("hyperliquidAccount", "")).lower()
+            == self.config.get("hyperliquidAccount", "").lower()
+            and stored.get("hedgeStrategy") == hedge_strategy
+        )
+        if not identity_matches:
+            return None
+        try:
+            regime = str(stored.get("hedgeRegime"))
+            reference = decimal(stored.get("protectionReference"), "referência persistida")
+        except NeutralisError:
+            return None
+        if regime not in {"protected", "upside"} or reference <= 0:
+            return None
+        actual_regime = "protected" if hyp.signed_position < 0 else "upside"
+        if regime != actual_regime:
+            self._event(
+                "state-reconciliation",
+                "Estado salvo divergia da posição real; prevaleceu a Hyperliquid",
+                savedRegime=regime,
+                actualRegime=actual_regime,
+                market=hyp.market,
+            )
+            return None
+        if actual_regime == "protected" and hyp.entry_price > 0:
+            reference = hyp.entry_price
+        self._event(
+            "state-restored",
+            "Estado da estratégia recuperado com segurança",
+            regime=actual_regime,
+            reference=reference,
+            market=hyp.market,
+        )
+        return actual_regime, reference
 
     def _load_config(self) -> dict[str, str]:
         defaults = {
@@ -1545,9 +1640,19 @@ class NeutralisMonitor:
         with self.lock:
             if self.state["mode"] == "running":
                 raise NeutralisError("Pare o monitor antes de alterar a configuração")
+            previous_identity = tuple(
+                self.config.get(key, "")
+                for key in ("source", "solanaWallet", "evmWallet", "uniswapTokenId", "hyperliquidAccount", "positionAddress")
+            )
             self.config = {"source": source, "solanaWallet": wallet, "evmWallet": evm_wallet, "uniswapTokenId": uniswap_token_id, "hyperliquidAccount": account, "positionAddress": position, "maxPositionNotional": str(max_notional), "stepPercent": str(step_percent), "hedgeStrategy": hedge_strategy}
             self.config_file.write_text(json.dumps(self.config, indent=2), encoding="utf-8")
             os.chmod(self.config_file, 0o600)
+            current_identity = tuple(
+                self.config.get(key, "")
+                for key in ("source", "solanaWallet", "evmWallet", "uniswapTokenId", "hyperliquidAccount", "positionAddress")
+            )
+            if current_identity != previous_identity:
+                self._clear_strategy_state()
         return dict(self.config)
 
     def max_position_notional(self) -> Decimal:
@@ -2003,6 +2108,11 @@ class NeutralisMonitor:
             current_short = abs(min(hyp.signed_position, Decimal("0")))
             hedge_regime = "protected" if current_short > 0 else "upside"
             protection_reference = hyp.entry_price if hyp.entry_price > 0 else hyp.mark
+            # O dry-run continua isolado: somente o modo real recupera o
+            # estado operacional salvo antes de uma reinicialização.
+            restored_strategy = self._restore_strategy_state(position, hyp, hedge_strategy) if live else None
+            if restored_strategy:
+                hedge_regime, protection_reference = restored_strategy
             regime_confirmation: str | None = None
             regime_confirmation_count = 0
             initial_adjusted = False
@@ -2067,6 +2177,8 @@ class NeutralisMonitor:
                 label = "MODO REAL ativo" if live else "Dry-run ativo"
                 regime_label = "protegido" if hedge_regime == "protected" else "participando da alta"
                 self.state.update({"mode": "running", "message": f"{label} · {regime_label} · banda de {step * 100:.2f}%", "snapshot": json_safe(initial_snapshot), "updatedAt": now_iso()})
+            if live:
+                self._persist_strategy_state(initial_snapshot)
             start_message = (
                 f"MODO REAL iniciado em {hyp.market}; delta inicial corrigido"
                 if live and initial_adjusted
@@ -2296,6 +2408,8 @@ class NeutralisMonitor:
                         "snapshot": json_safe(snapshot),
                         "updatedAt": now_iso(),
                     })
+                if live:
+                    self._persist_strategy_state(snapshot)
         except NeutralisError as error:
             self._pause(str(error))
         except Exception as error:

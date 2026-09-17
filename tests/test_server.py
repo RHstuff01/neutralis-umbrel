@@ -19,6 +19,14 @@ SPEC.loader.exec_module(server)
 
 
 class NeutralisTests(unittest.TestCase):
+    def setUp(self):
+        for monitor in server.MONITORS.values():
+            monitor.persisted_strategy = None
+            try:
+                monitor.strategy_state_file.unlink()
+            except FileNotFoundError:
+                pass
+
     def test_xstock_symbol_maps_to_hyperliquid(self):
         self.assertEqual(server.hyp_symbol("AAPLX"), "AAPL")
         self.assertEqual(server.hyp_symbol("AMZNx"), "AMZN")
@@ -33,6 +41,7 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(server.hyp_symbol("GOOGLx"), "GOOGL")
         self.assertEqual(server.hyp_symbol("Google"), "GOOGL")
         self.assertEqual(server.hyp_symbol("Alphabet"), "GOOGL")
+        self.assertEqual(server.hyp_symbol("wNEAR"), "NEAR")
         self.assertEqual(server.hyp_symbol("SPYx"), "US500")
         self.assertEqual(server.hedge_mode("SPYx"), "units")
         self.assertEqual(server.hyp_symbol("crcl"), "CRCL")
@@ -567,6 +576,26 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(server.hyp_symbol("SKR"), "SKR")
         self.assertIsNone(server.hyp_dex("SKR"))
 
+    def test_byreal_wnear_usdc_uses_main_hyperliquid_near_market(self):
+        pool = {
+            "poolAddress": "FXetFeCdbzdoQQdyxhDcjH29VUjyA2pj2FZZhV7xgw8f",
+            "mintAInfo": {"address": "3ZLek6pGAQ2B21K6VJvUXQGqLq9xw9BG", "symbol": "wNEAR", "decimals": 6},
+            "mintBInfo": {"address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "symbol": "USDC", "decimals": 6},
+            "tickCurrent": 8500,
+        }
+        position = {
+            "positionAddress": "11111111111111111111111111111111",
+            "poolAddress": pool["poolAddress"],
+            "lowerTick": 8000,
+            "upperTick": 9000,
+            "liquidityUsd": 1000,
+        }
+        normalized = server.normalize_position(position, pool)
+        self.assertEqual(normalized["pair"], "WNEAR / USDC")
+        self.assertEqual(normalized["hedgeSymbol"], "NEAR")
+        self.assertIsNone(server.hyp_dex(normalized["hedgeSymbol"]))
+        self.assertTrue(normalized["importable"])
+
     def test_main_hyperliquid_market_is_queried_without_dex(self):
         account = "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF"
         metadata = {"universe": [{"name": "ZEC", "szDecimals": 3}]}
@@ -868,6 +897,63 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(server.upside_hedge_signal("protected", Decimal("80.40"), Decimal("80"), step), "close")
         self.assertIsNone(server.upside_hedge_signal("upside", Decimal("79.61"), Decimal("80"), step))
         self.assertEqual(server.upside_hedge_signal("upside", Decimal("79.60"), Decimal("80"), step), "open")
+
+    def test_strategy_state_round_trip_preserves_upside_reference(self):
+        monitor = server.NeutralisMonitor("persistence")
+        monitor.config = {
+            **monitor.config,
+            "source": "orca",
+            "positionAddress": "saved-position",
+            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "hedgeStrategy": "upside",
+        }
+        position = {"positionAddress": "actual-position"}
+        snapshot = {
+            "position": position,
+            "market": "ZEC",
+            "hedgeStrategy": "upside",
+            "hedgeRegime": "upside",
+            "protectionReference": Decimal("42.75"),
+            "realShort": Decimal("0"),
+        }
+        monitor._persist_strategy_state(snapshot)
+
+        restarted = server.NeutralisMonitor("persistence")
+        restarted.config = dict(monitor.config)
+        hyp = server.HypState("ZEC", 3, Decimal("44"), Decimal("44"), Decimal("0"), 0)
+        restored = restarted._restore_strategy_state(position, hyp, "upside")
+
+        self.assertEqual(restored, ("upside", Decimal("42.75")))
+
+    def test_strategy_state_reconciles_against_real_hyperliquid_position(self):
+        monitor = server.NeutralisMonitor("reconciliation")
+        monitor.config = {
+            **monitor.config,
+            "source": "orca",
+            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "hedgeStrategy": "upside",
+        }
+        position = {"positionAddress": "actual-position"}
+        monitor.persisted_strategy = {
+            "version": 1,
+            "source": "orca",
+            "positionAddress": "actual-position",
+            "market": "ZEC",
+            "hyperliquidAccount": monitor.config["hyperliquidAccount"],
+            "hedgeStrategy": "upside",
+            "hedgeRegime": "upside",
+            "protectionReference": "42.75",
+            "realShort": "0",
+        }
+        hyp = server.HypState(
+            "ZEC", 3, Decimal("41"), Decimal("41"), Decimal("-2"), 0, entry_price=Decimal("41.5")
+        )
+        events = []
+        with patch.object(monitor, "_event", side_effect=lambda event, message, **details: events.append(event)):
+            restored = monitor._restore_strategy_state(position, hyp, "upside")
+
+        self.assertIsNone(restored)
+        self.assertIn("state-reconciliation", events)
 
     def test_dry_run_closes_short_after_two_confirmed_readings_above_band(self):
         position = {
