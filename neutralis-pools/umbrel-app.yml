@@ -4,11 +4,11 @@ name: Neutralis Pools
 tagline: Evolução diária, liquidez e taxas das suas LPs
 icon: https://raw.githubusercontent.com/RHstuff01/neutralis-pools/main/neutralis-pools/icon.svg
 category: finance
-version: "1.0.4"
+version: "1.1.0"
 port: 8788
 description: >-
   Acompanha posições de liquidez diariamente, consolida liquidez, taxas, PnL e APR,
-  mantém histórico local e importa automaticamente posições abertas da Byreal por carteira Solana.
+  mantém histórico local e importa automaticamente posições da Byreal, Raydium e Orca.
 developer: Neutralis
 website: https://github.com/RHstuff01/neutralis-pools
 submitter: Neutralis
@@ -16,7 +16,7 @@ submission: https://github.com/RHstuff01/neutralis-pools
 repo: https://github.com/RHstuff01/neutralis-pools
 support: https://github.com/RHstuff01/neutralis-pools/issues
 gallery: []
-releaseNotes: Mostra números nos gráficos, idade pela abertura na Byreal e liquidez inicial em cada pool.
+releaseNotes: Adiciona acompanhamento automático de pools Raydium e Orca, preservando o histórico da Byreal.
 dependencies: []
 path: ""
 defaultUsername: ""
