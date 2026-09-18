@@ -280,6 +280,16 @@ class NeutralisTests(unittest.TestCase):
             server.prepare_data_permissions()
         chmod.assert_any_call(server.DATA_DIR, 0o700)
 
+    def test_three_monitors_have_independent_persistent_files(self):
+        self.assertEqual(set(server.MONITORS), {"1", "2", "3"})
+        third = server.monitor_for_slot("3")
+        self.assertEqual(third.slot, "3")
+        self.assertEqual(third.config_file.name, "config-3.json")
+        self.assertEqual(third.log_file.name, "events-3.jsonl")
+        self.assertEqual(third.strategy_state_file.name, "strategy-state-3.json")
+        self.assertEqual(len({monitor.config_file for monitor in server.MONITORS.values()}), 3)
+        self.assertEqual(len({monitor.strategy_state_file for monitor in server.MONITORS.values()}), 3)
+
     def test_byreal_position_normalization(self):
         position = {
             "positionAddress": "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw",

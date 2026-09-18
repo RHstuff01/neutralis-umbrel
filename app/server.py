@@ -1468,8 +1468,8 @@ class NeutralisMonitor:
     def __init__(self, slot: str = "1") -> None:
         DATA_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.slot = slot
-        # O slot 1 preserva os dados já usados pelo app. O segundo slot tem
-        # arquivos próprios: configuração e registro jamais se misturam.
+        # O slot 1 preserva os dados já usados pelo app. Os demais slots têm
+        # arquivos próprios: configuração, estado e registro jamais se misturam.
         self.config_file = CONFIG_FILE if slot == "1" else DATA_DIR / f"config-{slot}.json"
         self.log_file = LOG_FILE if slot == "1" else DATA_DIR / f"events-{slot}.jsonl"
         self.strategy_state_file = DATA_DIR / ("strategy-state.json" if slot == "1" else f"strategy-state-{slot}.json")
@@ -2427,7 +2427,7 @@ class NeutralisMonitor:
             return {"config": dict(self.config), "monitor": json_safe(dict(self.state)), "events": self.events(50), "dryRun": not bool((self.state.get("snapshot") or {}).get("live")), "ordersEnabled": True, "apiWalletConfigured": API_KEY_FILE.exists(), "telegramConfigured": self.telegram_configured(), "solanaRpcConfigured": SOLANA_RPC_FILE.exists(), "solanaRpcHost": urlparse(solana_rpc_url()).hostname, "robinhoodRpcConfigured": ROBINHOOD_RPC_FILE.exists(), "autoLimits": {"pollSeconds": AUTO_POLL_SECONDS, "maxSlippagePercent": float(AUTO_RETRY_SLIPPAGES[-1] * 100), "maxPositionNotional": float(self.max_position_notional()), "minOrderNotional": 10}}
 
 
-MONITORS = {"1": NeutralisMonitor("1"), "2": NeutralisMonitor("2")}
+MONITORS = {slot: NeutralisMonitor(slot) for slot in ("1", "2", "3")}
 # Compatibilidade com testes e chamadas internas antigas: slot 1.
 MONITOR = MONITORS["1"]
 
