@@ -901,12 +901,15 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(saved["source"], "uniswap_arc")
         self.assertEqual(saved["uniswapTokenId"], "57757")
 
-    def test_upside_strategy_uses_symmetric_trigger_band(self):
+    def test_upside_strategy_reopens_at_reference_and_waits_half_step_initially(self):
         step = Decimal("0.005")
         self.assertIsNone(server.upside_hedge_signal("protected", Decimal("80.39"), Decimal("80"), step))
         self.assertEqual(server.upside_hedge_signal("protected", Decimal("80.40"), Decimal("80"), step), "close")
-        self.assertIsNone(server.upside_hedge_signal("upside", Decimal("79.61"), Decimal("80"), step))
-        self.assertEqual(server.upside_hedge_signal("upside", Decimal("79.60"), Decimal("80"), step), "open")
+        self.assertIsNone(server.upside_hedge_signal("upside", Decimal("80.01"), Decimal("80"), step))
+        self.assertEqual(server.upside_hedge_signal("upside", Decimal("80"), Decimal("80"), step), "open")
+        self.assertIsNone(server.upside_hedge_signal("initial_wait", Decimal("79.81"), Decimal("80"), step))
+        self.assertEqual(server.upside_hedge_signal("initial_wait", Decimal("79.80"), Decimal("80"), step), "open")
+        self.assertEqual(server.upside_hedge_signal("initial_wait", Decimal("80.20"), Decimal("80"), step), "confirm_upside")
 
     def test_strategy_state_round_trip_preserves_upside_reference(self):
         monitor = server.NeutralisMonitor("persistence")
@@ -1015,6 +1018,35 @@ class NeutralisTests(unittest.TestCase):
                 server.MONITOR._run(live=False)
             self.assertGreater(server.MONITOR.state["snapshot"]["virtualShort"], 0)
             self.assertEqual(server.MONITOR.state["snapshot"]["hedgeRegime"], "protected")
+            self.assertIn("downside-open", events)
+        finally:
+            server.MONITOR.config = original
+
+    def test_new_unhedged_pool_confirms_initial_upside_then_opens_at_reference(self):
+        position = {
+            "positionAddress": "position", "hedgeSymbol": "CRCL", "currentPrice": Decimal("80"),
+            "hedgeMode": "units",
+        }
+        marks = ["80", "80.20", "80.21", "80.01", "80.00", "79.99"]
+        snapshots = [
+            (
+                position,
+                server.HypState("xyz:CRCL", 3, Decimal(mark), Decimal(mark), Decimal("0"), 0),
+                Decimal("50"), Decimal("150"), Decimal("60"), Decimal("30"),
+            )
+            for mark in marks
+        ]
+        original = dict(server.MONITOR.config)
+        events = []
+        try:
+            server.MONITOR.config = {**original, "hedgeStrategy": "upside", "stepPercent": "0.5"}
+            with patch.object(server.MONITOR, "_retry_snapshot", side_effect=snapshots), patch.object(
+                server.MONITOR.stop_event, "wait", side_effect=[False, False, False, False, False, True]
+            ), patch.object(server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)):
+                server.MONITOR._run(live=False)
+            self.assertGreater(server.MONITOR.state["snapshot"]["virtualShort"], 0)
+            self.assertEqual(server.MONITOR.state["snapshot"]["hedgeRegime"], "protected")
+            self.assertIn("initial-upside", events)
             self.assertIn("downside-open", events)
         finally:
             server.MONITOR.config = original
