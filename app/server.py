@@ -2247,11 +2247,17 @@ class NeutralisMonitor:
                     if hedge_regime == "protected" and hyp_now.entry_price > 0:
                         protection_reference = hyp_now.entry_price
                     signal = upside_hedge_signal(hedge_regime, hyp_now.mark, protection_reference, step)
-                    if signal == regime_confirmation:
+                    if signal is None:
+                        # Ausência de troca de regime não é uma confirmação.
+                        # O contador precisa ficar zerado para que o ajuste
+                        # delta normal continue autorizado após o gatilho.
+                        regime_confirmation = None
+                        regime_confirmation_count = 0
+                    elif signal == regime_confirmation:
                         regime_confirmation_count += 1
                     else:
                         regime_confirmation = signal
-                        regime_confirmation_count = 1 if signal else 0
+                        regime_confirmation_count = 1
 
                     # Duas leituras eliminam um tick isolado; a proteção
                     # principal contra falsos rompimentos é a banda ±gatilho.

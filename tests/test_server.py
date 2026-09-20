@@ -995,6 +995,34 @@ class NeutralisTests(unittest.TestCase):
         finally:
             server.MONITOR.config = original
 
+    def test_protected_short_rebalances_downward_when_trigger_is_crossed(self):
+        position = {
+            "positionAddress": "position", "hedgeSymbol": "NEAR", "currentPrice": Decimal("4.25"),
+            "hedgeMode": "units",
+        }
+        initial = server.HypState("NEAR", 3, Decimal("4.25"), Decimal("4.25"), Decimal("-1236.7"), 0, entry_price=Decimal("4.25"))
+        falling = server.HypState("NEAR", 3, Decimal("4.07"), Decimal("4.07"), Decimal("-1236.7"), 0, entry_price=Decimal("4.25"))
+        snapshots = [
+            (position, initial, Decimal("3.86"), Decimal("4.56"), Decimal("60"), Decimal("1236.7")),
+            (position, falling, Decimal("3.86"), Decimal("4.56"), Decimal("60"), Decimal("2047.241")),
+        ]
+        original = dict(server.MONITOR.config)
+        events = []
+        try:
+            server.MONITOR.config = {**original, "hedgeStrategy": "upside", "stepPercent": "2.5"}
+            with patch.object(server.MONITOR, "_retry_snapshot", side_effect=snapshots), patch.object(
+                server.MONITOR.stop_event, "wait", side_effect=[False, True]
+            ), patch.object(
+                server, "target_at_reference_price", return_value=Decimal("2047.241")
+            ), patch.object(
+                server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)
+            ):
+                server.MONITOR._run(live=False)
+            self.assertEqual(server.MONITOR.state["snapshot"]["virtualShort"], 2047.241)
+            self.assertIn("adjustment", events)
+        finally:
+            server.MONITOR.config = original
+
     def test_dry_run_reopens_full_hedge_after_two_readings_below_band(self):
         position = {
             "positionAddress": "position", "hedgeSymbol": "CRCL", "currentPrice": Decimal("80"),
