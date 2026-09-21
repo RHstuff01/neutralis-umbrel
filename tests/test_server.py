@@ -1077,6 +1077,91 @@ class NeutralisTests(unittest.TestCase):
             ("protected", Decimal("4.10")),
         )
 
+    def test_version_5_avax_reference_is_corrected_once_and_recovery_is_armed(self):
+        monitor = server.NeutralisMonitor("avax-reference-current-operation")
+        monitor.config = {
+            **monitor.config,
+            "source": "orca",
+            "positionAddress": "avax-position",
+            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "hedgeStrategy": "upside",
+        }
+        position = {"positionAddress": "avax-position"}
+        monitor.persisted_strategy = {
+            "version": 5,
+            "source": "orca",
+            "positionAddress": "avax-position",
+            "market": "AVAX",
+            "hyperliquidAccount": monitor.config["hyperliquidAccount"],
+            "hedgeStrategy": "upside",
+            "hedgeRegime": "protected",
+            "protectionReference": "11.24",
+        }
+        hyp = server.HypState("AVAX", 2, Decimal("11.25"), Decimal("11.25"), Decimal("-10"), 0, entry_price=Decimal("10.99"))
+
+        self.assertEqual(
+            monitor._restore_strategy_state(position, hyp, "upside"),
+            ("protected", Decimal("11.08")),
+        )
+        self.assertTrue(monitor.persisted_strategy["baseRecoveryArmed"])
+        self.assertTrue(monitor.persisted_strategy["baseRecoveryForceClose"])
+
+    def test_version_5_near_reference_is_corrected_once_and_recovery_is_armed(self):
+        monitor = server.NeutralisMonitor("near-reference-current-operation")
+        monitor.config = {
+            **monitor.config,
+            "source": "byreal",
+            "positionAddress": "near-position",
+            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "hedgeStrategy": "upside",
+        }
+        position = {"positionAddress": "near-position"}
+        monitor.persisted_strategy = {
+            "version": 5,
+            "source": "byreal",
+            "positionAddress": "near-position",
+            "market": "NEAR",
+            "hyperliquidAccount": monitor.config["hyperliquidAccount"],
+            "hedgeStrategy": "upside",
+            "hedgeRegime": "protected",
+            "protectionReference": "4.28",
+        }
+        hyp = server.HypState("NEAR", 3, Decimal("4.29"), Decimal("4.29"), Decimal("-10"), 0, entry_price=Decimal("4.0772"))
+
+        self.assertEqual(
+            monitor._restore_strategy_state(position, hyp, "upside"),
+            ("protected", Decimal("4.10")),
+        )
+        self.assertTrue(monitor.persisted_strategy["baseRecoveryArmed"])
+        self.assertTrue(monitor.persisted_strategy["baseRecoveryForceClose"])
+
+    def test_version_6_reference_is_never_changed_by_one_time_correction(self):
+        monitor = server.NeutralisMonitor("reference-correction-finished")
+        monitor.config = {
+            **monitor.config,
+            "source": "orca",
+            "positionAddress": "avax-position",
+            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "hedgeStrategy": "upside",
+        }
+        position = {"positionAddress": "avax-position"}
+        monitor.persisted_strategy = {
+            "version": 6,
+            "source": "orca",
+            "positionAddress": "avax-position",
+            "market": "AVAX",
+            "hyperliquidAccount": monitor.config["hyperliquidAccount"],
+            "hedgeStrategy": "upside",
+            "hedgeRegime": "protected",
+            "protectionReference": "11.24",
+        }
+        hyp = server.HypState("AVAX", 2, Decimal("11.20"), Decimal("11.20"), Decimal("-10"), 0)
+
+        self.assertEqual(
+            monitor._restore_strategy_state(position, hyp, "upside"),
+            ("protected", Decimal("11.24")),
+        )
+
     def test_manual_stop_clears_fixed_operation_reference(self):
         monitor = server.NeutralisMonitor("manual-reset")
         monitor._persist_strategy_state({
@@ -1115,7 +1200,7 @@ class NeutralisTests(unittest.TestCase):
             "recoveryHigh": Decimal("101.25"),
         })
 
-        self.assertEqual(monitor.persisted_strategy["version"], 5)
+        self.assertEqual(monitor.persisted_strategy["version"], 6)
         self.assertEqual(monitor.persisted_strategy["hedgeLots"], [lot])
         self.assertEqual(monitor.persisted_strategy["recoveryHigh"], "101.25")
 
