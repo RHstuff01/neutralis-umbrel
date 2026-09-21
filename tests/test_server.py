@@ -910,8 +910,9 @@ class NeutralisTests(unittest.TestCase):
 
     def test_upside_strategy_returns_to_wait_at_reference_and_uses_half_step(self):
         step = Decimal("0.005")
-        self.assertIsNone(server.upside_hedge_signal("protected", Decimal("80.079"), Decimal("80"), step))
-        self.assertEqual(server.upside_hedge_signal("protected", Decimal("80.08"), Decimal("80"), step), "close")
+        self.assertIsNone(server.upside_hedge_signal("protected", Decimal("79.919"), Decimal("80"), step, Decimal("80")))
+        self.assertEqual(server.upside_hedge_signal("protected", Decimal("79.92"), Decimal("80"), step, Decimal("80")), "close")
+        self.assertIsNone(server.upside_hedge_signal("protected", Decimal("80.01"), Decimal("80"), step, Decimal("80")))
         self.assertIsNone(server.upside_hedge_signal("upside", Decimal("80.01"), Decimal("80"), step))
         self.assertEqual(server.upside_hedge_signal("upside", Decimal("80"), Decimal("80"), step), "wait")
         self.assertIsNone(server.upside_hedge_signal("initial_wait", Decimal("79.81"), Decimal("80"), step))
@@ -1110,7 +1111,7 @@ class NeutralisTests(unittest.TestCase):
             "hedgeMode": "units",
         }
         initial = server.HypState("xyz:CRCL", 3, Decimal("80"), Decimal("80"), Decimal("-30"), 0, "xyz", Decimal("80"))
-        recovered = server.HypState("xyz:CRCL", 3, Decimal("80.09"), Decimal("80.09"), Decimal("-30"), 0, "xyz", Decimal("80"))
+        recovered = server.HypState("xyz:CRCL", 3, Decimal("79.93"), Decimal("79.93"), Decimal("-30"), 0, "xyz", Decimal("80"))
         snapshots = [
             (position, initial, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("30")),
             *[(position, recovered, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("29")) for _ in range(server.RECOVERY_CONFIRMATION_READINGS)],
@@ -1125,7 +1126,39 @@ class NeutralisTests(unittest.TestCase):
                 server.MONITOR._run(live=False)
             self.assertEqual(server.MONITOR.state["snapshot"]["virtualShort"], 0)
             self.assertEqual(server.MONITOR.state["snapshot"]["hedgeRegime"], "upside")
+            self.assertTrue(server.MONITOR.state["snapshot"]["recoveryActive"])
             self.assertIn("upside-close", events)
+        finally:
+            server.MONITOR.config = original
+
+    def test_base_short_reopens_after_half_trigger_reversal_from_recovery_high(self):
+        position = {
+            "positionAddress": "position", "hedgeSymbol": "CRCL", "currentPrice": Decimal("80"),
+            "hedgeMode": "units",
+        }
+        initial = server.HypState("xyz:CRCL", 3, Decimal("78"), Decimal("78"), Decimal("-30"), 0, "xyz", Decimal("80"))
+        recovered = server.HypState("xyz:CRCL", 3, Decimal("79.93"), Decimal("79.93"), Decimal("-30"), 0, "xyz", Decimal("80"))
+        recovery_high = server.HypState("xyz:CRCL", 3, Decimal("81"), Decimal("81"), Decimal("-30"), 0, "xyz", Decimal("80"))
+        reversed_mark = server.HypState("xyz:CRCL", 3, Decimal("80.59"), Decimal("80.59"), Decimal("-30"), 0, "xyz", Decimal("80"))
+        snapshots = [
+            (position, initial, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("30")),
+            *[(position, recovered, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("29")) for _ in range(server.RECOVERY_CONFIRMATION_READINGS)],
+            (position, recovery_high, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("29")),
+            (position, reversed_mark, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("29")),
+        ]
+        original = dict(server.MONITOR.config)
+        events = []
+        try:
+            server.MONITOR.config = {**original, "hedgeStrategy": "upside", "stepPercent": "1"}
+            with patch.object(server.MONITOR, "_retry_snapshot", side_effect=snapshots), patch.object(
+                server.MONITOR.stop_event, "wait",
+                side_effect=[False] * (server.RECOVERY_CONFIRMATION_READINGS + 2) + [True],
+            ), patch.object(server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)):
+                server.MONITOR._run(live=False)
+            self.assertGreater(server.MONITOR.state["snapshot"]["virtualShort"], 0)
+            self.assertEqual(server.MONITOR.state["snapshot"]["hedgeRegime"], "protected")
+            self.assertFalse(server.MONITOR.state["snapshot"]["recoveryActive"])
+            self.assertIn("base-reentry", events)
         finally:
             server.MONITOR.config = original
 
