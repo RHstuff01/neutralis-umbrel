@@ -2209,21 +2209,41 @@ class NeutralisMonitor:
     def _is_transient_network_error(error: NeutralisError) -> bool:
         return str(error).startswith("Falha de rede")
 
+    @staticmethod
+    def _is_temporarily_unavailable_position(error: NeutralisError) -> bool:
+        return str(error) == "A posição selecionada não está aberta ou não pode ser calculada"
+
     def _retry_snapshot(self) -> tuple[dict[str, Any], HypState, Decimal, Decimal, Decimal, Decimal]:
-        """Aguarda a rede voltar sem encerrar um hedge já ativo."""
+        """Aguarda uma leitura utilizável sem encerrar um hedge já ativo."""
         failures = 0
+        retry_kind = "network"
         while not self.stop_event.is_set():
             try:
                 snapshot = self._live_snapshot()
                 if failures:
-                    self._event("network-recovered", f"Conexão restabelecida após {failures} tentativa(s)")
+                    if retry_kind == "position":
+                        self._event(
+                            "position-recovered",
+                            f"Leitura da posição restabelecida após {failures} tentativa(s)",
+                        )
+                    else:
+                        self._event("network-recovered", f"Conexão restabelecida após {failures} tentativa(s)")
                 return snapshot
             except NeutralisError as error:
-                if not self._is_transient_network_error(error):
+                is_network = self._is_transient_network_error(error)
+                is_position = self._is_temporarily_unavailable_position(error)
+                if not (is_network or is_position):
                     raise
+                retry_kind = "position" if is_position else "network"
                 failures += 1
                 if failures == 1 or failures % 12 == 0:
-                    self._event("network-retry", f"{error}; tentando novamente ({failures})", reason=str(error))
+                    event = "position-retry" if is_position else "network-retry"
+                    message = (
+                        f"Leitura temporariamente indisponível; tentando novamente ({failures})"
+                        if is_position
+                        else f"{error}; tentando novamente ({failures})"
+                    )
+                    self._event(event, message, reason=str(error))
                 if self.stop_event.wait(5):
                     break
         raise NeutralisError("Monitor interrompido pelo usuário")
