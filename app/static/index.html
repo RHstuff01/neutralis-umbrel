@@ -59,7 +59,7 @@
         <div class="notice"><b>Alerta:</b> o Telegram recebe uma mensagem se esta pool pausar automaticamente ou sair da faixa superior/inferior. Parar pelo botão não envia alerta.</div>
         <label class="field"><span>Confirmação para modo real</span><input id="liveConfirmation" autocomplete="off" placeholder="Digite ATIVAR"></label>
         <div class="actions"><button id="startLive">Ativar monitor real</button></div>
-        <div class="notice"><b>Modo real:</b> uma operação nova sem short observa primeiro metade do gatilho. Nas quedas seguintes, cada aumento do hedge vira uma parcela interna. Na recuperação, a parcela é reduzida perto do próprio preço de entrada após 30 segundos de confirmação; se o preço reverter meia banda, todo o delta faltante é recomposto de uma vez. Compra sempre usa reduce-only e nunca abre long.</div>
+        <div class="notice"><b>Modo real:</b> uma operação nova sem short observa primeiro metade do gatilho. Nas quedas seguintes, cada aumento do hedge vira uma parcela interna. Na recuperação, a parcela é reduzida na primeira leitura ascendente próxima do próprio preço de entrada; se o preço reverter meia banda, todo o delta faltante é recomposto de uma vez. Compra sempre usa reduce-only e nunca abre long.</div>
       </article>
     </section>
     <section class="panel logs"><h2>03 · Registro do monitor</h2><div id="events" class="empty">Nenhum evento registrado.</div></section>
