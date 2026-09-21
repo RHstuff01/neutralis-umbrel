@@ -343,6 +343,18 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual([item[0] for item in events], ["network-retry", "network-recovered"])
         self.assertIn("api.hyperliquid.xyz", events[0][1])
 
+    def test_retry_snapshot_keeps_monitor_alive_when_position_temporarily_disappears(self):
+        monitor = server.NeutralisMonitor("position-retry-test")
+        expected = ({"positionAddress": "position"}, Mock(), Decimal("1"), Decimal("2"), Decimal("3"), Decimal("4"))
+        events = []
+        unavailable = server.NeutralisError("A posição selecionada não está aberta ou não pode ser calculada")
+        with patch.object(monitor, "_live_snapshot", side_effect=[unavailable, expected]), patch.object(
+            monitor.stop_event, "wait", return_value=False
+        ), patch.object(monitor, "_event", side_effect=lambda event, message, **details: events.append(event)):
+            self.assertEqual(monitor._retry_snapshot(), expected)
+
+        self.assertEqual(events, ["position-retry", "position-recovered"])
+
     def test_live_snapshot_falls_back_to_hyp_mark_when_byreal_has_no_tick_price(self):
         monitor = server.NeutralisMonitor("byreal-mark-fallback-test")
         position = {
