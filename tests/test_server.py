@@ -586,6 +586,13 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(server.hyp_symbol("SKR"), "SKR")
         self.assertIsNone(server.hyp_dex("SKR"))
 
+    def test_orca_avax_usdc_uses_main_hyperliquid_avax_market(self):
+        avax = "avaxGHCq3T7hoxd73oY2KY9hJSTaeMibXvHy5KNzh5D"
+        usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        self.assertEqual(server.orca_symbols([avax, usdc]), {avax: "AVAX", usdc: "USDC"})
+        self.assertEqual(server.hyp_symbol("AVAX"), "AVAX")
+        self.assertIsNone(server.hyp_dex("AVAX"))
+
     def test_byreal_wnear_usdc_uses_main_hyperliquid_near_market(self):
         pool = {
             "poolAddress": "FXetFeCdbzdoQQdyxhDcjH29VUjyA2pj2FZZhV7xgw8f",

@@ -96,7 +96,7 @@ SYMBOL_ALIASES = {
 # Os RWAs tokenizados permanecem no DEX xyz; US500 usa mkts por ter a mesma
 # escala unitária de SPYx na Orca.
 HYP_DEX_BY_SYMBOL: dict[str, str | None] = {
-    "US500": "mkts", "ZEC": None, "SOL": None, "SKR": None, "NEAR": None,
+    "US500": "mkts", "ZEC": None, "SOL": None, "SKR": None, "NEAR": None, "AVAX": None,
 }
 HYP_DEX_BY_SYMBOL["PENGU"] = None
 # Alguns emissores exibem o ativo com sufixo USD na interface, mas a API
@@ -146,6 +146,10 @@ KNOWN_MINTS = {
     # correspondente é o perp principal SKR (exibido na interface como
     # SKR-USD), portanto é consultado e negociado sem prefixo de DEX.
     "SKRbvo6Gf7GondiT3BbTfuRDPqLWei4j2Qy2NPGZhW3": "SKR",
+    # AVAX nativo em Solana usado pelo Whirlpool AVAX/USDC
+    # HFCMZM2NiLG74Fsx15VL3WFn5pR2ZxDNuXe1STntE8oh. O hedge correspondente
+    # é o perp principal AVAX da Hyperliquid.
+    "avaxGHCq3T7hoxd73oY2KY9hJSTaeMibXvHy5KNzh5D": "AVAX",
 }
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
