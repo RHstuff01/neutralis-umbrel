@@ -1022,7 +1022,7 @@ class NeutralisTests(unittest.TestCase):
             "recoveryHigh": Decimal("101.25"),
         })
 
-        self.assertEqual(monitor.persisted_strategy["version"], 2)
+        self.assertEqual(monitor.persisted_strategy["version"], 3)
         self.assertEqual(monitor.persisted_strategy["hedgeLots"], [lot])
         self.assertEqual(monitor.persisted_strategy["recoveryHigh"], "101.25")
 
@@ -1036,6 +1036,12 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(len(server.open_hedge_lots(lots)), 1)
         self.assertIs(server.open_hedge_lots(lots)[0], first)
         self.assertIsNotNone(second["closedAt"])
+
+    def test_new_lot_starts_with_persistent_recovery_disarmed(self):
+        lots = []
+        lot = server.add_hedge_lot(lots, Decimal("2"), Decimal("3.9754"))
+
+        self.assertFalse(lot["recoveryArmed"])
 
     def test_reentry_uses_one_global_half_trigger_and_does_not_accumulate(self):
         step = Decimal("0.01")

@@ -1530,6 +1530,7 @@ def add_hedge_lot(
         ),
         "openedAt": now_iso(),
         "closedAt": None,
+        "recoveryArmed": False,
     }
     lots.append(lot)
     return lot
@@ -1606,7 +1607,7 @@ class NeutralisMonitor:
     def _load_strategy_state(self) -> dict[str, Any] | None:
         try:
             stored = json.loads(self.strategy_state_file.read_text(encoding="utf-8"))
-            return stored if isinstance(stored, dict) and stored.get("version") in {1, 2} else None
+            return stored if isinstance(stored, dict) and stored.get("version") in {1, 2, 3} else None
         except (OSError, json.JSONDecodeError):
             return None
 
@@ -1631,7 +1632,7 @@ class NeutralisMonitor:
             return
         position = snapshot.get("position") or {}
         payload = {
-            "version": 2,
+            "version": 3,
             "source": self.config.get("source"),
             "positionAddress": position.get("positionAddress"),
             "market": snapshot.get("market"),
@@ -2257,7 +2258,7 @@ class NeutralisMonitor:
             hedge_lots: list[dict[str, Any]] = []
             recovery_active = False
             recovery_high = Decimal("0")
-            if live and restored_strategy and self.persisted_strategy and self.persisted_strategy.get("version") == 2:
+            if live and restored_strategy and self.persisted_strategy and self.persisted_strategy.get("version") in {2, 3}:
                 raw_lots = self.persisted_strategy.get("hedgeLots", [])
                 if isinstance(raw_lots, list):
                     for raw_lot in raw_lots:
@@ -2265,7 +2266,14 @@ class NeutralisMonitor:
                             continue
                         try:
                             if decimal(raw_lot.get("size", 0), "parcela") > 0 and decimal(raw_lot.get("entryPrice", 0), "entrada da parcela") > 0:
-                                hedge_lots.append(dict(raw_lot))
+                                migrated_lot = dict(raw_lot)
+                                # Parcelas criadas antes da versão 3 não
+                                # registravam a passagem por baixo do piso.
+                                # Migram armadas para não ficarem presas após
+                                # a atualização que interrompeu o cruzamento.
+                                if "recoveryArmed" not in migrated_lot:
+                                    migrated_lot["recoveryArmed"] = True
+                                hedge_lots.append(migrated_lot)
                         except NeutralisError:
                             continue
                 recovery_active = bool(self.persisted_strategy.get("recoveryActive", False))
@@ -2528,6 +2536,14 @@ class NeutralisMonitor:
                 # ascendente de 0,10% abaixo da entrada. Assim uma recuperação
                 # rápida não escapa entre duas consultas.
                 if hedge_regime == "protected" and open_hedge_lots(hedge_lots):
+                    # Cada parcela fica permanentemente armada depois de uma
+                    # leitura abaixo do próprio piso. Esse sinal faz parte do
+                    # estado persistido e sobrevive a reinícios do container.
+                    for open_lot in open_hedge_lots(hedge_lots):
+                        open_entry = decimal(open_lot["entryPrice"], "entrada da parcela")
+                        open_floor = open_entry * (Decimal("1") - BASE_RECOVERY_EXIT_BUFFER)
+                        if hyp_now.mark < open_floor:
+                            open_lot["recoveryArmed"] = True
                     newest_lot = open_hedge_lots(hedge_lots)[-1]
                     lot_entry = decimal(newest_lot["entryPrice"], "entrada da parcela")
                     lot_close_floor = lot_entry * (Decimal("1") - BASE_RECOVERY_EXIT_BUFFER)
@@ -2536,7 +2552,9 @@ class NeutralisMonitor:
                     # dentro da faixa lucrativa, encerre a parcela sem esperar
                     # um novo mergulho. Acima da entrada, somente um cruzamento
                     # observado nesta execução autoriza a saída.
-                    eligible = crossed_recovery or lot_close_floor <= hyp_now.mark <= lot_entry
+                    eligible = (
+                        bool(newest_lot.get("recoveryArmed")) and hyp_now.mark >= lot_close_floor
+                    ) or crossed_recovery
                     lot_id = str(newest_lot.get("id", ""))
                     if eligible:
                         lot_size = decimal(newest_lot["size"], "parcela")
