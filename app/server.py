@@ -1468,9 +1468,9 @@ def upside_hedge_signal(regime: str, mark: Decimal, entry_price: Decimal, step: 
     """Indica a troca de regime da estratégia de participação na alta.
 
     Uma proteção existente só é encerrada depois da alta correspondente ao
-    gatilho completo. Depois de encerrada, ela volta na própria referência de
-    entrada: não esperamos outra banda para baixo e, assim, reduzimos a
-    exposição durante uma reversão.
+    gatilho completo. Depois de encerrada, o retorno à referência não recompõe
+    o short imediatamente: ele devolve a estratégia ao modo de espera. A partir
+    daí, metade do gatilho decide novamente a direção, como no início.
 
     Uma operação realmente nova usa metade do gatilho apenas para descobrir a
     direção inicial. A queda abre a proteção; a alta confirma o regime de
@@ -1481,8 +1481,8 @@ def upside_hedge_signal(regime: str, mark: Decimal, entry_price: Decimal, step: 
     if regime == "protected" and mark >= entry_price * (Decimal("1") + step):
         return "close"
     if regime == "upside" and mark <= entry_price:
-        return "open"
-    if regime == "initial_wait":
+        return "wait"
+    if regime in {"initial_wait", "direction_wait"}:
         half_step = step / Decimal("2")
         if mark <= entry_price * (Decimal("1") - half_step):
             return "open"
@@ -1645,7 +1645,7 @@ class NeutralisMonitor:
             reference = decimal(stored.get("protectionReference"), "referência persistida")
         except NeutralisError:
             return None
-        if regime not in {"protected", "upside", "initial_wait"} or reference <= 0:
+        if regime not in {"protected", "upside", "initial_wait", "direction_wait"} or reference <= 0:
             return None
         actual_is_protected = hyp.signed_position < 0
         saved_is_protected = regime == "protected"
@@ -2257,7 +2257,7 @@ class NeutralisMonitor:
                 # Sem short, começa participando da alta e só abre proteção
                 # depois da queda confirmada. Se o short já estiver acima da
                 # banda de saída, não aumente a posição antes de fechá-la.
-                if hedge_regime in {"upside", "initial_wait"}:
+                if hedge_regime in {"upside", "initial_wait", "direction_wait"}:
                     initial_target = Decimal("0")
                 elif upside_hedge_signal(hedge_regime, hyp.mark, protection_reference, step) == "close":
                     initial_target = current_short
@@ -2327,10 +2327,14 @@ class NeutralisMonitor:
                 "openLotCount": len(open_hedge_lots(hedge_lots)),
                 "recoveryActive": recovery_active,
                 "recoveryHigh": recovery_high,
-                "closeThreshold": protection_reference * (Decimal("1") + step),
+                "closeThreshold": protection_reference * (
+                    Decimal("1") + step / Decimal("2")
+                    if hedge_regime in {"initial_wait", "direction_wait"}
+                    else Decimal("1") + step
+                ),
                 "openThreshold": protection_reference * (
                     Decimal("1") - step / Decimal("2")
-                    if hedge_regime == "initial_wait"
+                    if hedge_regime in {"initial_wait", "direction_wait"}
                     else Decimal("1")
                 ),
                 "live": live,
@@ -2340,7 +2344,8 @@ class NeutralisMonitor:
                 label = "MODO REAL ativo" if live else "Dry-run ativo"
                 regime_label = {
                     "protected": "protegido",
-                    "initial_wait": "aguardando direção inicial",
+                    "initial_wait": "aguardando direção",
+                    "direction_wait": "aguardando nova direção",
                     "upside": "sem short · aguardando retorno à referência",
                 }.get(hedge_regime, hedge_regime)
                 self.state.update({"mode": "running", "message": f"{label} · {regime_label} · banda de {step * 100:.2f}%", "snapshot": json_safe(initial_snapshot), "updatedAt": now_iso()})
@@ -2401,12 +2406,12 @@ class NeutralisMonitor:
                     # Duas leituras eliminam um tick isolado; a proteção
                     # principal contra falsos rompimentos é a banda ±gatilho.
                     if signal and regime_confirmation_count >= 2:
-                        next_target = Decimal("0") if signal in {"close", "confirm_upside"} else target
+                        next_target = Decimal("0") if signal in {"close", "confirm_upside", "wait"} else target
                         if live:
                             # Confirmar uma alta inicial não exige execução: a
                             # posição já está zerada. Nos demais sinais, ajuste
                             # normalmente e confirme o resultado on-chain.
-                            if signal != "confirm_upside":
+                            if signal not in {"confirm_upside", "wait"}:
                                 result = self._execute_auto_adjustment(position_now, hyp_now, next_target)
                                 if result:
                                     virtual_short = result["currentShort"]
@@ -2416,8 +2421,8 @@ class NeutralisMonitor:
                             before = virtual_short
                             virtual_short = next_target
                             self._event(
-                                "upside-close" if signal == "close" else "initial-upside" if signal == "confirm_upside" else "downside-open",
-                                f"SIMULAR {'FECHAR TODO O SHORT' if signal == 'close' else 'CONFIRMAR ALTA INICIAL' if signal == 'confirm_upside' else 'REABRIR HEDGE DE 100%'}",
+                                "upside-close" if signal == "close" else "initial-upside" if signal == "confirm_upside" else "direction-wait" if signal == "wait" else "downside-open",
+                                f"SIMULAR {'FECHAR TODO O SHORT' if signal == 'close' else 'CONFIRMAR ALTA' if signal == 'confirm_upside' else 'AGUARDAR NOVA DIREÇÃO' if signal == 'wait' else 'REABRIR HEDGE DE 100%'}",
                                 before=before,
                                 after=virtual_short,
                                 mark=hyp_now.mark,
@@ -2434,8 +2439,15 @@ class NeutralisMonitor:
                             hedge_lots = []
                             recovery_active = False
                             recovery_high = Decimal("0")
-                        hedge_regime = "upside" if signal in {"close", "confirm_upside"} else "protected"
-                        if signal == "open":
+                        was_direction_wait = hedge_regime == "direction_wait"
+                        hedge_regime = (
+                            "upside"
+                            if signal in {"close", "confirm_upside"}
+                            else "direction_wait"
+                            if signal == "wait"
+                            else "protected"
+                        )
+                        if signal == "open" and not was_direction_wait:
                             protection_reference = (
                                 hyp_now.entry_price if live and hyp_now.entry_price > 0 else hyp_now.mark
                             )
@@ -2443,8 +2455,10 @@ class NeutralisMonitor:
                             "hedge-regime",
                             "Short zerado; participando da alta"
                             if signal == "close"
-                            else "Alta inicial confirmada; aguardando retorno à referência"
+                            else "Alta confirmada; aguardando retorno à referência"
                             if signal == "confirm_upside"
+                            else "Preço voltou à referência; aguardando nova direção"
+                            if signal == "wait"
                             else "Queda confirmada; hedge de 100% reativado",
                             regime=hedge_regime,
                             mark=hyp_now.mark,
@@ -2457,7 +2471,7 @@ class NeutralisMonitor:
                         regime_confirmation = None
                         regime_confirmation_count = 0
 
-                    if hedge_regime in {"upside", "initial_wait"}:
+                    if hedge_regime in {"upside", "initial_wait", "direction_wait"}:
                         # Exibição e cálculo de pendência devem refletir que,
                         # nestes regimes, o alvo deliberado é zero.
                         target = Decimal("0")
@@ -2696,20 +2710,24 @@ class NeutralisMonitor:
                     "openLotCount": len(open_hedge_lots(hedge_lots)),
                     "recoveryActive": recovery_active,
                     "recoveryHigh": recovery_high,
-                    "closeThreshold": protection_reference * (Decimal("1") + step),
+                    "closeThreshold": protection_reference * (
+                        Decimal("1") + step / Decimal("2")
+                        if hedge_regime in {"initial_wait", "direction_wait"}
+                        else Decimal("1") + step
+                    ),
                     "live": live,
                     "pendingNotional": abs(target - (abs(min(hyp_now.signed_position, Decimal('0'))) if live else virtual_short)) * hyp_now.mark,
                     "openThreshold": protection_reference * (
                         Decimal("1") - step / Decimal("2")
-                        if hedge_regime == "initial_wait"
+                        if hedge_regime in {"initial_wait", "direction_wait"}
                         else Decimal("1")
                     ),
-                    "closeThreshold": protection_reference * (Decimal("1") + step),
                 }
                 with self.lock:
                     regime_label = {
                         "protected": "protegido",
-                        "initial_wait": "aguardando direção inicial",
+                        "initial_wait": "aguardando direção",
+                        "direction_wait": "aguardando nova direção",
                         "upside": "sem short · aguardando retorno à referência",
                     }.get(hedge_regime, hedge_regime)
                     self.state.update({
