@@ -951,6 +951,47 @@ class NeutralisTests(unittest.TestCase):
 
         self.assertEqual(restored, ("upside", Decimal("42.75")))
 
+    def test_protected_state_restores_fixed_reference_not_current_short_average(self):
+        monitor = server.NeutralisMonitor("fixed-reference")
+        monitor.config = {
+            **monitor.config,
+            "source": "orca",
+            "positionAddress": "saved-position",
+            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "hedgeStrategy": "upside",
+        }
+        position = {"positionAddress": "actual-position"}
+        monitor._persist_strategy_state({
+            "position": position,
+            "market": "NEAR",
+            "hedgeStrategy": "upside",
+            "hedgeRegime": "protected",
+            "protectionReference": Decimal("4.12"),
+            "realShort": Decimal("10"),
+        })
+
+        restarted = server.NeutralisMonitor("fixed-reference")
+        restarted.config = dict(monitor.config)
+        hyp = server.HypState("NEAR", 3, Decimal("4.08"), Decimal("4.08"), Decimal("-10"), 0, entry_price=Decimal("4.10"))
+
+        self.assertEqual(restarted._restore_strategy_state(position, hyp, "upside"), ("protected", Decimal("4.12")))
+
+    def test_manual_stop_clears_fixed_operation_reference(self):
+        monitor = server.NeutralisMonitor("manual-reset")
+        monitor._persist_strategy_state({
+            "position": {"positionAddress": "position"},
+            "market": "NEAR",
+            "hedgeStrategy": "upside",
+            "hedgeRegime": "protected",
+            "protectionReference": Decimal("4.12"),
+            "realShort": Decimal("10"),
+        })
+
+        monitor.stop()
+
+        self.assertIsNone(monitor.persisted_strategy)
+        self.assertFalse(monitor.strategy_state_file.exists())
+
     def test_strategy_state_persists_lots_and_global_recovery_reference(self):
         monitor = server.NeutralisMonitor("lot-persistence")
         monitor.config = {

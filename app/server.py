@@ -1599,6 +1599,11 @@ class NeutralisMonitor:
         deixa JSON parcial e uma atualização do mark, por si só, não desgasta
         o armazenamento do Umbrel.
         """
+        # Uma parada manual encerra deliberadamente a operação. Mesmo que uma
+        # iteração já estivesse em andamento, ela não pode recriar a referência
+        # que acabou de ser apagada pelo usuário.
+        if self.manual_stop_requested:
+            return
         position = snapshot.get("position") or {}
         payload = {
             "version": 2,
@@ -1662,8 +1667,6 @@ class NeutralisMonitor:
                 market=hyp.market,
             )
             return None
-        if regime == "protected" and hyp.entry_price > 0:
-            reference = hyp.entry_price
         self._event(
             "state-restored",
             "Estado da estratégia recuperado com segurança",
@@ -2175,6 +2178,9 @@ class NeutralisMonitor:
         self.stop_event.set()
         with self.lock:
             self.manual_stop_requested = True
+            # Parar manualmente encerra a operação estratégica. No próximo
+            # início, o mark daquele momento será a nova referência fixa.
+            self._clear_strategy_state()
             self.state.update({"mode": "stopped", "message": "Monitor interrompido pelo usuário", "updatedAt": now_iso()})
         self._event("stop", "Monitor interrompido pelo usuário")
 
@@ -2215,7 +2221,9 @@ class NeutralisMonitor:
             # qual lado o mercado anda. Um estado salvo distingue essa estreia
             # de uma proteção que já foi fechada deliberadamente na alta.
             hedge_regime = "protected" if current_short > 0 else "initial_wait"
-            protection_reference = hyp.entry_price if hyp.entry_price > 0 else hyp.mark
+            # A fronteira estratégica nasce no primeiro início da operação e
+            # permanece fixa. O preço médio móvel do short nunca a substitui.
+            protection_reference = hyp.mark
             # O dry-run continua isolado: somente o modo real recupera o
             # estado operacional salvo antes de uma reinicialização.
             restored_strategy = self._restore_strategy_state(position, hyp, hedge_strategy) if live else None
@@ -2389,11 +2397,6 @@ class NeutralisMonitor:
                 projected_lp_price = lp_anchor * hyp_now.mark / hyp_anchor
                 target = target_at_reference_price(position_now, liquidity, projected_lp_price, lower, upper, hyp_now.mark)
                 if hedge_strategy == "upside":
-                    # Enquanto existe short, acompanhe o preço médio real da
-                    # posição. A banda só muda quando uma execução altera a
-                    # entrada média; oscilações do mark não movem a referência.
-                    if hedge_regime == "protected" and hyp_now.entry_price > 0:
-                        protection_reference = hyp_now.entry_price
                     signal = upside_hedge_signal(hedge_regime, hyp_now.mark, protection_reference, step)
                     # As parcelas adicionais são recuperadas primeiro, em
                     # ordem LIFO. O short-base só pode ser zerado depois que
@@ -2450,7 +2453,6 @@ class NeutralisMonitor:
                             hedge_lots = []
                             recovery_active = False
                             recovery_high = Decimal("0")
-                        was_direction_wait = hedge_regime == "direction_wait"
                         hedge_regime = (
                             "upside"
                             if signal in {"close", "confirm_upside"}
@@ -2458,10 +2460,6 @@ class NeutralisMonitor:
                             if signal == "wait"
                             else "protected"
                         )
-                        if signal == "open" and not was_direction_wait:
-                            protection_reference = (
-                                hyp_now.entry_price if live and hyp_now.entry_price > 0 else hyp_now.mark
-                            )
                         self._event(
                             "hedge-regime",
                             "Short zerado; participando da alta"
