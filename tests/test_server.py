@@ -823,6 +823,29 @@ class NeutralisTests(unittest.TestCase):
                 server.MONITOR._execute_auto_adjustment(position, hyp, Decimal("2.600"))
         self.assertEqual(exchange.order.call_count, 4)
 
+    def test_insufficient_margin_reduces_order_and_keeps_monitor_running(self):
+        position = {"positionAddress": "position", "hedgeSymbol": "COIN", "currentPrice": Decimal("100")}
+        hyp = server.HypState("xyz:COIN", 3, Decimal("100"), Decimal("100"), Decimal("-2"), 0)
+        snapshot = (position, hyp, Decimal("80"), Decimal("120"), Decimal("1"), Decimal("3"))
+        response = {
+            "status": "ok",
+            "response": {"data": {"statuses": [{"error": "Insufficient margin to place order. asset=74"}]}},
+        }
+        exchange = Mock()
+        exchange.order.return_value = response
+        events = []
+        with patch.object(server, "hyp_state", return_value=hyp), patch.object(
+            server.MONITOR, "_retry_snapshot", return_value=snapshot
+        ), patch.object(server.MONITOR, "_exchange", return_value=exchange), patch.object(
+            server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)
+        ), patch.object(server.MONITOR.stop_event, "wait", return_value=False):
+            result = server.MONITOR._execute_auto_adjustment(position, hyp, Decimal("3"))
+
+        self.assertIsNone(result)
+        self.assertGreater(exchange.order.call_count, 1)
+        self.assertIn("margin-retry", events)
+        self.assertIn("margin-limited", events)
+
     def test_auto_sell_pauses_above_six_hundred_total_notional(self):
         position = {"hedgeSymbol": "COIN", "currentPrice": Decimal("176")}
         hyp = server.HypState("xyz:COIN", 3, Decimal("176"), Decimal("176"), Decimal("-2.740"), 0)
@@ -911,8 +934,9 @@ class NeutralisTests(unittest.TestCase):
     def test_upside_strategy_returns_to_wait_at_reference_and_uses_half_step(self):
         step = Decimal("0.005")
         self.assertIsNone(server.upside_hedge_signal("protected", Decimal("79.919"), Decimal("80"), step, Decimal("80")))
-        self.assertEqual(server.upside_hedge_signal("protected", Decimal("79.92"), Decimal("80"), step, Decimal("80")), "close")
-        self.assertIsNone(server.upside_hedge_signal("protected", Decimal("80.01"), Decimal("80"), step, Decimal("80")))
+        self.assertIsNone(server.upside_hedge_signal("protected", Decimal("79.92"), Decimal("80"), step, Decimal("80")))
+        self.assertEqual(server.upside_hedge_signal("protected", Decimal("79.92"), Decimal("80"), step, Decimal("80"), True), "close")
+        self.assertEqual(server.upside_hedge_signal("protected", Decimal("80.01"), Decimal("80"), step, Decimal("80"), True), "close")
         self.assertIsNone(server.upside_hedge_signal("upside", Decimal("80.01"), Decimal("80"), step))
         self.assertEqual(server.upside_hedge_signal("upside", Decimal("80"), Decimal("80"), step), "wait")
         self.assertIsNone(server.upside_hedge_signal("initial_wait", Decimal("79.81"), Decimal("80"), step))
@@ -984,6 +1008,63 @@ class NeutralisTests(unittest.TestCase):
 
         self.assertEqual(restarted._restore_strategy_state(position, hyp, "upside"), ("protected", Decimal("4.12")))
 
+    def test_legacy_near_reference_is_corrected_to_420_once(self):
+        monitor = server.NeutralisMonitor("near-reference-correction")
+        monitor.config = {
+            **monitor.config,
+            "source": "byreal",
+            "positionAddress": "near-position",
+            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "hedgeStrategy": "upside",
+        }
+        position = {"positionAddress": "near-position"}
+        monitor.persisted_strategy = {
+            "version": 4,
+            "source": "byreal",
+            "positionAddress": "near-position",
+            "market": "NEAR",
+            "hyperliquidAccount": monitor.config["hyperliquidAccount"],
+            "hedgeStrategy": "upside",
+            "hedgeRegime": "protected",
+            "protectionReference": "4.10",
+        }
+        hyp = server.HypState(
+            "NEAR", 3, Decimal("4.08"), Decimal("4.08"), Decimal("-10"), 0,
+            entry_price=Decimal("4.10"),
+        )
+
+        self.assertEqual(
+            monitor._restore_strategy_state(position, hyp, "upside"),
+            ("protected", Decimal("4.20")),
+        )
+
+    def test_current_near_reference_at_410_is_not_corrected_again(self):
+        monitor = server.NeutralisMonitor("near-reference-current")
+        monitor.config = {
+            **monitor.config,
+            "source": "byreal",
+            "positionAddress": "near-position",
+            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "hedgeStrategy": "upside",
+        }
+        position = {"positionAddress": "near-position"}
+        monitor.persisted_strategy = {
+            "version": 5,
+            "source": "byreal",
+            "positionAddress": "near-position",
+            "market": "NEAR",
+            "hyperliquidAccount": monitor.config["hyperliquidAccount"],
+            "hedgeStrategy": "upside",
+            "hedgeRegime": "protected",
+            "protectionReference": "4.10",
+        }
+        hyp = server.HypState("NEAR", 3, Decimal("4.08"), Decimal("4.08"), Decimal("-10"), 0)
+
+        self.assertEqual(
+            monitor._restore_strategy_state(position, hyp, "upside"),
+            ("protected", Decimal("4.10")),
+        )
+
     def test_manual_stop_clears_fixed_operation_reference(self):
         monitor = server.NeutralisMonitor("manual-reset")
         monitor._persist_strategy_state({
@@ -1022,7 +1103,7 @@ class NeutralisTests(unittest.TestCase):
             "recoveryHigh": Decimal("101.25"),
         })
 
-        self.assertEqual(monitor.persisted_strategy["version"], 3)
+        self.assertEqual(monitor.persisted_strategy["version"], 5)
         self.assertEqual(monitor.persisted_strategy["hedgeLots"], [lot])
         self.assertEqual(monitor.persisted_strategy["recoveryHigh"], "101.25")
 
@@ -1037,11 +1118,12 @@ class NeutralisTests(unittest.TestCase):
         self.assertIs(server.open_hedge_lots(lots)[0], first)
         self.assertIsNotNone(second["closedAt"])
 
-    def test_new_lot_starts_with_persistent_recovery_disarmed(self):
+    def test_new_lot_is_ready_to_detect_immediate_reversal(self):
         lots = []
         lot = server.add_hedge_lot(lots, Decimal("2"), Decimal("3.9754"))
 
-        self.assertFalse(lot["recoveryArmed"])
+        self.assertTrue(lot["recoveryArmed"])
+        self.assertFalse(lot["recoveryForceClose"])
 
     def test_reentry_uses_one_global_half_trigger_and_does_not_accumulate(self):
         step = Decimal("0.01")
@@ -1122,23 +1204,25 @@ class NeutralisTests(unittest.TestCase):
         self.assertIsNone(restored)
         self.assertIn("state-reconciliation", events)
 
-    def test_dry_run_closes_base_short_after_30_seconds_near_entry(self):
+    def test_dry_run_closes_armed_base_short_on_first_recovery(self):
         position = {
             "positionAddress": "position", "hedgeSymbol": "CRCL", "currentPrice": Decimal("80"),
             "hedgeMode": "units",
         }
         initial = server.HypState("xyz:CRCL", 3, Decimal("80"), Decimal("80"), Decimal("-30"), 0, "xyz", Decimal("80"))
+        falling = server.HypState("xyz:CRCL", 3, Decimal("79.90"), Decimal("79.90"), Decimal("-30"), 0, "xyz", Decimal("80"))
         recovered = server.HypState("xyz:CRCL", 3, Decimal("79.93"), Decimal("79.93"), Decimal("-30"), 0, "xyz", Decimal("80"))
         snapshots = [
             (position, initial, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("30")),
-            *[(position, recovered, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("29")) for _ in range(server.RECOVERY_CONFIRMATION_READINGS)],
+            (position, falling, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("30")),
+            (position, recovered, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("29")),
         ]
         original = dict(server.MONITOR.config)
         events = []
         try:
             server.MONITOR.config = {**original, "hedgeStrategy": "upside", "stepPercent": "0.5"}
             with patch.object(server.MONITOR, "_retry_snapshot", side_effect=snapshots), patch.object(
-                server.MONITOR.stop_event, "wait", side_effect=[False] * server.RECOVERY_CONFIRMATION_READINGS + [True]
+                server.MONITOR.stop_event, "wait", side_effect=[False, False, True]
             ), patch.object(server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)):
                 server.MONITOR._run(live=False)
             self.assertEqual(server.MONITOR.state["snapshot"]["virtualShort"], 0)
@@ -1159,7 +1243,7 @@ class NeutralisTests(unittest.TestCase):
         reversed_mark = server.HypState("xyz:CRCL", 3, Decimal("80.59"), Decimal("80.59"), Decimal("-30"), 0, "xyz", Decimal("80"))
         snapshots = [
             (position, initial, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("30")),
-            *[(position, recovered, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("29")) for _ in range(server.RECOVERY_CONFIRMATION_READINGS)],
+            (position, recovered, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("29")),
             (position, recovery_high, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("29")),
             (position, reversed_mark, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("29")),
         ]
@@ -1169,7 +1253,7 @@ class NeutralisTests(unittest.TestCase):
             server.MONITOR.config = {**original, "hedgeStrategy": "upside", "stepPercent": "1"}
             with patch.object(server.MONITOR, "_retry_snapshot", side_effect=snapshots), patch.object(
                 server.MONITOR.stop_event, "wait",
-                side_effect=[False] * (server.RECOVERY_CONFIRMATION_READINGS + 2) + [True],
+                side_effect=[False, False, False, True],
             ), patch.object(server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)):
                 server.MONITOR._run(live=False)
             self.assertGreater(server.MONITOR.state["snapshot"]["virtualShort"], 0)
