@@ -903,8 +903,8 @@ class NeutralisTests(unittest.TestCase):
 
     def test_upside_strategy_returns_to_wait_at_reference_and_uses_half_step(self):
         step = Decimal("0.005")
-        self.assertIsNone(server.upside_hedge_signal("protected", Decimal("80.39"), Decimal("80"), step))
-        self.assertEqual(server.upside_hedge_signal("protected", Decimal("80.40"), Decimal("80"), step), "close")
+        self.assertIsNone(server.upside_hedge_signal("protected", Decimal("80.079"), Decimal("80"), step))
+        self.assertEqual(server.upside_hedge_signal("protected", Decimal("80.08"), Decimal("80"), step), "close")
         self.assertIsNone(server.upside_hedge_signal("upside", Decimal("80.01"), Decimal("80"), step))
         self.assertEqual(server.upside_hedge_signal("upside", Decimal("80"), Decimal("80"), step), "wait")
         self.assertIsNone(server.upside_hedge_signal("initial_wait", Decimal("79.81"), Decimal("80"), step))
@@ -1056,25 +1056,23 @@ class NeutralisTests(unittest.TestCase):
         self.assertIsNone(restored)
         self.assertIn("state-reconciliation", events)
 
-    def test_dry_run_closes_short_after_two_confirmed_readings_above_band(self):
+    def test_dry_run_closes_base_short_after_30_seconds_near_entry(self):
         position = {
             "positionAddress": "position", "hedgeSymbol": "CRCL", "currentPrice": Decimal("80"),
             "hedgeMode": "units",
         }
         initial = server.HypState("xyz:CRCL", 3, Decimal("80"), Decimal("80"), Decimal("-30"), 0, "xyz", Decimal("80"))
-        first = server.HypState("xyz:CRCL", 3, Decimal("80.41"), Decimal("80.41"), Decimal("-30"), 0, "xyz", Decimal("80"))
-        second = server.HypState("xyz:CRCL", 3, Decimal("80.42"), Decimal("80.42"), Decimal("-30"), 0, "xyz", Decimal("80"))
+        recovered = server.HypState("xyz:CRCL", 3, Decimal("80.09"), Decimal("80.09"), Decimal("-30"), 0, "xyz", Decimal("80"))
         snapshots = [
             (position, initial, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("30")),
-            (position, first, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("29")),
-            (position, second, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("29")),
+            *[(position, recovered, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("29")) for _ in range(server.RECOVERY_CONFIRMATION_READINGS)],
         ]
         original = dict(server.MONITOR.config)
         events = []
         try:
             server.MONITOR.config = {**original, "hedgeStrategy": "upside", "stepPercent": "0.5"}
             with patch.object(server.MONITOR, "_retry_snapshot", side_effect=snapshots), patch.object(
-                server.MONITOR.stop_event, "wait", side_effect=[False, False, True]
+                server.MONITOR.stop_event, "wait", side_effect=[False] * server.RECOVERY_CONFIRMATION_READINGS + [True]
             ), patch.object(server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)):
                 server.MONITOR._run(live=False)
             self.assertEqual(server.MONITOR.state["snapshot"]["virtualShort"], 0)

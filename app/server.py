@@ -66,6 +66,10 @@ AUTO_POLL_SECONDS = 2
 AUTO_RETRY_SECONDS = 1
 RECOVERY_CONFIRMATION_SECONDS = 30
 RECOVERY_CONFIRMATION_READINGS = max(1, math.ceil(RECOVERY_CONFIRMATION_SECONDS / AUTO_POLL_SECONDS))
+# O short-base é encerrado muito perto do próprio preço médio. Esta pequena
+# margem cobre ruído/spread sem obrigar a posição a perder uma banda inteira
+# antes de participar novamente da alta.
+BASE_RECOVERY_EXIT_BUFFER = Decimal("0.001")
 # Uma IOC que não encontra livro não deve abandonar o hedge. O preço-limite
 # vai ficando mais agressivo até este teto e depois continua tentando nele,
 # sempre podendo ser interrompido manualmente pelo usuário.
@@ -1478,7 +1482,7 @@ def upside_hedge_signal(regime: str, mark: Decimal, entry_price: Decimal, step: 
     """
     if mark <= 0 or entry_price <= 0 or step <= 0:
         return None
-    if regime == "protected" and mark >= entry_price * (Decimal("1") + step):
+    if regime == "protected" and mark >= entry_price * (Decimal("1") + BASE_RECOVERY_EXIT_BUFFER):
         return "close"
     if regime == "upside" and mark <= entry_price:
         return "wait"
@@ -2330,7 +2334,7 @@ class NeutralisMonitor:
                 "closeThreshold": protection_reference * (
                     Decimal("1") + step / Decimal("2")
                     if hedge_regime in {"initial_wait", "direction_wait"}
-                    else Decimal("1") + step
+                    else Decimal("1") + BASE_RECOVERY_EXIT_BUFFER
                 ),
                 "openThreshold": protection_reference * (
                     Decimal("1") - step / Decimal("2")
@@ -2391,6 +2395,11 @@ class NeutralisMonitor:
                     if hedge_regime == "protected" and hyp_now.entry_price > 0:
                         protection_reference = hyp_now.entry_price
                     signal = upside_hedge_signal(hedge_regime, hyp_now.mark, protection_reference, step)
+                    # As parcelas adicionais são recuperadas primeiro, em
+                    # ordem LIFO. O short-base só pode ser zerado depois que
+                    # nenhuma parcela adicional continuar aberta.
+                    if signal == "close" and open_hedge_lots(hedge_lots):
+                        signal = None
                     if signal is None:
                         # Ausência de troca de regime não é uma confirmação.
                         # O contador precisa ficar zerado para que o ajuste
@@ -2403,9 +2412,11 @@ class NeutralisMonitor:
                         regime_confirmation = signal
                         regime_confirmation_count = 1
 
-                    # Duas leituras eliminam um tick isolado; a proteção
-                    # principal contra falsos rompimentos é a banda ±gatilho.
-                    if signal and regime_confirmation_count >= 2:
+                    # Abrir/voltar à espera exige duas leituras. Encerrar o
+                    # short-base próximo da referência exige 30 segundos para
+                    # não reagir a uma violinada curta.
+                    required_confirmation = RECOVERY_CONFIRMATION_READINGS if signal == "close" else 2
+                    if signal and regime_confirmation_count >= required_confirmation:
                         next_target = Decimal("0") if signal in {"close", "confirm_upside", "wait"} else target
                         if live:
                             # Confirmar uma alta inicial não exige execução: a
@@ -2713,7 +2724,7 @@ class NeutralisMonitor:
                     "closeThreshold": protection_reference * (
                         Decimal("1") + step / Decimal("2")
                         if hedge_regime in {"initial_wait", "direction_wait"}
-                        else Decimal("1") + step
+                        else Decimal("1") + BASE_RECOVERY_EXIT_BUFFER
                     ),
                     "live": live,
                     "pendingNotional": abs(target - (abs(min(hyp_now.signed_position, Decimal('0'))) if live else virtual_short)) * hyp_now.mark,
