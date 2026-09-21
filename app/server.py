@@ -61,8 +61,11 @@ AUTO_WIDE_STEP = Decimal("0.005")
 AUTO_NARROW_RANGE = Decimal("0.03")
 AUTO_EXECUTION_PRICE_DRIFT = Decimal("0.005")
 AUTO_MIN_ORDER_NOTIONAL = Decimal("10")
+ESTIMATED_TAKER_FEE_RATE = Decimal("0.00045")
 AUTO_POLL_SECONDS = 2
 AUTO_RETRY_SECONDS = 1
+RECOVERY_CONFIRMATION_SECONDS = 30
+RECOVERY_CONFIRMATION_READINGS = max(1, math.ceil(RECOVERY_CONFIRMATION_SECONDS / AUTO_POLL_SECONDS))
 # Uma IOC que não encontra livro não deve abandonar o hedge. O preço-limite
 # vai ficando mais agressivo até este teto e depois continua tentando nele,
 # sempre podendo ser interrompido manualmente pelo usuário.
@@ -1470,6 +1473,56 @@ def upside_hedge_signal(regime: str, mark: Decimal, entry_price: Decimal, step: 
     return None
 
 
+def open_hedge_lots(lots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Retorna somente parcelas ainda abertas, preservando a ordem de criação."""
+    return [lot for lot in lots if not lot.get("closedAt") and decimal(lot.get("size", 0), "parcela") > 0]
+
+
+def add_hedge_lot(
+    lots: list[dict[str, Any]],
+    size: Decimal,
+    entry_price: Decimal,
+    reference_price: Decimal | None = None,
+) -> dict[str, Any] | None:
+    """Registra um aumento real do short como parcela interna independente."""
+    if size <= 0 or entry_price <= 0:
+        return None
+    lot = {
+        "id": f"{int(datetime.now(timezone.utc).timestamp() * 1_000_000)}-{len(lots) + 1}",
+        "size": str(size),
+        "entryPrice": str(entry_price),
+        "estimatedFeeUsd": str(size * entry_price * ESTIMATED_TAKER_FEE_RATE),
+        "estimatedSlippageUsd": str(
+            abs(entry_price - reference_price) * size if reference_price and reference_price > 0 else Decimal("0")
+        ),
+        "openedAt": now_iso(),
+        "closedAt": None,
+    }
+    lots.append(lot)
+    return lot
+
+
+def consume_hedge_lot(lot: dict[str, Any], filled_size: Decimal) -> Decimal:
+    """Aplica uma compra reduce-only à parcela LIFO e devolve eventual sobra."""
+    size = decimal(lot.get("size", 0), "parcela")
+    consumed = min(size, max(Decimal("0"), filled_size))
+    remaining = size - consumed
+    lot["size"] = str(remaining)
+    if remaining <= 0:
+        lot["closedAt"] = now_iso()
+    return filled_size - consumed
+
+
+def recovery_reentry_signal(mark: Decimal, recovery_high: Decimal, step: Decimal) -> bool:
+    """Confirma reversão de meia banda usando uma única máxima global."""
+    return (
+        mark > 0
+        and recovery_high > 0
+        and step > 0
+        and mark <= recovery_high * (Decimal("1") - step / Decimal("2"))
+    )
+
+
 def json_safe(value: Any) -> Any:
     if isinstance(value, Decimal):
         return float(value)
@@ -1506,7 +1559,7 @@ class NeutralisMonitor:
     def _load_strategy_state(self) -> dict[str, Any] | None:
         try:
             stored = json.loads(self.strategy_state_file.read_text(encoding="utf-8"))
-            return stored if isinstance(stored, dict) and stored.get("version") == 1 else None
+            return stored if isinstance(stored, dict) and stored.get("version") in {1, 2} else None
         except (OSError, json.JSONDecodeError):
             return None
 
@@ -1526,7 +1579,7 @@ class NeutralisMonitor:
         """
         position = snapshot.get("position") or {}
         payload = {
-            "version": 1,
+            "version": 2,
             "source": self.config.get("source"),
             "positionAddress": position.get("positionAddress"),
             "market": snapshot.get("market"),
@@ -1535,6 +1588,10 @@ class NeutralisMonitor:
             "hedgeRegime": snapshot.get("hedgeRegime"),
             "protectionReference": str(snapshot.get("protectionReference")),
             "realShort": str(snapshot.get("realShort")),
+            "baseShort": str(snapshot.get("baseShort", snapshot.get("realShort", 0))),
+            "hedgeLots": snapshot.get("hedgeLots", []),
+            "recoveryActive": bool(snapshot.get("recoveryActive", False)),
+            "recoveryHigh": str(snapshot.get("recoveryHigh", 0)),
         }
         previous = self.persisted_strategy or {}
         if all(previous.get(key) == value for key, value in payload.items()):
@@ -1793,6 +1850,7 @@ class NeutralisMonitor:
     ) -> dict[str, Any] | None:
         original_position = position.get("positionAddress")
         total_filled = Decimal("0")
+        total_fill_notional = Decimal("0")
         last_direction: bool | None = None
 
         for attempt in count():
@@ -1820,6 +1878,7 @@ class NeutralisMonitor:
                     "currentShort": current_short,
                     "target": target,
                     "anchor": hyp.mark,
+                    "averageFillPrice": total_fill_notional / total_filled if total_filled else hyp.mark,
                 } if total_filled else None
 
             is_buy = difference < 0
@@ -1896,7 +1955,9 @@ class NeutralisMonitor:
                 continue
 
             filled_size = decimal(filled.get("totalSz", size), "quantidade executada")
+            fill_price = decimal(filled.get("avgPx", hyp.mark), "preço executado")
             total_filled += filled_size
+            total_fill_notional += filled_size * fill_price
             last_direction = is_buy
             action = "COMPRAR / reduzir short" if is_buy else "VENDER / aumentar short"
             self._event(
@@ -2133,6 +2194,38 @@ class NeutralisMonitor:
             restored_strategy = self._restore_strategy_state(position, hyp, hedge_strategy) if live else None
             if restored_strategy:
                 hedge_regime, protection_reference = restored_strategy
+            hedge_lots: list[dict[str, Any]] = []
+            recovery_active = False
+            recovery_high = Decimal("0")
+            if live and restored_strategy and self.persisted_strategy and self.persisted_strategy.get("version") == 2:
+                raw_lots = self.persisted_strategy.get("hedgeLots", [])
+                if isinstance(raw_lots, list):
+                    for raw_lot in raw_lots:
+                        if not isinstance(raw_lot, dict):
+                            continue
+                        try:
+                            if decimal(raw_lot.get("size", 0), "parcela") > 0 and decimal(raw_lot.get("entryPrice", 0), "entrada da parcela") > 0:
+                                hedge_lots.append(dict(raw_lot))
+                        except NeutralisError:
+                            continue
+                recovery_active = bool(self.persisted_strategy.get("recoveryActive", False))
+                try:
+                    recovery_high = decimal(self.persisted_strategy.get("recoveryHigh", 0), "máxima da recuperação")
+                except NeutralisError:
+                    recovery_high = Decimal("0")
+            lots_total = sum((decimal(lot["size"], "parcela") for lot in open_hedge_lots(hedge_lots)), Decimal("0"))
+            # A posição real é a fonte de verdade. Uma diferença após execução
+            # manual ou migração fica incorporada ao short-base, nunca cria uma
+            # parcela fictícia que o robô poderia encerrar indevidamente.
+            base_short = max(Decimal("0"), current_short - lots_total)
+            if lots_total > current_short:
+                hedge_lots = []
+                base_short = current_short
+                recovery_active = False
+                recovery_high = Decimal("0")
+                self._event("lot-reconciliation", "Parcelas salvas divergiam do short real; posição real preservada como base")
+            recovery_candidate_id: str | None = None
+            recovery_confirmation_count = 0
             regime_confirmation: str | None = None
             regime_confirmation_count = 0
             initial_adjusted = False
@@ -2146,7 +2239,10 @@ class NeutralisMonitor:
                 elif upside_hedge_signal(hedge_regime, hyp.mark, protection_reference, step) == "close":
                     initial_target = current_short
             initial_residual = abs(initial_target - current_short) * hyp.mark
-            if live and initial_residual >= AUTO_MIN_ORDER_NOTIONAL:
+            restored_lot_reduction = bool(
+                restored_strategy and open_hedge_lots(hedge_lots) and initial_target < current_short
+            )
+            if live and initial_residual >= AUTO_MIN_ORDER_NOTIONAL and not restored_lot_reduction:
                 self._event(
                     "initial-reconciliation",
                     f"CORRIGIR DELTA INICIAL · residual US$ {initial_residual:.2f}",
@@ -2156,11 +2252,24 @@ class NeutralisMonitor:
                 )
                 result = self._execute_auto_adjustment(position, hyp, initial_target)
                 initial_adjusted = bool(result)
+                initial_difference = initial_target - current_short
                 position, hyp, lower, upper, liquidity, target = self._retry_snapshot()
                 lp_price = decimal(position.get("currentPrice") or hyp.mark, "preço da LP")
                 lp_anchor = lp_price
                 hyp_anchor = hyp.mark
                 ratio_anchor = lp_anchor / hyp_anchor
+                if result and initial_difference > 0 and restored_strategy:
+                    add_hedge_lot(
+                        hedge_lots,
+                        decimal(result["filled"], "execução da parcela"),
+                        decimal(result.get("averageFillPrice", hyp.mark), "preço executado"),
+                        hyp.mark,
+                    )
+                else:
+                    base_short = abs(min(hyp.signed_position, Decimal("0")))
+                    hedge_lots = []
+                    recovery_active = False
+                    recovery_high = Decimal("0")
             initial_signed = hyp.signed_position
             virtual_short = abs(min(initial_signed, Decimal("0")))
             quantum = Decimal(1).scaleb(-hyp.decimals)
@@ -2188,6 +2297,11 @@ class NeutralisMonitor:
                 "hedgeStrategy": hedge_strategy,
                 "hedgeRegime": hedge_regime,
                 "protectionReference": protection_reference,
+                "baseShort": base_short,
+                "hedgeLots": hedge_lots,
+                "openLotCount": len(open_hedge_lots(hedge_lots)),
+                "recoveryActive": recovery_active,
+                "recoveryHigh": recovery_high,
                 "closeThreshold": protection_reference * (Decimal("1") + step),
                 "openThreshold": protection_reference * (
                     Decimal("1") - step / Decimal("2")
@@ -2285,6 +2399,16 @@ class NeutralisMonitor:
                                 reference=protection_reference,
                                 stepPercent=step * 100,
                             )
+                        if signal == "close":
+                            base_short = Decimal("0")
+                            hedge_lots = []
+                            recovery_active = False
+                            recovery_high = Decimal("0")
+                        elif signal == "open":
+                            base_short = abs(min(hyp_now.signed_position, Decimal("0"))) if live else virtual_short
+                            hedge_lots = []
+                            recovery_active = False
+                            recovery_high = Decimal("0")
                         hedge_regime = "upside" if signal in {"close", "confirm_upside"} else "protected"
                         if signal == "open":
                             protection_reference = (
@@ -2312,6 +2436,84 @@ class NeutralisMonitor:
                         # Exibição e cálculo de pendência devem refletir que,
                         # nestes regimes, o alvo deliberado é zero.
                         target = Decimal("0")
+                lot_action_performed = False
+                # As vendas adicionais feitas durante a queda são parcelas
+                # internas. Na recuperação, somente a parcela mais recente
+                # elegível é reduzida (LIFO), perto do próprio preço de
+                # execução, após 30 segundos de confirmação.
+                if hedge_regime == "protected" and open_hedge_lots(hedge_lots):
+                    newest_lot = open_hedge_lots(hedge_lots)[-1]
+                    lot_entry = decimal(newest_lot["entryPrice"], "entrada da parcela")
+                    eligible = hyp_now.mark >= lot_entry
+                    lot_id = str(newest_lot.get("id", ""))
+                    if eligible and recovery_candidate_id == lot_id:
+                        recovery_confirmation_count += 1
+                    elif eligible:
+                        recovery_candidate_id = lot_id
+                        recovery_confirmation_count = 1
+                    else:
+                        recovery_candidate_id = None
+                        recovery_confirmation_count = 0
+                    if eligible and recovery_confirmation_count >= RECOVERY_CONFIRMATION_READINGS:
+                        lot_size = decimal(newest_lot["size"], "parcela")
+                        current_for_lots = abs(min(hyp_now.signed_position, Decimal("0"))) if live else virtual_short
+                        close_target = max(Decimal("0"), current_for_lots - lot_size)
+                        if live:
+                            result = self._execute_auto_adjustment(position_now, hyp_now, close_target)
+                            if result:
+                                consume_hedge_lot(newest_lot, decimal(result["filled"], "execução da parcela"))
+                                virtual_short = result["currentShort"]
+                        else:
+                            consume_hedge_lot(newest_lot, lot_size)
+                            virtual_short = close_target
+                        self._event(
+                            "lot-recovery",
+                            f"PARCELA RECUPERADA · reduzir short {lot_size} {position_now['hedgeSymbol']}",
+                            size=lot_size,
+                            entryPrice=lot_entry,
+                            mark=hyp_now.mark,
+                            live=live,
+                        )
+                        recovery_active = True
+                        recovery_high = hyp_now.mark
+                        recovery_candidate_id = None
+                        recovery_confirmation_count = 0
+                        lot_action_performed = True
+
+                # Depois de reduzir uma ou mais parcelas, uma reversão de
+                # metade do gatilho a partir da máxima da recuperação recompõe
+                # TODO o delta faltante em uma única ordem. A referência é
+                # global, portanto o risco de meia banda nunca se acumula.
+                if hedge_regime == "protected" and recovery_active and not lot_action_performed:
+                    recovery_high = max(recovery_high, hyp_now.mark)
+                    if recovery_reentry_signal(hyp_now.mark, recovery_high, step):
+                        current_for_reentry = abs(min(hyp_now.signed_position, Decimal("0"))) if live else virtual_short
+                        missing = max(Decimal("0"), target - current_for_reentry)
+                        if missing * hyp_now.mark >= AUTO_MIN_ORDER_NOTIONAL:
+                            if live:
+                                result = self._execute_auto_adjustment(position_now, hyp_now, target)
+                                if result:
+                                    add_hedge_lot(
+                                        hedge_lots,
+                                        decimal(result["filled"], "execução da parcela"),
+                                        decimal(result.get("averageFillPrice", hyp_now.mark), "preço executado"),
+                                        hyp_now.mark,
+                                    )
+                                    virtual_short = result["currentShort"]
+                            else:
+                                add_hedge_lot(hedge_lots, missing, hyp_now.mark)
+                                virtual_short += missing
+                            self._event(
+                                "lot-reentry",
+                                f"REVERSÃO · recompor todo o delta faltante de {missing} {position_now['hedgeSymbol']}",
+                                missing=missing,
+                                recoveryHigh=recovery_high,
+                                mark=hyp_now.mark,
+                                live=live,
+                            )
+                        recovery_active = False
+                        recovery_high = Decimal("0")
+                        lot_action_performed = True
                 # A saída inferior deixa a LP 100% no ativo. O hedge segue
                 # normalmente, mas o aviso é útil para o usuário reavaliar a
                 # faixa. Só avisamos na transição para não gerar spam a cada
@@ -2341,6 +2543,10 @@ class NeutralisMonitor:
                         virtual_short = Decimal("0")
                     if not awaiting_upper_reentry:
                         awaiting_upper_reentry = True
+                        base_short = Decimal("0")
+                        hedge_lots = []
+                        recovery_active = False
+                        recovery_high = Decimal("0")
                         if hedge_strategy == "upside":
                             hedge_regime = "upside"
                         self._event(
@@ -2370,8 +2576,10 @@ class NeutralisMonitor:
                         result = self._execute_auto_adjustment(position_now, hyp_now, target)
                         if result:
                             virtual_short = result["currentShort"]
+                            base_short = result["currentShort"]
                     elif hedge_strategy == "neutral" or hedge_regime == "protected":
                         virtual_short = target
+                        base_short = target
                     else:
                         target = Decimal("0")
                     lp_anchor, hyp_anchor, anchor = projected_lp_price, hyp_now.mark, projected_lp_price
@@ -2380,15 +2588,29 @@ class NeutralisMonitor:
                 if abs(movement) >= step and (
                     hedge_strategy == "neutral"
                     or (hedge_regime == "protected" and regime_confirmation_count == 0)
-                ):
+                ) and not recovery_active and not lot_action_performed:
                     current_short = abs(min(hyp_now.signed_position, Decimal("0")))
                     difference = target - (current_short if live else virtual_short)
                     size = abs(difference).quantize(quantum, rounding=ROUND_DOWN)
                     notional = size * hyp_now.mark
-                    if size > 0 and notional >= AUTO_MIN_ORDER_NOTIONAL:
+                    # Uma redução correspondente a parcelas abertas espera a
+                    # recuperação até o preço de entrada delas. Isso substitui
+                    # a recompra automática uma banda acima, responsável pela
+                    # perda repetida nas violinadas.
+                    lot_managed_reduction = difference < 0 and bool(open_hedge_lots(hedge_lots))
+                    if size > 0 and notional >= AUTO_MIN_ORDER_NOTIONAL and not lot_managed_reduction:
                         if live:
                             result = self._execute_auto_adjustment(position_now, hyp_now, target)
                             if result:
+                                if difference > 0:
+                                    add_hedge_lot(
+                                        hedge_lots,
+                                        decimal(result["filled"], "execução da parcela"),
+                                        decimal(result.get("averageFillPrice", hyp_now.mark), "preço executado"),
+                                        hyp_now.mark,
+                                    )
+                                else:
+                                    base_short = result["currentShort"]
                                 virtual_short = result["currentShort"]
                                 # Conserva o preço projetado no próximo
                                 # degrau, mesmo que o tick Orca ainda esteja
@@ -2404,6 +2626,10 @@ class NeutralisMonitor:
                             action = "VENDER" if difference > 0 else "COMPRAR"
                             before = virtual_short
                             virtual_short = virtual_short + size if difference > 0 else max(Decimal("0"), virtual_short - size)
+                            if difference > 0:
+                                add_hedge_lot(hedge_lots, size, hyp_now.mark)
+                            else:
+                                base_short = virtual_short
                             self._event("adjustment", f"SIMULAR {action} {size} {position['hedgeSymbol']}", size=size, before=before, after=virtual_short, target=target, mark=hyp_now.mark)
                             lp_anchor = projected_lp_price
                             hyp_anchor = hyp_now.mark
@@ -2412,7 +2638,7 @@ class NeutralisMonitor:
                             movement = Decimal("0")
                             projected_lp_price = lp_anchor
                             basis_from_anchor = Decimal("0")
-                    elif size > 0:
+                    elif size > 0 and not lot_managed_reduction:
                         self._event("below-minimum", f"Ajuste de US$ {notional:.2f} aguardando próximo nível", size=size, target=target, mark=hyp_now.mark)
 
                 snapshot = {
@@ -2438,6 +2664,11 @@ class NeutralisMonitor:
                     "hedgeStrategy": hedge_strategy,
                     "hedgeRegime": hedge_regime,
                     "protectionReference": protection_reference,
+                    "baseShort": base_short,
+                    "hedgeLots": hedge_lots,
+                    "openLotCount": len(open_hedge_lots(hedge_lots)),
+                    "recoveryActive": recovery_active,
+                    "recoveryHigh": recovery_high,
                     "closeThreshold": protection_reference * (Decimal("1") + step),
                     "live": live,
                     "pendingNotional": abs(target - (abs(min(hyp_now.signed_position, Decimal('0'))) if live else virtual_short)) * hyp_now.mark,

@@ -938,6 +938,81 @@ class NeutralisTests(unittest.TestCase):
 
         self.assertEqual(restored, ("upside", Decimal("42.75")))
 
+    def test_strategy_state_persists_lots_and_global_recovery_reference(self):
+        monitor = server.NeutralisMonitor("lot-persistence")
+        monitor.config = {
+            **monitor.config,
+            "source": "orca",
+            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "hedgeStrategy": "upside",
+        }
+        lot = {"id": "lot-1", "size": "2.5", "entryPrice": "99", "openedAt": "now", "closedAt": None}
+        monitor._persist_strategy_state({
+            "position": {"positionAddress": "position"},
+            "market": "NEAR",
+            "hedgeStrategy": "upside",
+            "hedgeRegime": "protected",
+            "protectionReference": Decimal("100"),
+            "realShort": Decimal("12.5"),
+            "baseShort": Decimal("10"),
+            "hedgeLots": [lot],
+            "recoveryActive": True,
+            "recoveryHigh": Decimal("101.25"),
+        })
+
+        self.assertEqual(monitor.persisted_strategy["version"], 2)
+        self.assertEqual(monitor.persisted_strategy["hedgeLots"], [lot])
+        self.assertEqual(monitor.persisted_strategy["recoveryHigh"], "101.25")
+
+    def test_lot_is_consumed_without_affecting_other_lots(self):
+        lots = []
+        first = server.add_hedge_lot(lots, Decimal("3"), Decimal("99"))
+        second = server.add_hedge_lot(lots, Decimal("2"), Decimal("98"))
+
+        server.consume_hedge_lot(second, Decimal("2"))
+
+        self.assertEqual(len(server.open_hedge_lots(lots)), 1)
+        self.assertIs(server.open_hedge_lots(lots)[0], first)
+        self.assertIsNotNone(second["closedAt"])
+
+    def test_reentry_uses_one_global_half_trigger_and_does_not_accumulate(self):
+        step = Decimal("0.01")
+        high = Decimal("102")
+        self.assertFalse(server.recovery_reentry_signal(Decimal("101.50"), high, step))
+        self.assertTrue(server.recovery_reentry_signal(Decimal("101.49"), high, step))
+        # Depois da recomposição o estado é zerado; quedas adicionais não
+        # somam novas meias bandas sem uma nova parcela recuperada.
+        self.assertFalse(server.recovery_reentry_signal(Decimal("100"), Decimal("0"), step))
+
+    def test_incremental_lot_waits_30_seconds_then_closes_near_its_entry(self):
+        position = {
+            "positionAddress": "position", "hedgeSymbol": "NEAR", "currentPrice": Decimal("100"),
+            "hedgeMode": "units",
+        }
+        initial = server.HypState("NEAR", 3, Decimal("100"), Decimal("100"), Decimal("-10"), 0, entry_price=Decimal("100"))
+        falling = server.HypState("NEAR", 3, Decimal("99"), Decimal("99"), Decimal("-10"), 0, entry_price=Decimal("100"))
+        recovering = server.HypState("NEAR", 3, Decimal("99"), Decimal("99"), Decimal("-10"), 0, entry_price=Decimal("100"))
+        snapshots = [
+            (position, initial, Decimal("80"), Decimal("120"), Decimal("60"), Decimal("10")),
+            (position, falling, Decimal("80"), Decimal("120"), Decimal("60"), Decimal("12")),
+            *[(position, recovering, Decimal("80"), Decimal("120"), Decimal("60"), Decimal("10")) for _ in range(server.RECOVERY_CONFIRMATION_READINGS)],
+        ]
+        original = dict(server.MONITOR.config)
+        events = []
+        try:
+            server.MONITOR.config = {**original, "hedgeStrategy": "upside", "stepPercent": "1"}
+            with patch.object(server.MONITOR, "_retry_snapshot", side_effect=snapshots), patch.object(
+                server.MONITOR.stop_event, "wait", side_effect=[False] * (1 + server.RECOVERY_CONFIRMATION_READINGS) + [True]
+            ), patch.object(
+                server, "target_at_reference_price", side_effect=[Decimal("12")] + [Decimal("10")] * server.RECOVERY_CONFIRMATION_READINGS
+            ), patch.object(server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)):
+                server.MONITOR._run(live=False)
+            self.assertEqual(server.MONITOR.state["snapshot"]["openLotCount"], 0)
+            self.assertTrue(server.MONITOR.state["snapshot"]["recoveryActive"])
+            self.assertIn("lot-recovery", events)
+        finally:
+            server.MONITOR.config = original
+
     def test_strategy_state_reconciles_against_real_hyperliquid_position(self):
         monitor = server.NeutralisMonitor("reconciliation")
         monitor.config = {
