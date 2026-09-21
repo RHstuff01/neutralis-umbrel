@@ -64,8 +64,6 @@ AUTO_MIN_ORDER_NOTIONAL = Decimal("10")
 ESTIMATED_TAKER_FEE_RATE = Decimal("0.00045")
 AUTO_POLL_SECONDS = 2
 AUTO_RETRY_SECONDS = 1
-RECOVERY_CONFIRMATION_SECONDS = 30
-RECOVERY_CONFIRMATION_READINGS = max(1, math.ceil(RECOVERY_CONFIRMATION_SECONDS / AUTO_POLL_SECONDS))
 # O short-base é encerrado pouco abaixo do próprio preço médio. A margem busca
 # cobrir taxa/spread e impede que a recompra programada transforme a recuperação
 # em perda deliberada do short.
@@ -1478,6 +1476,7 @@ def upside_hedge_signal(
     operation_reference: Decimal,
     step: Decimal,
     short_entry_price: Decimal | None = None,
+    base_recovery_armed: bool = False,
 ) -> str | None:
     """Indica a troca de regime da estratégia de participação na alta.
 
@@ -1491,9 +1490,9 @@ def upside_hedge_signal(
     """
     if mark <= 0 or operation_reference <= 0 or step <= 0:
         return None
-    if regime == "protected" and short_entry_price and short_entry_price > 0:
+    if regime == "protected" and base_recovery_armed and short_entry_price and short_entry_price > 0:
         close_floor = short_entry_price * (Decimal("1") - BASE_RECOVERY_EXIT_BUFFER)
-        if close_floor <= mark <= short_entry_price:
+        if mark >= close_floor:
             return "close"
     if regime == "upside" and mark <= operation_reference:
         return "wait"
@@ -1530,7 +1529,8 @@ def add_hedge_lot(
         ),
         "openedAt": now_iso(),
         "closedAt": None,
-        "recoveryArmed": False,
+        "recoveryArmed": True,
+        "recoveryForceClose": False,
     }
     lots.append(lot)
     return lot
@@ -1607,7 +1607,7 @@ class NeutralisMonitor:
     def _load_strategy_state(self) -> dict[str, Any] | None:
         try:
             stored = json.loads(self.strategy_state_file.read_text(encoding="utf-8"))
-            return stored if isinstance(stored, dict) and stored.get("version") in {1, 2, 3} else None
+            return stored if isinstance(stored, dict) and stored.get("version") in {1, 2, 3, 4, 5} else None
         except (OSError, json.JSONDecodeError):
             return None
 
@@ -1632,7 +1632,7 @@ class NeutralisMonitor:
             return
         position = snapshot.get("position") or {}
         payload = {
-            "version": 3,
+            "version": 5,
             "source": self.config.get("source"),
             "positionAddress": position.get("positionAddress"),
             "market": snapshot.get("market"),
@@ -1642,6 +1642,8 @@ class NeutralisMonitor:
             "protectionReference": str(snapshot.get("protectionReference")),
             "realShort": str(snapshot.get("realShort")),
             "baseShort": str(snapshot.get("baseShort", snapshot.get("realShort", 0))),
+            "baseRecoveryArmed": bool(snapshot.get("baseRecoveryArmed", False)),
+            "baseRecoveryForceClose": bool(snapshot.get("baseRecoveryForceClose", False)),
             "hedgeLots": snapshot.get("hedgeLots", []),
             "recoveryActive": bool(snapshot.get("recoveryActive", False)),
             "recoveryHigh": str(snapshot.get("recoveryHigh", 0)),
@@ -1682,6 +1684,26 @@ class NeutralisMonitor:
             return None
         if regime not in {"protected", "upside", "initial_wait", "direction_wait"} or reference <= 0:
             return None
+        # Migração pontual da operação NEAR que já estava aberta
+        # quando a referência fixa passou a ser persistida. O estado antigo
+        # registrou 4,10, mas a referência correta desta operação é 4,20.
+        # A versão 5 gravada logo depois impede que a correção se repita ou
+        # afete uma operação futura que legitimamente comece perto de 4,10.
+        state_version = int(stored.get("version", 1))
+        if (
+            state_version <= 4
+            and hyp.market.upper() == "NEAR"
+            and reference.quantize(Decimal("0.01")) == Decimal("4.10")
+        ):
+            previous_reference = reference
+            reference = Decimal("4.20")
+            self._event(
+                "reference-correction",
+                "Referência inicial da operação NEAR corrigida uma única vez para US$ 4,20",
+                previousReference=previous_reference,
+                reference=reference,
+                market=hyp.market,
+            )
         actual_is_protected = hyp.signed_position < 0
         saved_is_protected = regime == "protected"
         if saved_is_protected != actual_is_protected:
@@ -1908,6 +1930,7 @@ class NeutralisMonitor:
         total_filled = Decimal("0")
         total_fill_notional = Decimal("0")
         last_direction: bool | None = None
+        margin_size_cap: Decimal | None = None
 
         for attempt in count():
             if attempt:
@@ -1923,6 +1946,8 @@ class NeutralisMonitor:
             quantum = Decimal(1).scaleb(-hyp.decimals)
             difference = target - current_short
             size = abs(difference).quantize(quantum, rounding=ROUND_DOWN)
+            if margin_size_cap is not None and difference > 0:
+                size = min(size, margin_size_cap).quantize(quantum, rounding=ROUND_DOWN)
             residual_notional = abs(difference) * hyp.mark
             if size <= 0 or residual_notional < AUTO_MIN_ORDER_NOTIONAL:
                 return {
@@ -1976,6 +2001,46 @@ class NeutralisMonitor:
                 # IOC sem contraparte. Ambas devem seguir para o próximo
                 # limite mais agressivo, e não pausar o hedge de imediato.
                 error_text = str(error).upper()
+                insufficient_margin = "INSUFFICIENT MARGIN" in error_text
+                if insufficient_margin and not is_buy:
+                    # Não pause todo o monitor por falta de margem. Reduza a
+                    # ordem progressivamente até encontrar o tamanho aceito.
+                    # Se nem a ordem mínima couber, mantenha o robô vivo para
+                    # tentar novamente no próximo ciclo ou após novo depósito.
+                    margin_size_cap = (size / Decimal("2")).quantize(quantum, rounding=ROUND_DOWN)
+                    if margin_size_cap <= 0 or margin_size_cap * hyp.mark < AUTO_MIN_ORDER_NOTIONAL:
+                        self._event(
+                            "margin-limited",
+                            "Margem insuficiente; ajuste pendente e monitor mantido ativo",
+                            requestedSize=size,
+                            target=target,
+                            mark=hyp.mark,
+                            residualNotional=residual_notional,
+                        )
+                        if total_filled:
+                            return {
+                                "size": total_filled,
+                                "notional": total_fill_notional,
+                                "isBuy": last_direction,
+                                "filled": total_filled,
+                                "residualNotional": residual_notional,
+                                "currentShort": current_short,
+                                "target": target,
+                                "anchor": hyp.mark,
+                                "averageFillPrice": total_fill_notional / total_filled,
+                            }
+                        return None
+                    self._event(
+                        "margin-retry",
+                        f"Margem insuficiente; tentando ordem menor de {margin_size_cap} {position['hedgeSymbol']}",
+                        requestedSize=size,
+                        reducedSize=margin_size_cap,
+                        target=target,
+                        mark=hyp.mark,
+                    )
+                    if self.stop_event.wait(AUTO_RETRY_SECONDS):
+                        raise NeutralisError("Monitor interrompido durante o ajuste")
+                    continue
                 retryable = (
                     "IOC" in error_text
                     or "IOCCANCEL" in error_text
@@ -2258,7 +2323,30 @@ class NeutralisMonitor:
             hedge_lots: list[dict[str, Any]] = []
             recovery_active = False
             recovery_high = Decimal("0")
-            if live and restored_strategy and self.persisted_strategy and self.persisted_strategy.get("version") in {2, 3}:
+            base_recovery_armed = False
+            base_recovery_force_close = False
+            if live and restored_strategy and self.persisted_strategy:
+                state_version = int(self.persisted_strategy.get("version", 1))
+                # Estados antigos não registravam a passagem do short-base
+                # abaixo do piso. Uma posição protegida já existente migra
+                # armada para encerrar imediatamente uma recuperação perdida.
+                base_recovery_armed = (
+                    bool(self.persisted_strategy.get("baseRecoveryArmed", False))
+                    if state_version >= 4
+                    else hedge_regime == "protected" and current_short > 0
+                )
+                base_recovery_force_close = (
+                    bool(self.persisted_strategy.get("baseRecoveryForceClose", False))
+                    if state_version >= 4
+                    else hedge_regime == "protected" and current_short > 0
+                )
+            if (
+                hedge_regime == "protected"
+                and hyp.entry_price > 0
+                and hyp.mark < hyp.entry_price * (Decimal("1") - BASE_RECOVERY_EXIT_BUFFER)
+            ):
+                base_recovery_armed = True
+            if live and restored_strategy and self.persisted_strategy and self.persisted_strategy.get("version") in {2, 3, 4, 5}:
                 raw_lots = self.persisted_strategy.get("hedgeLots", [])
                 if isinstance(raw_lots, list):
                     for raw_lot in raw_lots:
@@ -2273,6 +2361,9 @@ class NeutralisMonitor:
                                 # a atualização que interrompeu o cruzamento.
                                 if "recoveryArmed" not in migrated_lot:
                                     migrated_lot["recoveryArmed"] = True
+                                    migrated_lot["recoveryForceClose"] = True
+                                elif "recoveryForceClose" not in migrated_lot:
+                                    migrated_lot["recoveryForceClose"] = False
                                 hedge_lots.append(migrated_lot)
                         except NeutralisError:
                             continue
@@ -2303,7 +2394,12 @@ class NeutralisMonitor:
                 if hedge_regime in {"upside", "initial_wait", "direction_wait"}:
                     initial_target = Decimal("0")
                 elif upside_hedge_signal(
-                    hedge_regime, hyp.mark, protection_reference, step, hyp.entry_price
+                    hedge_regime,
+                    hyp.mark,
+                    protection_reference,
+                    step,
+                    hyp.entry_price,
+                    base_recovery_armed and base_recovery_force_close,
                 ) == "close":
                     initial_target = current_short
             initial_residual = abs(initial_target - current_short) * hyp.mark
@@ -2368,6 +2464,8 @@ class NeutralisMonitor:
                 "protectionDistancePercent": (hyp.mark / protection_reference - Decimal("1")) * Decimal("100"),
                 **principal_metrics(position, self.config.get("initialPrincipalUsd", "")),
                 "baseShort": base_short,
+                "baseRecoveryArmed": base_recovery_armed,
+                "baseRecoveryForceClose": base_recovery_force_close,
                 "hedgeLots": hedge_lots,
                 "openLotCount": len(open_hedge_lots(hedge_lots)),
                 "recoveryActive": recovery_active,
@@ -2434,8 +2532,18 @@ class NeutralisMonitor:
                 target = target_at_reference_price(position_now, liquidity, projected_lp_price, lower, upper, hyp_now.mark)
                 full_hedge_target = target
                 if hedge_strategy == "upside":
+                    if hedge_regime == "protected" and hyp_now.entry_price > 0:
+                        base_close_floor = hyp_now.entry_price * (Decimal("1") - BASE_RECOVERY_EXIT_BUFFER)
+                        if hyp_now.mark < base_close_floor:
+                            base_recovery_armed = True
                     signal = upside_hedge_signal(
-                        hedge_regime, hyp_now.mark, protection_reference, step, hyp_now.entry_price
+                        hedge_regime,
+                        hyp_now.mark,
+                        protection_reference,
+                        step,
+                        hyp_now.entry_price,
+                        base_recovery_armed
+                        and (base_recovery_force_close or hyp_now.mark > previous_hyp_mark),
                     )
                     # Depois de zerar o short-base, a reentrada é controlada
                     # exclusivamente pela reversão de meia banda desde a máxima
@@ -2459,10 +2567,10 @@ class NeutralisMonitor:
                         regime_confirmation = signal
                         regime_confirmation_count = 1
 
-                    # Abrir/voltar à espera exige duas leituras. Encerrar o
-                    # short-base próximo da referência exige 30 segundos para
-                    # não reagir a uma violinada curta.
-                    required_confirmation = RECOVERY_CONFIRMATION_READINGS if signal == "close" else 2
+                    # Abrir/voltar à espera exige duas leituras. O short-base
+                    # armado encerra na primeira recuperação observada para
+                    # não deixar o prejuízo crescer enquanto o ativo sobe.
+                    required_confirmation = 1 if signal == "close" else 2
                     if signal and regime_confirmation_count >= required_confirmation:
                         next_target = Decimal("0") if signal in {"close", "confirm_upside", "wait"} else target
                         if live:
@@ -2489,11 +2597,15 @@ class NeutralisMonitor:
                             )
                         if signal == "close":
                             base_short = Decimal("0")
+                            base_recovery_armed = False
+                            base_recovery_force_close = False
                             hedge_lots = []
                             recovery_active = True
                             recovery_high = hyp_now.mark
                         elif signal == "open":
                             base_short = abs(min(hyp_now.signed_position, Decimal("0"))) if live else virtual_short
+                            base_recovery_armed = True
+                            base_recovery_force_close = False
                             hedge_lots = []
                             recovery_active = False
                             recovery_high = Decimal("0")
@@ -2552,9 +2664,10 @@ class NeutralisMonitor:
                     # dentro da faixa lucrativa, encerre a parcela sem esperar
                     # um novo mergulho. Acima da entrada, somente um cruzamento
                     # observado nesta execução autoriza a saída.
-                    eligible = (
-                        bool(newest_lot.get("recoveryArmed")) and hyp_now.mark >= lot_close_floor
-                    ) or crossed_recovery
+                    eligible = bool(newest_lot.get("recoveryArmed")) and hyp_now.mark >= lot_close_floor and (
+                        bool(newest_lot.get("recoveryForceClose")) or hyp_now.mark > previous_hyp_mark
+                    )
+                    eligible = eligible or crossed_recovery
                     lot_id = str(newest_lot.get("id", ""))
                     if eligible:
                         lot_size = decimal(newest_lot["size"], "parcela")
@@ -2598,6 +2711,8 @@ class NeutralisMonitor:
                                     virtual_short = result["currentShort"]
                                     if hedge_regime == "upside":
                                         base_short = result["currentShort"]
+                                        base_recovery_armed = True
+                                        base_recovery_force_close = False
                                         hedge_lots = []
                                         reentry_completed = True
                                     else:
@@ -2610,6 +2725,8 @@ class NeutralisMonitor:
                             else:
                                 if hedge_regime == "upside":
                                     base_short = full_hedge_target
+                                    base_recovery_armed = True
+                                    base_recovery_force_close = False
                                     hedge_lots = []
                                     reentry_completed = True
                                 else:
@@ -2659,6 +2776,8 @@ class NeutralisMonitor:
                     if not awaiting_upper_reentry:
                         awaiting_upper_reentry = True
                         base_short = Decimal("0")
+                        base_recovery_armed = False
+                        base_recovery_force_close = False
                         hedge_lots = []
                         recovery_active = False
                         recovery_high = Decimal("0")
@@ -2782,6 +2901,8 @@ class NeutralisMonitor:
                     "protectionDistancePercent": (hyp_now.mark / protection_reference - Decimal("1")) * Decimal("100"),
                     **principal_metrics(position_now, self.config.get("initialPrincipalUsd", "")),
                     "baseShort": base_short,
+                    "baseRecoveryArmed": base_recovery_armed,
+                    "baseRecoveryForceClose": base_recovery_force_close,
                     "hedgeLots": hedge_lots,
                     "openLotCount": len(open_hedge_lots(hedge_lots)),
                     "recoveryActive": recovery_active,
