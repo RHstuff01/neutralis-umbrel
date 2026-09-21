@@ -1046,27 +1046,38 @@ class NeutralisTests(unittest.TestCase):
         # somam novas meias bandas sem uma nova parcela recuperada.
         self.assertFalse(server.recovery_reentry_signal(Decimal("100"), Decimal("0"), step))
 
-    def test_incremental_lot_waits_30_seconds_then_closes_near_its_entry(self):
+    def test_lot_recovery_crosses_exit_floor_only_on_the_way_up(self):
+        entry = Decimal("3.9754")
+        floor = entry * (Decimal("1") - server.BASE_RECOVERY_EXIT_BUFFER)
+
+        self.assertTrue(server.lot_recovery_crossed(floor - Decimal("0.0001"), floor, entry))
+        self.assertTrue(server.lot_recovery_crossed(Decimal("3.96"), Decimal("3.99"), entry))
+        self.assertFalse(server.lot_recovery_crossed(Decimal("4.00"), Decimal("3.97"), entry))
+        self.assertFalse(server.lot_recovery_crossed(Decimal("3.96"), Decimal("3.97"), entry))
+
+    def test_incremental_lot_closes_on_first_upward_crossing(self):
         position = {
             "positionAddress": "position", "hedgeSymbol": "NEAR", "currentPrice": Decimal("100"),
             "hedgeMode": "units",
         }
         initial = server.HypState("NEAR", 3, Decimal("100"), Decimal("100"), Decimal("-10"), 0, entry_price=Decimal("100"))
         falling = server.HypState("NEAR", 3, Decimal("99"), Decimal("99"), Decimal("-10"), 0, entry_price=Decimal("100"))
+        deeper = server.HypState("NEAR", 3, Decimal("98.5"), Decimal("98.5"), Decimal("-10"), 0, entry_price=Decimal("99"))
         recovering = server.HypState("NEAR", 3, Decimal("99"), Decimal("99"), Decimal("-10"), 0, entry_price=Decimal("100"))
         snapshots = [
             (position, initial, Decimal("80"), Decimal("120"), Decimal("60"), Decimal("10")),
             (position, falling, Decimal("80"), Decimal("120"), Decimal("60"), Decimal("12")),
-            *[(position, recovering, Decimal("80"), Decimal("120"), Decimal("60"), Decimal("10")) for _ in range(server.RECOVERY_CONFIRMATION_READINGS)],
+            (position, deeper, Decimal("80"), Decimal("120"), Decimal("60"), Decimal("12")),
+            (position, recovering, Decimal("80"), Decimal("120"), Decimal("60"), Decimal("10")),
         ]
         original = dict(server.MONITOR.config)
         events = []
         try:
             server.MONITOR.config = {**original, "hedgeStrategy": "upside", "stepPercent": "1"}
             with patch.object(server.MONITOR, "_retry_snapshot", side_effect=snapshots), patch.object(
-                server.MONITOR.stop_event, "wait", side_effect=[False] * (1 + server.RECOVERY_CONFIRMATION_READINGS) + [True]
+                server.MONITOR.stop_event, "wait", side_effect=[False, False, False, True]
             ), patch.object(
-                server, "target_at_reference_price", side_effect=[Decimal("12")] + [Decimal("10")] * server.RECOVERY_CONFIRMATION_READINGS
+                server, "target_at_reference_price", side_effect=[Decimal("12"), Decimal("12"), Decimal("10")]
             ), patch.object(server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)):
                 server.MONITOR._run(live=False)
             self.assertEqual(server.MONITOR.state["snapshot"]["openLotCount"], 0)

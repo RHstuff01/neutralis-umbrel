@@ -4,7 +4,7 @@ name: Neutralis Hedge
 tagline: Hedge dinâmico protegido para LPs RWA
 icon: https://neutralis-rwa-hedge.rafaelherzer.chatgpt.site/favicon.svg
 category: finance
-version: "0.8.43"
+version: "0.8.44"
 port: 8787
 description: >-
   Monitora uma posição de liquidez concentrada na Byreal, Raydium, Orca ou Uniswap V3/V4 e a posição
@@ -17,7 +17,7 @@ submission: https://github.com/getumbrel/umbrel-community-app-store
 repo: https://github.com/getumbrel/umbrel-community-app-store
 support: https://github.com/getumbrel/umbrel-community-app-store/issues
 gallery: []
-releaseNotes: Fecha shorts até 0,10% abaixo da entrada e recompõe o hedge após reversão de meia banda desde a máxima da recuperação.
+releaseNotes: Fecha cada parcela no primeiro cruzamento ascendente de 0,10% abaixo da entrada, mesmo quando o preço atravessa rapidamente a faixa.
 dependencies: []
 path: ""
 defaultUsername: ""

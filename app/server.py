@@ -1546,6 +1546,20 @@ def consume_hedge_lot(lot: dict[str, Any], filled_size: Decimal) -> Decimal:
     return filled_size - consumed
 
 
+def lot_recovery_crossed(previous_mark: Decimal, mark: Decimal, entry_price: Decimal) -> bool:
+    """Fecha a parcela no primeiro cruzamento ascendente de sua saída.
+
+    O preço pode atravessar a faixa de 0,10% entre duas consultas. Por isso,
+    não exigimos permanência dentro dela: basta vir de baixo e alcançar ou
+    ultrapassar o piso de saída. Uma passagem descendente nunca dispara a
+    recompra, preservando o hedge durante a queda.
+    """
+    if previous_mark <= 0 or mark <= 0 or entry_price <= 0:
+        return False
+    close_floor = entry_price * (Decimal("1") - BASE_RECOVERY_EXIT_BUFFER)
+    return previous_mark < close_floor <= mark
+
+
 def recovery_reentry_signal(mark: Decimal, recovery_high: Decimal, step: Decimal) -> bool:
     """Confirma reversão de meia banda usando uma única máxima global."""
     return (
@@ -2270,8 +2284,6 @@ class NeutralisMonitor:
                 recovery_active = False
                 recovery_high = Decimal("0")
                 self._event("lot-reconciliation", "Parcelas salvas divergiam do short real; posição real preservada como base")
-            recovery_candidate_id: str | None = None
-            recovery_confirmation_count = 0
             regime_confirmation: str | None = None
             regime_confirmation_count = 0
             initial_adjusted = False
@@ -2388,6 +2400,7 @@ class NeutralisMonitor:
             self._event("start-live" if live else "start", start_message, mark=hyp.mark, lpPrice=lp_price, lower=lower, upper=upper, anchor=anchor, hedgeRatio=ratio_anchor)
             awaiting_upper_reentry = False
             below_range = lp_price <= lower
+            previous_hyp_mark = hyp.mark
 
             while not self.stop_event.wait(AUTO_POLL_SECONDS):
                 position_now, hyp_now, lower, upper, liquidity, target = self._retry_snapshot()
@@ -2511,22 +2524,21 @@ class NeutralisMonitor:
                 # As vendas adicionais feitas durante a queda são parcelas
                 # internas. Na recuperação, somente a parcela mais recente
                 # elegível é reduzida (LIFO), perto do próprio preço de
-                # execução, após 30 segundos de confirmação.
+                # execução. O fechamento ocorre no primeiro cruzamento
+                # ascendente de 0,10% abaixo da entrada. Assim uma recuperação
+                # rápida não escapa entre duas consultas.
                 if hedge_regime == "protected" and open_hedge_lots(hedge_lots):
                     newest_lot = open_hedge_lots(hedge_lots)[-1]
                     lot_entry = decimal(newest_lot["entryPrice"], "entrada da parcela")
                     lot_close_floor = lot_entry * (Decimal("1") - BASE_RECOVERY_EXIT_BUFFER)
-                    eligible = lot_close_floor <= hyp_now.mark <= lot_entry
+                    crossed_recovery = lot_recovery_crossed(previous_hyp_mark, hyp_now.mark, lot_entry)
+                    # Compatibilidade após reinício: se o processo voltar já
+                    # dentro da faixa lucrativa, encerre a parcela sem esperar
+                    # um novo mergulho. Acima da entrada, somente um cruzamento
+                    # observado nesta execução autoriza a saída.
+                    eligible = crossed_recovery or lot_close_floor <= hyp_now.mark <= lot_entry
                     lot_id = str(newest_lot.get("id", ""))
-                    if eligible and recovery_candidate_id == lot_id:
-                        recovery_confirmation_count += 1
-                    elif eligible:
-                        recovery_candidate_id = lot_id
-                        recovery_confirmation_count = 1
-                    else:
-                        recovery_candidate_id = None
-                        recovery_confirmation_count = 0
-                    if eligible and recovery_confirmation_count >= RECOVERY_CONFIRMATION_READINGS:
+                    if eligible:
                         lot_size = decimal(newest_lot["size"], "parcela")
                         current_for_lots = abs(min(hyp_now.signed_position, Decimal("0"))) if live else virtual_short
                         close_target = max(Decimal("0"), current_for_lots - lot_size)
@@ -2548,8 +2560,6 @@ class NeutralisMonitor:
                         )
                         recovery_active = True
                         recovery_high = hyp_now.mark
-                        recovery_candidate_id = None
-                        recovery_confirmation_count = 0
                         lot_action_performed = True
 
                 # Depois de reduzir uma ou mais parcelas, uma reversão de
@@ -2787,6 +2797,7 @@ class NeutralisMonitor:
                     })
                 if live:
                     self._persist_strategy_state(snapshot)
+                previous_hyp_mark = hyp_now.mark
         except NeutralisError as error:
             self._pause(str(error))
         except Exception as error:
