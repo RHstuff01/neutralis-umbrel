@@ -911,6 +911,18 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(server.upside_hedge_signal("initial_wait", Decimal("79.80"), Decimal("80"), step), "open")
         self.assertEqual(server.upside_hedge_signal("initial_wait", Decimal("80.20"), Decimal("80"), step), "confirm_upside")
 
+    def test_principal_result_excludes_fees_and_rewards(self):
+        position = {"liquidityUsd": Decimal("12548.56"), "earnedUsd": Decimal("403.58")}
+        metrics = server.principal_metrics(position, "12627.51")
+
+        self.assertEqual(metrics["principalPnlUsd"], Decimal("-78.95"))
+        self.assertAlmostEqual(float(metrics["principalPnlPercent"]), -0.6252, places=4)
+
+    def test_principal_result_requires_explicit_initial_balance(self):
+        metrics = server.principal_metrics({"liquidityUsd": Decimal("12548.56")}, "")
+        self.assertIsNone(metrics["principalInitialUsd"])
+        self.assertIsNone(metrics["principalPnlUsd"])
+
     def test_strategy_state_round_trip_preserves_upside_reference(self):
         monitor = server.NeutralisMonitor("persistence")
         monitor.config = {

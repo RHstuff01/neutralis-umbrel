@@ -1446,6 +1446,24 @@ def hedge_basis(position: dict[str, Any], lp_price: Decimal, hyp_mark: Decimal, 
     return abs(ratio / reference_ratio - Decimal("1"))
 
 
+def principal_metrics(position: dict[str, Any], initial_principal_raw: str) -> dict[str, Decimal | None]:
+    """Calcula o resultado do principal da LP sem incluir taxas ou recompensas."""
+    current_raw = position.get("liquidityUsd")
+    if current_raw is None:
+        return {"principalCurrentUsd": None, "principalInitialUsd": None, "principalPnlUsd": None, "principalPnlPercent": None}
+    current = decimal(current_raw, "saldo atual da LP")
+    if not initial_principal_raw:
+        return {"principalCurrentUsd": current, "principalInitialUsd": None, "principalPnlUsd": None, "principalPnlPercent": None}
+    initial = decimal(initial_principal_raw, "saldo inicial da LP")
+    pnl = current - initial
+    return {
+        "principalCurrentUsd": current,
+        "principalInitialUsd": initial,
+        "principalPnlUsd": pnl,
+        "principalPnlPercent": pnl / initial * Decimal("100"),
+    }
+
+
 def upside_hedge_signal(regime: str, mark: Decimal, entry_price: Decimal, step: Decimal) -> str | None:
     """Indica a troca de regime da estratégia de participação na alta.
 
@@ -1661,6 +1679,7 @@ class NeutralisMonitor:
             "positionAddress": "",
             "maxPositionNotional": "600",
             "stepPercent": "0.5",
+            "initialPrincipalUsd": "",
             "hedgeStrategy": "upside",
         }
         try:
@@ -1685,6 +1704,8 @@ class NeutralisMonitor:
         position = str(incoming.get("positionAddress", self.config["positionAddress"]))
         max_notional = decimal(incoming.get("maxPositionNotional", self.config["maxPositionNotional"]), "limite máximo do short")
         step_percent = decimal(incoming.get("stepPercent", self.config["stepPercent"]), "gatilho de ajuste")
+        initial_principal_raw = str(incoming.get("initialPrincipalUsd", self.config.get("initialPrincipalUsd", ""))).strip()
+        initial_principal = decimal(initial_principal_raw, "saldo inicial da LP") if initial_principal_raw else None
         hedge_strategy = str(incoming.get("hedgeStrategy", self.config.get("hedgeStrategy", "upside"))).lower()
         evm_source = source in {"uniswap", "uniswap_arc"}
         if source not in {"byreal", "raydium", "orca", "uniswap", "uniswap_arc"}:
@@ -1709,6 +1730,8 @@ class NeutralisMonitor:
             raise NeutralisError("O limite máximo do short deve ficar entre US$ 10 e US$ 100.000")
         if not Decimal("0.05") <= step_percent <= Decimal("5"):
             raise NeutralisError("O gatilho de ajuste deve ficar entre 0,05% e 5,00%")
+        if initial_principal is not None and not Decimal("1") <= initial_principal <= Decimal("100000000"):
+            raise NeutralisError("O saldo inicial da LP deve ficar entre US$ 1 e US$ 100.000.000")
         if hedge_strategy not in {"neutral", "upside"}:
             raise NeutralisError("Estratégia de hedge inválida")
         with self.lock:
@@ -1718,7 +1741,7 @@ class NeutralisMonitor:
                 self.config.get(key, "")
                 for key in ("source", "solanaWallet", "evmWallet", "uniswapTokenId", "hyperliquidAccount", "positionAddress")
             )
-            self.config = {"source": source, "solanaWallet": wallet, "evmWallet": evm_wallet, "uniswapTokenId": uniswap_token_id, "hyperliquidAccount": account, "positionAddress": position, "maxPositionNotional": str(max_notional), "stepPercent": str(step_percent), "hedgeStrategy": hedge_strategy}
+            self.config = {"source": source, "solanaWallet": wallet, "evmWallet": evm_wallet, "uniswapTokenId": uniswap_token_id, "hyperliquidAccount": account, "positionAddress": position, "maxPositionNotional": str(max_notional), "stepPercent": str(step_percent), "initialPrincipalUsd": str(initial_principal) if initial_principal is not None else "", "hedgeStrategy": hedge_strategy}
             self.config_file.write_text(json.dumps(self.config, indent=2), encoding="utf-8")
             os.chmod(self.config_file, 0o600)
             current_identity = tuple(
@@ -2297,6 +2320,8 @@ class NeutralisMonitor:
                 "hedgeStrategy": hedge_strategy,
                 "hedgeRegime": hedge_regime,
                 "protectionReference": protection_reference,
+                "protectionDistancePercent": (hyp.mark / protection_reference - Decimal("1")) * Decimal("100"),
+                **principal_metrics(position, self.config.get("initialPrincipalUsd", "")),
                 "baseShort": base_short,
                 "hedgeLots": hedge_lots,
                 "openLotCount": len(open_hedge_lots(hedge_lots)),
@@ -2316,7 +2341,7 @@ class NeutralisMonitor:
                 regime_label = {
                     "protected": "protegido",
                     "initial_wait": "aguardando direção inicial",
-                    "upside": "participando da alta",
+                    "upside": "sem short · aguardando retorno à referência",
                 }.get(hedge_regime, hedge_regime)
                 self.state.update({"mode": "running", "message": f"{label} · {regime_label} · banda de {step * 100:.2f}%", "snapshot": json_safe(initial_snapshot), "updatedAt": now_iso()})
             if live:
@@ -2664,6 +2689,8 @@ class NeutralisMonitor:
                     "hedgeStrategy": hedge_strategy,
                     "hedgeRegime": hedge_regime,
                     "protectionReference": protection_reference,
+                    "protectionDistancePercent": (hyp_now.mark / protection_reference - Decimal("1")) * Decimal("100"),
+                    **principal_metrics(position_now, self.config.get("initialPrincipalUsd", "")),
                     "baseShort": base_short,
                     "hedgeLots": hedge_lots,
                     "openLotCount": len(open_hedge_lots(hedge_lots)),
@@ -2683,7 +2710,7 @@ class NeutralisMonitor:
                     regime_label = {
                         "protected": "protegido",
                         "initial_wait": "aguardando direção inicial",
-                        "upside": "participando da alta",
+                        "upside": "sem short · aguardando retorno à referência",
                     }.get(hedge_regime, hedge_regime)
                     self.state.update({
                         "message": f"{'MODO REAL' if live else 'Dry-run'} ativo · {regime_label} · banda de {step * 100:.2f}%",
