@@ -967,10 +967,12 @@ class NeutralisTests(unittest.TestCase):
 
     def test_strategy_state_round_trip_preserves_upside_reference(self):
         monitor = server.NeutralisMonitor("persistence")
+        monitor.strategy_state_file.unlink(missing_ok=True)
+        monitor.persisted_strategy = None
         monitor.config = {
             **monitor.config,
             "source": "orca",
-            "positionAddress": "saved-position",
+            "positionAddress": "actual-position",
             "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
             "hedgeStrategy": "upside",
         }
@@ -994,10 +996,12 @@ class NeutralisTests(unittest.TestCase):
 
     def test_protected_state_restores_fixed_reference_not_current_short_average(self):
         monitor = server.NeutralisMonitor("fixed-reference")
+        monitor.strategy_state_file.unlink(missing_ok=True)
+        monitor.persisted_strategy = None
         monitor.config = {
             **monitor.config,
             "source": "orca",
-            "positionAddress": "saved-position",
+            "positionAddress": "actual-position",
             "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
             "hedgeStrategy": "upside",
         }
@@ -1197,21 +1201,22 @@ class NeutralisTests(unittest.TestCase):
             "recoveryHigh": Decimal("101.25"),
         })
 
-        self.assertEqual(monitor.persisted_strategy["version"], 7)
+        self.assertEqual(monitor.persisted_strategy["version"], 8)
         self.assertEqual(monitor.persisted_strategy["hedgeLots"], [lot])
         self.assertEqual(monitor.persisted_strategy["recoveryHigh"], "101.25")
 
-    def test_avax_reference_migration_is_applied_only_once(self):
+    def test_contaminated_avax_reference_is_replaced_by_current_operation(self):
         monitor = server.NeutralisMonitor("3")
-        monitor.reference_migration_file.unlink(missing_ok=True)
-        hyp = server.HypState("AVAX", 2, Decimal("11.10"), Decimal("11.10"), Decimal("-348.37"), 0)
+        monitor.config = {**monitor.config, "source": "orca", "positionAddress": "new-avax", "hyperliquidAccount": "0xabc", "hedgeStrategy": "upside"}
+        position = {"positionAddress": "new-avax"}
+        monitor.persisted_strategy = {
+            "version": 7, "source": "orca", "positionAddress": "new-avax", "market": "AVAX",
+            "hyperliquidAccount": "0xabc", "hedgeStrategy": "upside", "hedgeRegime": "upside",
+            "protectionReference": "11.08",
+        }
+        hyp = server.HypState("AVAX", 2, Decimal("11.55"), Decimal("11.55"), Decimal("0"), 0)
 
-        self.assertEqual(
-            monitor._pending_reference_migration(hyp),
-            ("avax-20260921-1108", Decimal("11.08")),
-        )
-        monitor._complete_reference_migration("avax-20260921-1108")
-        self.assertIsNone(monitor._pending_reference_migration(hyp))
+        self.assertEqual(monitor._restore_strategy_state(position, hyp, "upside"), ("initial_wait", Decimal("11.55")))
 
     def test_existing_short_without_trusted_state_is_not_increased_at_start(self):
         monitor = server.NeutralisMonitor("safe-existing-short")
@@ -1232,38 +1237,18 @@ class NeutralisTests(unittest.TestCase):
         execute.assert_not_called()
         self.assertAlmostEqual(monitor.state["snapshot"]["targetShort"], 348.37, places=6)
 
-    def test_current_avax_migration_closes_short_and_enters_upside(self):
-        monitor = server.NeutralisMonitor("3")
-        monitor.reference_migration_file.unlink(missing_ok=True)
-        monitor.persisted_strategy = None
-        monitor.config = {**monitor.config, "hedgeStrategy": "upside", "stepPercent": "1.25", "maxPositionNotional": "10000"}
-        position = {
-            "positionAddress": "position", "hedgeSymbol": "AVAX", "currentPrice": Decimal("11.15"),
-            "hedgeMode": "units",
+    def test_contaminated_near_reference_is_replaced_by_current_operation(self):
+        monitor = server.NeutralisMonitor("1")
+        monitor.config = {**monitor.config, "source": "orca", "positionAddress": "new-near", "hyperliquidAccount": "0xabc", "hedgeStrategy": "upside"}
+        position = {"positionAddress": "new-near"}
+        monitor.persisted_strategy = {
+            "version": 7, "source": "orca", "positionAddress": "new-near", "market": "NEAR",
+            "hyperliquidAccount": "0xabc", "hedgeStrategy": "upside", "hedgeRegime": "upside",
+            "protectionReference": "4.10",
         }
-        before = server.HypState("AVAX", 2, Decimal("11.10"), Decimal("11.10"), Decimal("-402.16"), 0, entry_price=Decimal("11.02"))
-        after = server.HypState("AVAX", 2, Decimal("11.10"), Decimal("11.10"), Decimal("0"), 0, entry_price=Decimal("0"))
-        snapshots = [
-            (position, before, Decimal("10.23"), Decimal("11.93"), Decimal("4500"), Decimal("402.88")),
-            (position, after, Decimal("10.23"), Decimal("11.93"), Decimal("4500"), Decimal("402.88")),
-        ]
-        execution = {
-            "size": Decimal("402.16"), "notional": Decimal("4463.976"), "isBuy": True,
-            "filled": Decimal("402.16"), "residualNotional": Decimal("0"),
-            "currentShort": Decimal("0"), "target": Decimal("0"), "anchor": Decimal("11.10"),
-            "averageFillPrice": Decimal("11.10"),
-        }
+        hyp = server.HypState("NEAR", 3, Decimal("4.55"), Decimal("4.55"), Decimal("0"), 0)
 
-        with patch.object(monitor, "_retry_snapshot", side_effect=snapshots), patch.object(
-            monitor.stop_event, "wait", return_value=True
-        ), patch.object(monitor, "_execute_auto_adjustment", return_value=execution) as execute:
-            monitor._run(live=True)
-
-        execute.assert_called_once()
-        self.assertEqual(execute.call_args.args[2], Decimal("0"))
-        self.assertEqual(monitor.state["snapshot"]["hedgeRegime"], "upside")
-        self.assertAlmostEqual(monitor.state["snapshot"]["protectionReference"], 11.08, places=6)
-        self.assertIsNone(monitor._pending_reference_migration(after))
+        self.assertEqual(monitor._restore_strategy_state(position, hyp, "upside"), ("initial_wait", Decimal("4.55")))
 
     def test_lot_is_consumed_without_affecting_other_lots(self):
         lots = []
