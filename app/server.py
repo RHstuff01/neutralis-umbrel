@@ -1590,6 +1590,7 @@ class NeutralisMonitor:
         self.config_file = CONFIG_FILE if slot == "1" else DATA_DIR / f"config-{slot}.json"
         self.log_file = LOG_FILE if slot == "1" else DATA_DIR / f"events-{slot}.jsonl"
         self.strategy_state_file = DATA_DIR / ("strategy-state.json" if slot == "1" else f"strategy-state-{slot}.json")
+        self.reference_migration_file = DATA_DIR / f"reference-migration-{slot}.json"
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
@@ -1607,7 +1608,7 @@ class NeutralisMonitor:
     def _load_strategy_state(self) -> dict[str, Any] | None:
         try:
             stored = json.loads(self.strategy_state_file.read_text(encoding="utf-8"))
-            return stored if isinstance(stored, dict) and stored.get("version") in {1, 2, 3, 4, 5, 6} else None
+            return stored if isinstance(stored, dict) and stored.get("version") in {1, 2, 3, 4, 5, 6, 7} else None
         except (OSError, json.JSONDecodeError):
             return None
 
@@ -1632,7 +1633,7 @@ class NeutralisMonitor:
             return
         position = snapshot.get("position") or {}
         payload = {
-            "version": 6,
+            "version": 7,
             "source": self.config.get("source"),
             "positionAddress": position.get("positionAddress"),
             "market": snapshot.get("market"),
@@ -1657,6 +1658,35 @@ class NeutralisMonitor:
         os.chmod(temporary, 0o600)
         os.replace(temporary, self.strategy_state_file)
         self.persisted_strategy = stored
+
+    def _pending_reference_migration(self, hyp: HypState) -> tuple[str, Decimal] | None:
+        """Retorna a correção pontual desta operação, sem afetar as futuras."""
+        corrections = {
+            ("1", "NEAR"): ("near-20260921-410", Decimal("4.10")),
+            ("3", "AVAX"): ("avax-20260921-1108", Decimal("11.08")),
+        }
+        correction = corrections.get((self.slot, hyp.market.upper()))
+        if not correction:
+            return None
+        try:
+            applied = json.loads(self.reference_migration_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            applied = {}
+        key, reference = correction
+        return None if isinstance(applied, dict) and applied.get(key) else (key, reference)
+
+    def _complete_reference_migration(self, key: str) -> None:
+        try:
+            applied = json.loads(self.reference_migration_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            applied = {}
+        if not isinstance(applied, dict):
+            applied = {}
+        applied[key] = now_iso()
+        temporary = self.reference_migration_file.with_suffix(".tmp")
+        temporary.write_text(json.dumps(applied, indent=2), encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, self.reference_migration_file)
 
     def _restore_strategy_state(
         self,
@@ -2367,6 +2397,25 @@ class NeutralisMonitor:
             restored_strategy = self._restore_strategy_state(position, hyp, hedge_strategy) if live else None
             if restored_strategy:
                 hedge_regime, protection_reference = restored_strategy
+            # Migração excepcional solicitada para as operações que já
+            # existiam antes da persistência confiável da referência. O
+            # marcador fica fora do estado apagado por uma parada manual:
+            # portanto ela é aplicada uma única vez, mesmo após reinício.
+            pending_reference_migration = self._pending_reference_migration(hyp) if live else None
+            if pending_reference_migration:
+                _, corrected_reference = pending_reference_migration
+                previous_reference = protection_reference
+                protection_reference = corrected_reference
+                hedge_regime = "protected" if current_short > 0 else (
+                    "upside" if hyp.mark > protection_reference else "initial_wait"
+                )
+                self._event(
+                    "reference-correction",
+                    f"Referência inicial da operação {hyp.market.upper()} corrigida uma única vez para US$ {corrected_reference}",
+                    previousReference=previous_reference,
+                    reference=corrected_reference,
+                    market=hyp.market,
+                )
             hedge_lots: list[dict[str, Any]] = []
             recovery_active = False
             recovery_high = Decimal("0")
@@ -2387,13 +2436,16 @@ class NeutralisMonitor:
                     if state_version >= 4
                     else hedge_regime == "protected" and current_short > 0
                 )
+            if pending_reference_migration and current_short > 0 and hyp.mark > protection_reference:
+                base_recovery_armed = True
+                base_recovery_force_close = True
             if (
                 hedge_regime == "protected"
                 and hyp.entry_price > 0
                 and hyp.mark < hyp.entry_price * (Decimal("1") - BASE_RECOVERY_EXIT_BUFFER)
             ):
                 base_recovery_armed = True
-            if live and restored_strategy and self.persisted_strategy and self.persisted_strategy.get("version") in {2, 3, 4, 5, 6}:
+            if live and restored_strategy and self.persisted_strategy and self.persisted_strategy.get("version") in {2, 3, 4, 5, 6, 7}:
                 raw_lots = self.persisted_strategy.get("hedgeLots", [])
                 if isinstance(raw_lots, list):
                     for raw_lot in raw_lots:
@@ -2440,6 +2492,15 @@ class NeutralisMonitor:
                 # banda de saída, não aumente a posição antes de fechá-la.
                 if hedge_regime in {"upside", "initial_wait", "direction_wait"}:
                     initial_target = Decimal("0")
+                elif pending_reference_migration and hyp.mark > protection_reference:
+                    # Acima da referência corrigida, a posição correta é
+                    # participação na alta: o short deve ser zerado agora.
+                    initial_target = Decimal("0")
+                elif current_short > 0 and not restored_strategy:
+                    # Sem histórico confiável, uma posição antiga nunca pode
+                    # ser aumentada apenas para reconciliar o delta no início.
+                    # Preserve-a até que a direção seja observada.
+                    initial_target = current_short
                 elif upside_hedge_signal(
                     hedge_regime,
                     hyp.mark,
@@ -2448,7 +2509,7 @@ class NeutralisMonitor:
                     hyp.entry_price,
                     base_recovery_armed and base_recovery_force_close,
                 ) == "close":
-                    initial_target = current_short
+                    initial_target = Decimal("0")
             initial_residual = abs(initial_target - current_short) * hyp.mark
             restored_lot_reduction = bool(
                 restored_strategy and open_hedge_lots(hedge_lots) and initial_target < current_short
@@ -2481,6 +2542,26 @@ class NeutralisMonitor:
                     hedge_lots = []
                     recovery_active = False
                     recovery_high = Decimal("0")
+                if (
+                    pending_reference_migration
+                    and initial_target == 0
+                    and hyp.signed_position == 0
+                    and hyp.mark > protection_reference
+                ):
+                    hedge_regime = "upside"
+                    base_short = Decimal("0")
+                    base_recovery_armed = False
+                    base_recovery_force_close = False
+                    recovery_active = True
+                    recovery_high = hyp.mark
+                    self._event(
+                        "hedge-regime",
+                        "Short zerado após correção da referência; participando da alta",
+                        regime=hedge_regime,
+                        mark=hyp.mark,
+                        reference=protection_reference,
+                        live=live,
+                    )
             initial_signed = hyp.signed_position
             virtual_short = abs(min(initial_signed, Decimal("0")))
             quantum = Decimal(1).scaleb(-hyp.decimals)
@@ -2543,6 +2624,8 @@ class NeutralisMonitor:
                 self.state.update({"mode": "running", "message": f"{label} · {regime_label} · banda de {step * 100:.2f}%", "snapshot": json_safe(initial_snapshot), "updatedAt": now_iso()})
             if live:
                 self._persist_strategy_state(initial_snapshot)
+                if pending_reference_migration:
+                    self._complete_reference_migration(pending_reference_migration[0])
             start_message = (
                 f"MODO REAL iniciado em {hyp.market}; delta inicial corrigido"
                 if live and initial_adjusted
