@@ -64,9 +64,8 @@ AUTO_MIN_ORDER_NOTIONAL = Decimal("10")
 ESTIMATED_TAKER_FEE_RATE = Decimal("0.00045")
 AUTO_POLL_SECONDS = 2
 AUTO_RETRY_SECONDS = 1
-# O short-base é encerrado pouco abaixo do próprio preço médio. A margem busca
-# cobrir taxa/spread e impede que a recompra programada transforme a recuperação
-# em perda deliberada do short.
+# Somente parcelas adicionais são recuperadas pouco abaixo do próprio preço
+# de execução. O short-base segue a referência inicial da operação.
 BASE_RECOVERY_EXIT_BUFFER = Decimal("0.001")
 # Uma IOC que não encontra livro não deve abandonar o hedge. O preço-limite
 # vai ficando mais agressivo até este teto e depois continua tentando nele,
@@ -1480,9 +1479,10 @@ def upside_hedge_signal(
 ) -> str | None:
     """Indica a troca de regime da estratégia de participação na alta.
 
-    Uma proteção existente é encerrada pouco abaixo do preço médio do short,
-    depois da confirmação temporal. A reentrada posterior é controlada pela
-    reversão desde a máxima da recuperação, fora desta função.
+    O short-base permanece protegendo a LP durante toda a região inferior e
+    somente é encerrado quando o ativo recupera a referência inicial da
+    operação. O piso de 0,10% abaixo do preço de execução pertence apenas
+    às parcelas adicionais e nunca pode zerar o short-base.
 
     Uma operação realmente nova usa metade do gatilho apenas para descobrir a
     direção inicial. A queda abre a proteção; a alta confirma o regime de
@@ -1490,10 +1490,8 @@ def upside_hedge_signal(
     """
     if mark <= 0 or operation_reference <= 0 or step <= 0:
         return None
-    if regime == "protected" and base_recovery_armed and short_entry_price and short_entry_price > 0:
-        close_floor = short_entry_price * (Decimal("1") - BASE_RECOVERY_EXIT_BUFFER)
-        if mark >= close_floor:
-            return "close"
+    if regime == "protected" and mark >= operation_reference:
+        return "close"
     if regime == "upside" and mark <= operation_reference:
         return "wait"
     if regime in {"initial_wait", "direction_wait"}:
@@ -1547,6 +1545,31 @@ def consume_hedge_lot(lot: dict[str, Any], filled_size: Decimal) -> Decimal:
     return filled_size - consumed
 
 
+def lot_minimum_hold_elapsed(
+    lot: dict[str, Any], minimum_seconds: Decimal, current_time: datetime | None = None
+) -> bool:
+    """Indica se a parcela já cumpriu o tempo mínimo configurado.
+
+    Parcelas antigas sem data continuam utilizáveis para não bloquear uma
+    proteção criada por versões anteriores.
+    """
+    if minimum_seconds <= 0:
+        return True
+    opened_at = str(lot.get("openedAt", "")).strip()
+    if not opened_at:
+        return True
+    try:
+        opened = datetime.fromisoformat(opened_at.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if opened.tzinfo is None:
+        opened = opened.replace(tzinfo=timezone.utc)
+    current = current_time or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return Decimal(str((current - opened).total_seconds())) >= minimum_seconds
+
+
 def lot_recovery_crossed(previous_mark: Decimal, mark: Decimal, entry_price: Decimal) -> bool:
     """Fecha a parcela no primeiro cruzamento ascendente de sua saída.
 
@@ -1561,10 +1584,11 @@ def lot_recovery_crossed(previous_mark: Decimal, mark: Decimal, entry_price: Dec
     return previous_mark < close_floor <= mark
 
 
-def recovery_reentry_signal(mark: Decimal, recovery_high: Decimal, step: Decimal) -> bool:
-    """Confirma reversão de meia banda usando uma única máxima global."""
+def recovery_reentry_signal(regime: str, mark: Decimal, recovery_high: Decimal, step: Decimal) -> bool:
+    """Recompõe parcelas recuperadas; nunca reabre o short-base no modo de alta."""
     return (
-        mark > 0
+        regime == "protected"
+        and mark > 0
         and recovery_high > 0
         and step > 0
         and mark <= recovery_high * (Decimal("1") - step / Decimal("2"))
@@ -1791,6 +1815,7 @@ class NeutralisMonitor:
             "positionAddress": "",
             "maxPositionNotional": "600",
             "stepPercent": "0.5",
+            "lotMinHoldSeconds": "60",
             "initialPrincipalUsd": "",
             "hedgeStrategy": "upside",
         }
@@ -1816,6 +1841,10 @@ class NeutralisMonitor:
         position = str(incoming.get("positionAddress", self.config["positionAddress"]))
         max_notional = decimal(incoming.get("maxPositionNotional", self.config["maxPositionNotional"]), "limite máximo do short")
         step_percent = decimal(incoming.get("stepPercent", self.config["stepPercent"]), "gatilho de ajuste")
+        lot_min_hold_seconds = decimal(
+            incoming.get("lotMinHoldSeconds", self.config.get("lotMinHoldSeconds", "60")),
+            "tempo mínimo da parcela",
+        )
         initial_principal_raw = str(incoming.get("initialPrincipalUsd", self.config.get("initialPrincipalUsd", ""))).strip()
         initial_principal = decimal(initial_principal_raw, "saldo inicial da LP") if initial_principal_raw else None
         hedge_strategy = str(incoming.get("hedgeStrategy", self.config.get("hedgeStrategy", "upside"))).lower()
@@ -1842,6 +1871,8 @@ class NeutralisMonitor:
             raise NeutralisError("O limite máximo do short deve ficar entre US$ 10 e US$ 100.000")
         if not Decimal("0.05") <= step_percent <= Decimal("5"):
             raise NeutralisError("O gatilho de ajuste deve ficar entre 0,05% e 5,00%")
+        if not Decimal("0") <= lot_min_hold_seconds <= Decimal("3600"):
+            raise NeutralisError("O tempo mínimo da parcela deve ficar entre 0 e 3.600 segundos")
         if initial_principal is not None and not Decimal("1") <= initial_principal <= Decimal("100000000"):
             raise NeutralisError("O saldo inicial da LP deve ficar entre US$ 1 e US$ 100.000.000")
         if hedge_strategy not in {"neutral", "upside"}:
@@ -1853,7 +1884,7 @@ class NeutralisMonitor:
                 self.config.get(key, "")
                 for key in ("source", "solanaWallet", "evmWallet", "uniswapTokenId", "hyperliquidAccount", "positionAddress")
             )
-            self.config = {"source": source, "solanaWallet": wallet, "evmWallet": evm_wallet, "uniswapTokenId": uniswap_token_id, "hyperliquidAccount": account, "positionAddress": position, "maxPositionNotional": str(max_notional), "stepPercent": str(step_percent), "initialPrincipalUsd": str(initial_principal) if initial_principal is not None else "", "hedgeStrategy": hedge_strategy}
+            self.config = {"source": source, "solanaWallet": wallet, "evmWallet": evm_wallet, "uniswapTokenId": uniswap_token_id, "hyperliquidAccount": account, "positionAddress": position, "maxPositionNotional": str(max_notional), "stepPercent": str(step_percent), "lotMinHoldSeconds": str(lot_min_hold_seconds), "initialPrincipalUsd": str(initial_principal) if initial_principal is not None else "", "hedgeStrategy": hedge_strategy}
             self.config_file.write_text(json.dumps(self.config, indent=2), encoding="utf-8")
             os.chmod(self.config_file, 0o600)
             current_identity = tuple(
@@ -1873,6 +1904,9 @@ class NeutralisMonitor:
         # à posição selecionada, e não ao mercado inteiro.
         del lower, upper
         return decimal(self.config.get("stepPercent", "0.5"), "gatilho de ajuste") / Decimal("100")
+
+    def lot_min_hold_seconds(self) -> Decimal:
+        return decimal(self.config.get("lotMinHoldSeconds", "60"), "tempo mínimo da parcela")
 
     def save_api_key(self, incoming: dict[str, Any]) -> dict[str, Any]:
         key = str(incoming.get("privateKey", "")).strip()
@@ -2596,6 +2630,7 @@ class NeutralisMonitor:
                 "baseRecoveryForceClose": base_recovery_force_close,
                 "hedgeLots": hedge_lots,
                 "openLotCount": len(open_hedge_lots(hedge_lots)),
+                "lotMinHoldSeconds": self.lot_min_hold_seconds(),
                 "recoveryActive": recovery_active,
                 "recoveryHigh": recovery_high,
                 "closeThreshold": (
@@ -2662,10 +2697,6 @@ class NeutralisMonitor:
                 target = target_at_reference_price(position_now, liquidity, projected_lp_price, lower, upper, hyp_now.mark)
                 full_hedge_target = target
                 if hedge_strategy == "upside":
-                    if hedge_regime == "protected" and hyp_now.entry_price > 0:
-                        base_close_floor = hyp_now.entry_price * (Decimal("1") - BASE_RECOVERY_EXIT_BUFFER)
-                        if hyp_now.mark < base_close_floor:
-                            base_recovery_armed = True
                     signal = upside_hedge_signal(
                         hedge_regime,
                         hyp_now.mark,
@@ -2675,11 +2706,6 @@ class NeutralisMonitor:
                         base_recovery_armed
                         and (base_recovery_force_close or hyp_now.mark > previous_hyp_mark),
                     )
-                    # Depois de zerar o short-base, a reentrada é controlada
-                    # exclusivamente pela reversão de meia banda desde a máxima
-                    # da recuperação, e não pela referência inicial.
-                    if hedge_regime == "upside" and recovery_active:
-                        signal = None
                     # As parcelas adicionais são recuperadas primeiro, em
                     # ordem LIFO. O short-base só pode ser zerado depois que
                     # nenhuma parcela adicional continuar aberta.
@@ -2697,9 +2723,9 @@ class NeutralisMonitor:
                         regime_confirmation = signal
                         regime_confirmation_count = 1
 
-                    # Abrir/voltar à espera exige duas leituras. O short-base
-                    # armado encerra na primeira recuperação observada para
-                    # não deixar o prejuízo crescer enquanto o ativo sobe.
+                    # Abrir/voltar à espera exige duas leituras. Ao recuperar
+                    # a referência inicial, o short-base encerra imediatamente;
+                    # o piso de 0,10% continua exclusivo das parcelas.
                     required_confirmation = 1 if signal == "close" else 2
                     if signal and regime_confirmation_count >= required_confirmation:
                         next_target = Decimal("0") if signal in {"close", "confirm_upside", "wait"} else target
@@ -2730,13 +2756,16 @@ class NeutralisMonitor:
                             base_recovery_armed = False
                             base_recovery_force_close = False
                             hedge_lots = []
-                            recovery_active = True
-                            recovery_high = hyp_now.mark
+                            recovery_active = False
+                            recovery_high = Decimal("0")
                         elif signal == "open":
                             base_short = abs(min(hyp_now.signed_position, Decimal("0"))) if live else virtual_short
                             base_recovery_armed = True
                             base_recovery_force_close = False
                             hedge_lots = []
+                            recovery_active = False
+                            recovery_high = Decimal("0")
+                        elif signal in {"confirm_upside", "wait"}:
                             recovery_active = False
                             recovery_high = Decimal("0")
                         hedge_regime = (
@@ -2790,14 +2819,18 @@ class NeutralisMonitor:
                     lot_entry = decimal(newest_lot["entryPrice"], "entrada da parcela")
                     lot_close_floor = lot_entry * (Decimal("1") - BASE_RECOVERY_EXIT_BUFFER)
                     crossed_recovery = lot_recovery_crossed(previous_hyp_mark, hyp_now.mark, lot_entry)
+                    minimum_hold = self.lot_min_hold_seconds()
+                    hold_elapsed = lot_minimum_hold_elapsed(newest_lot, minimum_hold)
                     # Compatibilidade após reinício: se o processo voltar já
                     # dentro da faixa lucrativa, encerre a parcela sem esperar
                     # um novo mergulho. Acima da entrada, somente um cruzamento
                     # observado nesta execução autoriza a saída.
-                    eligible = bool(newest_lot.get("recoveryArmed")) and hyp_now.mark >= lot_close_floor and (
-                        bool(newest_lot.get("recoveryForceClose")) or hyp_now.mark > previous_hyp_mark
+                    eligible = hold_elapsed and bool(newest_lot.get("recoveryArmed")) and hyp_now.mark >= lot_close_floor and (
+                        bool(newest_lot.get("recoveryForceClose"))
+                        or hyp_now.mark > previous_hyp_mark
+                        or minimum_hold > 0
                     )
-                    eligible = eligible or crossed_recovery
+                    eligible = eligible or (hold_elapsed and crossed_recovery)
                     lot_id = str(newest_lot.get("id", ""))
                     if eligible:
                         lot_size = decimal(newest_lot["size"], "parcela")
@@ -2827,11 +2860,9 @@ class NeutralisMonitor:
                 # metade do gatilho a partir da máxima da recuperação recompõe
                 # TODO o delta faltante em uma única ordem. A referência é
                 # global, portanto o risco de meia banda nunca se acumula.
-                if recovery_active and hedge_regime in {"protected", "upside"} and not lot_action_performed:
+                if recovery_active and hedge_regime == "protected" and not lot_action_performed:
                     recovery_high = max(recovery_high, hyp_now.mark)
-                    if recovery_reentry_signal(hyp_now.mark, recovery_high, step):
-                        reentry_from_upside = hedge_regime == "upside"
-                        reentry_completed = False
+                    if recovery_reentry_signal(hedge_regime, hyp_now.mark, recovery_high, step):
                         current_for_reentry = abs(min(hyp_now.signed_position, Decimal("0"))) if live else virtual_short
                         missing = max(Decimal("0"), full_hedge_target - current_for_reentry)
                         if missing * hyp_now.mark >= AUTO_MIN_ORDER_NOTIONAL:
@@ -2839,43 +2870,26 @@ class NeutralisMonitor:
                                 result = self._execute_auto_adjustment(position_now, hyp_now, full_hedge_target)
                                 if result:
                                     virtual_short = result["currentShort"]
-                                    if hedge_regime == "upside":
-                                        base_short = result["currentShort"]
-                                        base_recovery_armed = True
-                                        base_recovery_force_close = False
-                                        hedge_lots = []
-                                        reentry_completed = True
-                                    else:
-                                        add_hedge_lot(
-                                            hedge_lots,
-                                            decimal(result["filled"], "execução da parcela"),
-                                            decimal(result.get("averageFillPrice", hyp_now.mark), "preço executado"),
-                                            hyp_now.mark,
-                                        )
+                                    add_hedge_lot(
+                                        hedge_lots,
+                                        decimal(result["filled"], "execução da parcela"),
+                                        decimal(result.get("averageFillPrice", hyp_now.mark), "preço executado"),
+                                        hyp_now.mark,
+                                    )
                             else:
-                                if hedge_regime == "upside":
-                                    base_short = full_hedge_target
-                                    base_recovery_armed = True
-                                    base_recovery_force_close = False
-                                    hedge_lots = []
-                                    reentry_completed = True
-                                else:
-                                    add_hedge_lot(hedge_lots, missing, hyp_now.mark)
+                                add_hedge_lot(hedge_lots, missing, hyp_now.mark)
                                 virtual_short += missing
                             self._event(
-                                "base-reentry" if hedge_regime == "upside" else "lot-reentry",
+                                "lot-reentry",
                                 f"REVERSÃO · recompor todo o delta faltante de {missing} {position_now['hedgeSymbol']}",
                                 missing=missing,
                                 recoveryHigh=recovery_high,
                                 mark=hyp_now.mark,
                                 live=live,
                             )
-                        if reentry_from_upside and reentry_completed:
-                            hedge_regime = "protected"
-                        if not reentry_from_upside or reentry_completed:
-                            recovery_active = False
-                            recovery_high = Decimal("0")
-                            lot_action_performed = True
+                        recovery_active = False
+                        recovery_high = Decimal("0")
+                        lot_action_performed = True
                 # A saída inferior deixa a LP 100% no ativo. O hedge segue
                 # normalmente, mas o aviso é útil para o usuário reavaliar a
                 # faixa. Só avisamos na transição para não gerar spam a cada
@@ -3035,6 +3049,7 @@ class NeutralisMonitor:
                     "baseRecoveryForceClose": base_recovery_force_close,
                     "hedgeLots": hedge_lots,
                     "openLotCount": len(open_hedge_lots(hedge_lots)),
+                    "lotMinHoldSeconds": self.lot_min_hold_seconds(),
                     "recoveryActive": recovery_active,
                     "recoveryHigh": recovery_high,
                     "closeThreshold": (
