@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 40507)
-Total output lines: 3124
-
 #!/usr/bin/env python3
 """Neutralis Umbrel: monitor de hedge dinâmico em dry-run ou modo real."""
 
@@ -1259,7 +1256,850 @@ def byreal_positions(wallet: str) -> list[dict[str, Any]]:
                 if asset_usd is not None and quote_usd is not None and quote_usd > 0:
                     normalized["currentPrice"] = asset_usd / quote_usd
             except NeutralisError:
-                # A listagem da posiçã…10507 tokens truncated…eutralisError("Monitor interrompido durante o ajuste")
+                # A listagem da posição ainda pode ser usada em dry-run; o modo
+                # real permanece bloqueado sem uma cotação independente válida.
+                pass
+        result.append(normalized)
+    return result
+
+
+@dataclass
+class HypState:
+    market: str
+    decimals: int
+    mark: Decimal
+    oracle: Decimal
+    signed_position: Decimal
+    open_orders: int
+    dex: str | None = "xyz"
+    entry_price: Decimal = Decimal("0")
+
+
+def hyp_state(account: str, symbol: str) -> HypState:
+    if not EVM_PATTERN.fullmatch(account):
+        raise NeutralisError("Conta Hyperliquid inválida")
+    symbol = hyp_symbol(symbol)
+    preferred_dex = hyp_dex(symbol)
+    candidates = HYP_MARKET_ALTERNATIVES.get(
+        symbol,
+        (symbol, f"{symbol}USD") if preferred_dex == "xyz" and not symbol.endswith("USD") else (symbol,),
+    )
+
+    def info_payload(request_type: str, dex: str | None, **values: str) -> dict[str, str]:
+        payload = {"type": request_type, **values}
+        if dex:
+            payload["dex"] = dex
+        return payload
+
+    def market_in_dex(dex: str | None) -> tuple[dict[str, Any], list[Any], int | None]:
+        metadata, contexts = json_request(HYP_INFO_URL, info_payload("metaAndAssetCtxs", dex))
+        universe = metadata.get("universe", []) if isinstance(metadata, dict) else []
+        # Em mercados HIP-3 a própria API pode devolver o nome qualificado
+        # (por exemplo ``xyz:AAPL``), mesmo quando o catálogo foi consultado
+        # com ``dex=xyz``. Comparamos tanto o nome completo quanto a parte
+        # posterior aos dois-pontos.
+        index = next(
+            (
+                i
+                for i, row in enumerate(universe)
+                if str(row.get("name", "")).upper() in candidates
+                or str(row.get("name", "")).upper().rsplit(":", 1)[-1] in candidates
+            ),
+            None,
+        )
+        return metadata, contexts, index
+
+    metadata, contexts, index = market_in_dex(preferred_dex)
+    dex = preferred_dex
+    if index is None:
+        dex_rows = json_request(HYP_INFO_URL, {"type": "perpDexs"})
+        names = [str(row.get("name", "")) for row in dex_rows if isinstance(row, dict) and row.get("name")]
+        for candidate_dex in names:
+            if candidate_dex == preferred_dex:
+                continue
+            # Um DEX recém-publicado ou temporariamente indisponível não pode
+            # impedir a procura nos demais catálogos. Só a ausência do ativo
+            # em todos eles deve resultar em "contrato não encontrado".
+            try:
+                metadata, contexts, index = market_in_dex(candidate_dex)
+            except NeutralisError:
+                continue
+            if index is not None:
+                dex = candidate_dex
+                break
+    if index is None:
+        requested = f"{preferred_dex}:{symbol}" if preferred_dex else symbol
+        raise NeutralisError(f"Contrato {requested} não encontrado na Hyperliquid")
+    universe = metadata.get("universe", [])
+    active_symbol = str(universe[index].get("name", symbol))
+    # Não duplique o DEX quando a API já devolveu ``xyz:AAPL``.
+    if ":" in active_symbol:
+        catalog_dex, catalog_symbol = active_symbol.rsplit(":", 1)
+        market = f"{catalog_dex.lower()}:{catalog_symbol.upper()}"
+    else:
+        market = active_symbol.upper() if not dex else f"{dex}:{active_symbol.upper()}"
+    clearinghouse = json_request(HYP_INFO_URL, info_payload("clearinghouseState", dex, user=account))
+    orders = json_request(HYP_INFO_URL, info_payload("frontendOpenOrders", dex, user=account))
+    context = contexts[index]
+    signed = Decimal("0")
+    entry_price = Decimal("0")
+    for row in clearinghouse.get("assetPositions", []):
+        position = row.get("position", {})
+        if str(position.get("coin", "")).upper() in set(candidates) | {market.upper()}:
+            signed = decimal(position.get("szi", 0), "Hyperliquid szi")
+            entry_price = decimal(position.get("entryPx") or 0, "Hyperliquid entryPx")
+            break
+    open_orders = sum(1 for row in orders if str(row.get("coin", "")).upper() in set(candidates) | {market.upper()})
+    return HypState(
+        market=market,
+        decimals=int(universe[index]["szDecimals"]),
+        mark=decimal(context.get("markPx"), "Hyperliquid markPx"),
+        oracle=decimal(context.get("oraclePx", context.get("markPx")), "Hyperliquid oraclePx"),
+        signed_position=signed,
+        open_orders=open_orders,
+        dex=dex,
+        entry_price=entry_price,
+    )
+
+
+def hyp_ioc_limit_price(mark: Decimal, slippage: Decimal, is_buy: bool, size_decimals: int) -> Decimal:
+    """Preço IOC válido para as regras de precisão da Hyperliquid.
+
+    A Hyp aceita no máximo cinco algarismos significativos e, para perps,
+    no máximo ``6 - szDecimals`` casas decimais no preço. O arredondamento
+    precisa ser agressivo: para compra arredonda para cima, para venda para
+    baixo, evitando transformar uma IOC em ordem inválida ou não executável.
+    """
+    if mark <= 0 or slippage < 0 or not 0 <= size_decimals <= 6:
+        raise NeutralisError("Parâmetros inválidos para preço IOC")
+    raw = mark * (Decimal("1") + slippage if is_buy else Decimal("1") - slippage)
+    significant_places = 4 - raw.adjusted()
+    decimal_places = max(0, min(6 - size_decimals, significant_places))
+    tick = Decimal(1).scaleb(-decimal_places)
+    return raw.quantize(tick, rounding=ROUND_UP if is_buy else ROUND_DOWN)
+
+
+
+
+def lp_liquidity(value: Decimal, price: Decimal, lower: Decimal, upper: Decimal) -> Decimal:
+    if not (value > 0 and Decimal("0") < lower < upper and price > 0):
+        raise NeutralisError("Preço inválido para calcular a liquidez da LP")
+    sqrt_lower, sqrt_price, sqrt_upper = lower.sqrt(), price.sqrt(), upper.sqrt()
+    base_per_liquidity = (sqrt_upper - sqrt_price) / (sqrt_price * sqrt_upper)
+    stable_per_liquidity = sqrt_price - sqrt_lower
+    # Fora da faixa a posição continua existindo: abaixo dela fica toda no
+    # ativo-base; acima, toda na cotação estável. A liquidez precisa continuar
+    # calculável para que o hedge seja mantido, e não pausado.
+    if price <= lower:
+        base_per_liquidity = (sqrt_upper - sqrt_lower) / (sqrt_lower * sqrt_upper)
+        stable_per_liquidity = Decimal("0")
+    elif price >= upper:
+        base_per_liquidity = Decimal("0")
+        stable_per_liquidity = sqrt_upper - sqrt_lower
+    return value / (base_per_liquidity * price + stable_per_liquidity)
+
+
+def base_target(liquidity: Decimal, price: Decimal, lower: Decimal, upper: Decimal) -> Decimal:
+    sqrt_lower, sqrt_upper = lower.sqrt(), upper.sqrt()
+    if price <= lower:
+        return liquidity * (Decimal("1") / sqrt_lower - Decimal("1") / sqrt_upper)
+    if price >= upper:
+        return Decimal("0")
+    sqrt_price = price.sqrt()
+    return liquidity * (Decimal("1") / sqrt_price - Decimal("1") / sqrt_upper)
+
+
+def adaptive_rebalance_step(lower: Decimal, upper: Decimal) -> Decimal:
+    """Escolhe o gatilho pela largura total da faixa da LP.
+
+    A largura é medida sobre o ponto médio: faixas abaixo de 3% usam 0,25%;
+    faixas de 3% ou mais usam 0,50%.
+    """
+    if not (Decimal("0") < lower < upper):
+        raise NeutralisError("Faixa inválida para definir o gatilho")
+    midpoint = (lower + upper) / Decimal("2")
+    return AUTO_NARROW_STEP if (upper - lower) / midpoint < AUTO_NARROW_RANGE else AUTO_WIDE_STEP
+
+
+def target_at_reference_price(
+    position: dict[str, Any],
+    liquidity: Decimal,
+    price: Decimal,
+    lower: Decimal,
+    upper: Decimal,
+    hyp_mark: Decimal,
+) -> Decimal:
+    """Calcula a exposição da LP para um preço de referência do ativo.
+
+    Para a LP SPYx, o preço de referência acompanha o US500 da Hyperliquid
+    desde a âncora. Assim o gatilho e o ajuste não ficam à espera de um swap
+    na Orca apenas para atualizar o tick on-chain.
+    """
+    target = base_target(liquidity, price, lower, upper)
+    if position.get("hedgeMode") == "notional":
+        target = target * price / hyp_mark
+    return target
+
+
+def hedge_basis(position: dict[str, Any], lp_price: Decimal, hyp_mark: Decimal, reference_ratio: Decimal | None = None) -> Decimal:
+    if hyp_mark <= 0 or lp_price <= 0:
+        raise NeutralisError("Preço inválido para calcular o basis do hedge")
+    ratio = lp_price / hyp_mark
+    # O spread inicial entre dois mercados é normal. A proteção mede a
+    # alteração desse spread a partir da âncora, não o spread absoluto.
+    if reference_ratio is None or reference_ratio <= 0:
+        return abs(ratio - Decimal("1"))
+    return abs(ratio / reference_ratio - Decimal("1"))
+
+
+def principal_metrics(position: dict[str, Any], initial_principal_raw: str) -> dict[str, Decimal | None]:
+    """Calcula o resultado do principal da LP sem incluir taxas ou recompensas."""
+    current_raw = position.get("liquidityUsd")
+    if current_raw is None:
+        return {"principalCurrentUsd": None, "principalInitialUsd": None, "principalPnlUsd": None, "principalPnlPercent": None}
+    current = decimal(current_raw, "saldo atual da LP")
+    if not initial_principal_raw:
+        return {"principalCurrentUsd": current, "principalInitialUsd": None, "principalPnlUsd": None, "principalPnlPercent": None}
+    initial = decimal(initial_principal_raw, "saldo inicial da LP")
+    pnl = current - initial
+    return {
+        "principalCurrentUsd": current,
+        "principalInitialUsd": initial,
+        "principalPnlUsd": pnl,
+        "principalPnlPercent": pnl / initial * Decimal("100"),
+    }
+
+
+def upside_hedge_signal(
+    regime: str,
+    mark: Decimal,
+    operation_reference: Decimal,
+    step: Decimal,
+    short_entry_price: Decimal | None = None,
+    base_recovery_armed: bool = False,
+) -> str | None:
+    """Indica a troca de regime da estratégia de participação na alta.
+
+    Uma proteção existente é encerrada pouco abaixo do preço médio do short,
+    depois da confirmação temporal. A reentrada posterior é controlada pela
+    reversão desde a máxima da recuperação, fora desta função.
+
+    Uma operação realmente nova usa metade do gatilho apenas para descobrir a
+    direção inicial. A queda abre a proteção; a alta confirma o regime de
+    participação sem enviar ordem.
+    """
+    if mark <= 0 or operation_reference <= 0 or step <= 0:
+        return None
+    if regime == "protected" and base_recovery_armed and short_entry_price and short_entry_price > 0:
+        close_floor = short_entry_price * (Decimal("1") - BASE_RECOVERY_EXIT_BUFFER)
+        if mark >= close_floor:
+            return "close"
+    if regime == "upside" and mark <= operation_reference:
+        return "wait"
+    if regime in {"initial_wait", "direction_wait"}:
+        half_step = step / Decimal("2")
+        if mark <= operation_reference * (Decimal("1") - half_step):
+            return "open"
+        if mark >= operation_reference * (Decimal("1") + half_step):
+            return "confirm_upside"
+    return None
+
+
+def open_hedge_lots(lots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Retorna somente parcelas ainda abertas, preservando a ordem de criação."""
+    return [lot for lot in lots if not lot.get("closedAt") and decimal(lot.get("size", 0), "parcela") > 0]
+
+
+def add_hedge_lot(
+    lots: list[dict[str, Any]],
+    size: Decimal,
+    entry_price: Decimal,
+    reference_price: Decimal | None = None,
+) -> dict[str, Any] | None:
+    """Registra um aumento real do short como parcela interna independente."""
+    if size <= 0 or entry_price <= 0:
+        return None
+    lot = {
+        "id": f"{int(datetime.now(timezone.utc).timestamp() * 1_000_000)}-{len(lots) + 1}",
+        "size": str(size),
+        "entryPrice": str(entry_price),
+        "estimatedFeeUsd": str(size * entry_price * ESTIMATED_TAKER_FEE_RATE),
+        "estimatedSlippageUsd": str(
+            abs(entry_price - reference_price) * size if reference_price and reference_price > 0 else Decimal("0")
+        ),
+        "openedAt": now_iso(),
+        "closedAt": None,
+        "recoveryArmed": True,
+        "recoveryForceClose": False,
+    }
+    lots.append(lot)
+    return lot
+
+
+def consume_hedge_lot(lot: dict[str, Any], filled_size: Decimal) -> Decimal:
+    """Aplica uma compra reduce-only à parcela LIFO e devolve eventual sobra."""
+    size = decimal(lot.get("size", 0), "parcela")
+    consumed = min(size, max(Decimal("0"), filled_size))
+    remaining = size - consumed
+    lot["size"] = str(remaining)
+    if remaining <= 0:
+        lot["closedAt"] = now_iso()
+    return filled_size - consumed
+
+
+def lot_recovery_crossed(previous_mark: Decimal, mark: Decimal, entry_price: Decimal) -> bool:
+    """Fecha a parcela no primeiro cruzamento ascendente de sua saída.
+
+    O preço pode atravessar a faixa de 0,10% entre duas consultas. Por isso,
+    não exigimos permanência dentro dela: basta vir de baixo e alcançar ou
+    ultrapassar o piso de saída. Uma passagem descendente nunca dispara a
+    recompra, preservando o hedge durante a queda.
+    """
+    if previous_mark <= 0 or mark <= 0 or entry_price <= 0:
+        return False
+    close_floor = entry_price * (Decimal("1") - BASE_RECOVERY_EXIT_BUFFER)
+    return previous_mark < close_floor <= mark
+
+
+def recovery_reentry_signal(mark: Decimal, recovery_high: Decimal, step: Decimal) -> bool:
+    """Confirma reversão de meia banda usando uma única máxima global."""
+    return (
+        mark > 0
+        and recovery_high > 0
+        and step > 0
+        and mark <= recovery_high * (Decimal("1") - step / Decimal("2"))
+    )
+
+
+def json_safe(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [json_safe(item) for item in value]
+    return value
+
+
+class NeutralisMonitor:
+    def __init__(self, slot: str = "1") -> None:
+        DATA_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.slot = slot
+        # O slot 1 preserva os dados já usados pelo app. Os demais slots têm
+        # arquivos próprios: configuração, estado e registro jamais se misturam.
+        self.config_file = CONFIG_FILE if slot == "1" else DATA_DIR / f"config-{slot}.json"
+        self.log_file = LOG_FILE if slot == "1" else DATA_DIR / f"events-{slot}.jsonl"
+        self.strategy_state_file = DATA_DIR / ("strategy-state.json" if slot == "1" else f"strategy-state-{slot}.json")
+        self.lock = threading.RLock()
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.execution_lock = threading.Lock()
+        self.manual_stop_requested = False
+        self.config = self._load_config()
+        self.persisted_strategy = self._load_strategy_state()
+        self.state: dict[str, Any] = {
+            "mode": "stopped",
+            "message": "Pronto para iniciar",
+            "updatedAt": now_iso(),
+            "snapshot": None,
+        }
+
+    def _load_strategy_state(self) -> dict[str, Any] | None:
+        try:
+            stored = json.loads(self.strategy_state_file.read_text(encoding="utf-8"))
+            return stored if isinstance(stored, dict) and stored.get("version") in {1, 2, 3, 4, 5, 6} else None
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _clear_strategy_state(self) -> None:
+        self.persisted_strategy = None
+        try:
+            self.strategy_state_file.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _persist_strategy_state(self, snapshot: dict[str, Any]) -> None:
+        """Salva apenas o estado necessário para retomar a estratégia.
+
+        O arquivo é substituído atomicamente. Assim, uma queda de energia não
+        deixa JSON parcial e uma atualização do mark, por si só, não desgasta
+        o armazenamento do Umbrel.
+        """
+        # Uma parada manual encerra deliberadamente a operação. Mesmo que uma
+        # iteração já estivesse em andamento, ela não pode recriar a referência
+        # que acabou de ser apagada pelo usuário.
+        if self.manual_stop_requested:
+            return
+        position = snapshot.get("position") or {}
+        payload = {
+            "version": 6,
+            "source": self.config.get("source"),
+            "positionAddress": position.get("positionAddress"),
+            "market": snapshot.get("market"),
+            "hyperliquidAccount": self.config.get("hyperliquidAccount"),
+            "hedgeStrategy": snapshot.get("hedgeStrategy"),
+            "hedgeRegime": snapshot.get("hedgeRegime"),
+            "protectionReference": str(snapshot.get("protectionReference")),
+            "realShort": str(snapshot.get("realShort")),
+            "baseShort": str(snapshot.get("baseShort", snapshot.get("realShort", 0))),
+            "baseRecoveryArmed": bool(snapshot.get("baseRecoveryArmed", False)),
+            "baseRecoveryForceClose": bool(snapshot.get("baseRecoveryForceClose", False)),
+            "hedgeLots": snapshot.get("hedgeLots", []),
+            "recoveryActive": bool(snapshot.get("recoveryActive", False)),
+            "recoveryHigh": str(snapshot.get("recoveryHigh", 0)),
+        }
+        previous = self.persisted_strategy or {}
+        if all(previous.get(key) == value for key, value in payload.items()):
+            return
+        stored = {**payload, "updatedAt": now_iso()}
+        temporary = self.strategy_state_file.with_suffix(self.strategy_state_file.suffix + ".tmp")
+        temporary.write_text(json.dumps(stored, indent=2), encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, self.strategy_state_file)
+        self.persisted_strategy = stored
+
+    def _restore_strategy_state(
+        self,
+        position: dict[str, Any],
+        hyp: HypState,
+        hedge_strategy: str,
+    ) -> tuple[str, Decimal] | None:
+        stored = self.persisted_strategy
+        if not stored or hedge_strategy != "upside":
+            return None
+        identity_matches = (
+            stored.get("source") == self.config.get("source")
+            and stored.get("positionAddress") == position.get("positionAddress")
+            and str(stored.get("market", "")).upper() == hyp.market.upper()
+            and str(stored.get("hyperliquidAccount", "")).lower()
+            == self.config.get("hyperliquidAccount", "").lower()
+            and stored.get("hedgeStrategy") == hedge_strategy
+        )
+        if not identity_matches:
+            return None
+        try:
+            regime = str(stored.get("hedgeRegime"))
+            reference = decimal(stored.get("protectionReference"), "referência persistida")
+        except NeutralisError:
+            return None
+        if regime not in {"protected", "upside", "initial_wait", "direction_wait"} or reference <= 0:
+            return None
+        # Migração pontual da operação NEAR que já estava aberta
+        # quando a referência fixa passou a ser persistida. O estado antigo
+        # registrou 4,10, mas a referência correta desta operação é 4,20.
+        # A versão 5 gravada logo depois impede que a correção se repita ou
+        # afete uma operação futura que legitimamente comece perto de 4,10.
+        state_version = int(stored.get("version", 1))
+        if (
+            state_version <= 4
+            and hyp.market.upper() == "NEAR"
+            and reference.quantize(Decimal("0.01")) == Decimal("4.10")
+        ):
+            previous_reference = reference
+            reference = Decimal("4.20")
+            self._event(
+                "reference-correction",
+                "Referência inicial da operação NEAR corrigida uma única vez para US$ 4,20",
+                previousReference=previous_reference,
+                reference=reference,
+                market=hyp.market,
+            )
+        # Correção única das duas operações que já estavam abertas quando a
+        # referência inicial passou a ser gravada corretamente. Somente um
+        # estado da versão 5 e com o preço antigo específico entra aqui. Ao
+        # persistir novamente, a versão 6 impede repetição e protege operações
+        # futuras que legitimamente tenham esses mesmos preços.
+        one_time_reference_corrections = {
+            "AVAX": (Decimal("11.235"), Decimal("11.245"), Decimal("11.08")),
+            "NEAR": (Decimal("4.275"), Decimal("4.285"), Decimal("4.10")),
+        }
+        correction = one_time_reference_corrections.get(hyp.market.upper())
+        if state_version == 5 and correction:
+            lower_old, upper_old, corrected_reference = correction
+            if lower_old <= reference < upper_old:
+                previous_reference = reference
+                reference = corrected_reference
+                # As duas posições reais já estão acima da referência correta.
+                # Armar a recuperação faz o início reconciliar e zerar o short,
+                # em vez de conservar indevidamente o regime protegido antigo.
+                stored["baseRecoveryArmed"] = True
+                stored["baseRecoveryForceClose"] = True
+                self._event(
+                    "reference-correction",
+                    f"Referência inicial da operação {hyp.market.upper()} corrigida uma única vez para US$ {corrected_reference}",
+                    previousReference=previous_reference,
+                    reference=reference,
+                    market=hyp.market,
+                )
+        actual_is_protected = hyp.signed_position < 0
+        saved_is_protected = regime == "protected"
+        if saved_is_protected != actual_is_protected:
+            self._event(
+                "state-reconciliation",
+                "Estado salvo divergia da posição real; prevaleceu a Hyperliquid",
+                savedRegime=regime,
+                actualRegime="protected" if actual_is_protected else "unprotected",
+                market=hyp.market,
+            )
+            return None
+        self._event(
+            "state-restored",
+            "Estado da estratégia recuperado com segurança",
+            regime=regime,
+            reference=reference,
+            market=hyp.market,
+        )
+        return regime, reference
+
+    def _load_config(self) -> dict[str, str]:
+        defaults = {
+            "source": "byreal",
+            "solanaWallet": DEFAULT_SOLANA_WALLET,
+            "evmWallet": DEFAULT_HYP_ACCOUNT,
+            "uniswapTokenId": "",
+            "hyperliquidAccount": DEFAULT_HYP_ACCOUNT,
+            "positionAddress": "",
+            "maxPositionNotional": "600",
+            "stepPercent": "0.5",
+            "initialPrincipalUsd": "",
+            "hedgeStrategy": "upside",
+        }
+        try:
+            stored = json.loads(self.config_file.read_text(encoding="utf-8"))
+            if isinstance(stored, dict):
+                defaults.update({key: str(stored.get(key, defaults[key])) for key in defaults})
+        except (OSError, json.JSONDecodeError):
+            pass
+        return defaults
+
+    def save_config(self, incoming: dict[str, Any]) -> dict[str, str]:
+        source = str(incoming.get("source", self.config["source"])).lower()
+        wallet = str(incoming.get("solanaWallet", self.config["solanaWallet"]))
+        evm_wallet = str(incoming.get("evmWallet", self.config["evmWallet"]))
+        uniswap_token_id = str(incoming.get("uniswapTokenId", self.config.get("uniswapTokenId", ""))).strip()
+        # A interface não preenche novamente campos sensíveis/operacionais
+        # durante a atualização periódica. Na Arc o Token ID é obrigatório;
+        # portanto um envio vazio não deve apagar o NFT já salvo.
+        if not uniswap_token_id and source == "uniswap_arc":
+            uniswap_token_id = str(self.config.get("uniswapTokenId", "")).strip()
+        account = str(incoming.get("hyperliquidAccount", self.config["hyperliquidAccount"]))
+        position = str(incoming.get("positionAddress", self.config["positionAddress"]))
+        max_notional = decimal(incoming.get("maxPositionNotional", self.config["maxPositionNotional"]), "limite máximo do short")
+        step_percent = decimal(incoming.get("stepPercent", self.config["stepPercent"]), "gatilho de ajuste")
+        initial_principal_raw = str(incoming.get("initialPrincipalUsd", self.config.get("initialPrincipalUsd", ""))).strip()
+        initial_principal = decimal(initial_principal_raw, "saldo inicial da LP") if initial_principal_raw else None
+        hedge_strategy = str(incoming.get("hedgeStrategy", self.config.get("hedgeStrategy", "upside"))).lower()
+        evm_source = source in {"uniswap", "uniswap_arc"}
+        if source not in {"byreal", "raydium", "orca", "uniswap", "uniswap_arc"}:
+            raise NeutralisError("Fonte de liquidez inválida")
+        if not evm_source and not SOLANA_PATTERN.fullmatch(wallet):
+            raise NeutralisError("Carteira Solana inválida")
+        if evm_source and not EVM_PATTERN.fullmatch(evm_wallet):
+            raise NeutralisError("Carteira EVM inválida")
+        if not EVM_PATTERN.fullmatch(account):
+            raise NeutralisError("Conta Hyperliquid inválida")
+        if evm_source and position and not (
+            EVM_PATTERN.fullmatch(position) or re.fullmatch(r"0x[0-9a-fA-F]{64}", position)
+        ):
+            raise NeutralisError("Pool Uniswap inválida; use o endereço V3 ou o Pool ID V4")
+        if evm_source and uniswap_token_id and not re.fullmatch(r"[1-9][0-9]{0,77}", uniswap_token_id):
+            raise NeutralisError("NFT Uniswap inválido; use somente o número do Token ID")
+        if not evm_source and position and not SOLANA_PATTERN.fullmatch(position):
+            raise NeutralisError("Endereço da posição inválido")
+        if source == "uniswap_arc" and not uniswap_token_id:
+            raise NeutralisError("Informe o Token ID numérico do NFT Uniswap na Arc")
+        if not Decimal("10") <= max_notional <= Decimal("100000"):
+            raise NeutralisError("O limite máximo do short deve ficar entre US$ 10 e US$ 100.000")
+        if not Decimal("0.05") <= step_percent <= Decimal("5"):
+            raise NeutralisError("O gatilho de ajuste deve ficar entre 0,05% e 5,00%")
+        if initial_principal is not None and not Decimal("1") <= initial_principal <= Decimal("100000000"):
+            raise NeutralisError("O saldo inicial da LP deve ficar entre US$ 1 e US$ 100.000.000")
+        if hedge_strategy not in {"neutral", "upside"}:
+            raise NeutralisError("Estratégia de hedge inválida")
+        with self.lock:
+            if self.state["mode"] == "running":
+                raise NeutralisError("Pare o monitor antes de alterar a configuração")
+            previous_identity = tuple(
+                self.config.get(key, "")
+                for key in ("source", "solanaWallet", "evmWallet", "uniswapTokenId", "hyperliquidAccount", "positionAddress")
+            )
+            self.config = {"source": source, "solanaWallet": wallet, "evmWallet": evm_wallet, "uniswapTokenId": uniswap_token_id, "hyperliquidAccount": account, "positionAddress": position, "maxPositionNotional": str(max_notional), "stepPercent": str(step_percent), "initialPrincipalUsd": str(initial_principal) if initial_principal is not None else "", "hedgeStrategy": hedge_strategy}
+            self.config_file.write_text(json.dumps(self.config, indent=2), encoding="utf-8")
+            os.chmod(self.config_file, 0o600)
+            current_identity = tuple(
+                self.config.get(key, "")
+                for key in ("source", "solanaWallet", "evmWallet", "uniswapTokenId", "hyperliquidAccount", "positionAddress")
+            )
+            if current_identity != previous_identity:
+                self._clear_strategy_state()
+        return dict(self.config)
+
+    def max_position_notional(self) -> Decimal:
+        return decimal(self.config.get("maxPositionNotional", "600"), "limite máximo do short")
+
+    def rebalance_step(self, lower: Decimal, upper: Decimal) -> Decimal:
+        # O gatilho é definido pelo usuário para cada pool. Mantemos os
+        # parâmetros da faixa para tornar explícito que esta escolha pertence
+        # à posição selecionada, e não ao mercado inteiro.
+        del lower, upper
+        return decimal(self.config.get("stepPercent", "0.5"), "gatilho de ajuste") / Decimal("100")
+
+    def save_api_key(self, incoming: dict[str, Any]) -> dict[str, Any]:
+        key = str(incoming.get("privateKey", "")).strip()
+        if not PRIVATE_KEY_PATTERN.fullmatch(key):
+            raise NeutralisError("Chave privada da API Wallet inválida")
+        normalized = key if key.startswith("0x") else f"0x{key}"
+        API_KEY_FILE.write_text(normalized, encoding="ascii")
+        os.chmod(API_KEY_FILE, 0o600)
+        return {"configured": True}
+
+    def save_telegram_alert(self, incoming: dict[str, Any]) -> dict[str, Any]:
+        token = str(incoming.get("botToken", "")).strip()
+        chat_id = str(incoming.get("chatId", "")).strip()
+        if not TELEGRAM_TOKEN_PATTERN.fullmatch(token):
+            raise NeutralisError("Token do bot Telegram inválido")
+        if not TELEGRAM_CHAT_PATTERN.fullmatch(chat_id):
+            raise NeutralisError("Chat ID do Telegram inválido")
+        TELEGRAM_FILE.write_text(json.dumps({"botToken": token, "chatId": chat_id}), encoding="utf-8")
+        os.chmod(TELEGRAM_FILE, 0o600)
+        return {"configured": True}
+
+    @staticmethod
+    def telegram_configured() -> bool:
+        try:
+            stored = json.loads(TELEGRAM_FILE.read_text(encoding="utf-8"))
+            return bool(isinstance(stored, dict) and stored.get("botToken") and stored.get("chatId"))
+        except (OSError, json.JSONDecodeError):
+            return False
+
+    def _notify_telegram(self, message: str) -> None:
+        try:
+            stored = json.loads(TELEGRAM_FILE.read_text(encoding="utf-8"))
+            token, chat_id = str(stored["botToken"]), str(stored["chatId"])
+            text = f"⚠️ Neutralis: Pool {self.slot}.\n{message}"
+            json_request(f"https://api.telegram.org/bot{token}/sendMessage", {"chat_id": chat_id, "text": text})
+        except Exception:
+            # Uma falha no Telegram jamais pode parar, esconder ou reiniciar
+            # o monitor; o motivo original continua disponível no registro.
+            return
+
+    def save_solana_rpc(self, incoming: dict[str, Any]) -> dict[str, Any]:
+        endpoint = str(incoming.get("endpoint", "")).strip()
+        parsed = urlparse(endpoint)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            raise NeutralisError("Endpoint RPC Solana inválido; use uma URL HTTPS")
+        if len(endpoint) > 2048:
+            raise NeutralisError("Endpoint RPC Solana muito longo")
+        SOLANA_RPC_FILE.write_text(endpoint, encoding="utf-8")
+        os.chmod(SOLANA_RPC_FILE, 0o600)
+        return {"configured": True, "host": parsed.hostname}
+
+    def save_robinhood_rpc(self, incoming: dict[str, Any]) -> dict[str, Any]:
+        endpoint = str(incoming.get("endpoint", "")).strip()
+        parsed = urlparse(endpoint)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            raise NeutralisError("Endpoint RPC Robinhood inválido; use uma URL HTTPS")
+        if len(endpoint) > 2048:
+            raise NeutralisError("Endpoint RPC Robinhood muito longo")
+        ROBINHOOD_RPC_FILE.write_text(endpoint, encoding="utf-8")
+        os.chmod(ROBINHOOD_RPC_FILE, 0o600)
+        return {"configured": True, "host": parsed.hostname}
+
+    def _api_key(self) -> str:
+        try:
+            key = API_KEY_FILE.read_text(encoding="ascii").strip()
+        except OSError as error:
+            raise NeutralisError("Cadastre a chave da API Wallet no Umbrel") from error
+        if not PRIVATE_KEY_PATTERN.fullmatch(key):
+            raise NeutralisError("Chave da API Wallet armazenada é inválida")
+        return key if key.startswith("0x") else f"0x{key}"
+
+    def _exchange(self, active_dex: str | None = None):
+        try:
+            from eth_account import Account
+            from hyperliquid.exchange import Exchange
+            from hyperliquid.utils.constants import MAINNET_API_URL
+        except ImportError as error:
+            missing = getattr(error, "name", None) or str(error)
+            raise NeutralisError(f"SDK da Hyperliquid não está disponível ({missing})") from error
+        wallet = Account.from_key(self._api_key())
+        return Exchange(
+            wallet,
+            MAINNET_API_URL,
+            account_address=self.config["hyperliquidAccount"],
+            # A SDK só carrega o perp principal quando a lista inclui "".
+            # Ao informar apenas DEXs HIP-3, ela não cria o mapa interno para
+            # ZEC/SOL e `order("ZEC", ...)` termina em KeyError.
+            perp_dexs=list(dict.fromkeys(["", "xyz", "mkts", active_dex or ""])),
+        )
+
+    @staticmethod
+    def _order_status(response: Any) -> dict[str, Any]:
+        if not isinstance(response, dict) or response.get("status") != "ok":
+            raise NeutralisError("A Hyperliquid rejeitou a ordem automática")
+        statuses = response.get("response", {}).get("data", {}).get("statuses", [])
+        if not statuses or not isinstance(statuses[0], dict):
+            raise NeutralisError("Resposta inesperada ao enviar a ordem automática")
+        status = statuses[0]
+        if "error" in status:
+            raise NeutralisError(f"Ordem automática rejeitada: {status['error']}")
+        if "filled" not in status:
+            raise NeutralisError("A ordem IOC não foi executada; monitor pausado")
+        return status["filled"]
+
+    def _execute_auto_adjustment(
+        self,
+        position: dict[str, Any],
+        hyp: HypState,
+        target: Decimal,
+    ) -> dict[str, Any] | None:
+        original_position = position.get("positionAddress")
+        total_filled = Decimal("0")
+        total_fill_notional = Decimal("0")
+        last_direction: bool | None = None
+        margin_size_cap: Decimal | None = None
+
+        for attempt in count():
+            if attempt:
+                position, hyp, lower, upper, _, _ = self._retry_snapshot()
+                if original_position and position.get("positionAddress") != original_position:
+                    raise NeutralisError("A posição selecionada mudou durante o ajuste")
+
+            if hyp.open_orders:
+                raise NeutralisError("Existem ordens abertas neste mercado")
+            if hyp.signed_position > 0:
+                raise NeutralisError("A conta ficou long; monitor pausado")
+            current_short = abs(min(hyp.signed_position, Decimal("0")))
+            quantum = Decimal(1).scaleb(-hyp.decimals)
+            difference = target - current_short
+            size = abs(difference).quantize(quantum, rounding=ROUND_DOWN)
+            if margin_size_cap is not None and difference > 0:
+                size = min(size, margin_size_cap).quantize(quantum, rounding=ROUND_DOWN)
+            residual_notional = abs(difference) * hyp.mark
+            if size <= 0 or residual_notional < AUTO_MIN_ORDER_NOTIONAL:
+                return {
+                    "size": total_filled,
+                    "notional": total_filled * hyp.mark,
+                    "isBuy": last_direction,
+                    "filled": total_filled,
+                    "residualNotional": residual_notional,
+                    "currentShort": current_short,
+                    "target": target,
+                    "anchor": hyp.mark,
+                    "averageFillPrice": total_fill_notional / total_filled if total_filled else hyp.mark,
+                } if total_filled else None
+
+            is_buy = difference < 0
+            if is_buy:
+                size = min(size, current_short)
+            else:
+                resulting_notional = (current_short + size) * hyp.mark
+                if resulting_notional > self.max_position_notional():
+                    raise NeutralisError(f"Short-alvo ultrapassaria o limite total de US$ {self.max_position_notional():.2f}")
+            notional = size * hyp.mark
+            if notional < AUTO_MIN_ORDER_NOTIONAL:
+                return None
+
+            slippage = AUTO_RETRY_SLIPPAGES[min(attempt, len(AUTO_RETRY_SLIPPAGES) - 1)]
+            response = None
+            try:
+                with self.execution_lock:
+                    current = hyp_state(self.config["hyperliquidAccount"], position["hedgeSymbol"])
+                    if current.open_orders or current.signed_position != hyp.signed_position:
+                        raise NeutralisError("A posição ou as ordens mudaram durante a validação")
+                    # O mark pode mudar rápido entre a consulta e o envio.
+                    # Usamos o mark recém-lido para tornar a IOC executável,
+                    # em vez de pausar com o hedge incompleto.
+                    hyp = current
+                    if not is_buy and (current_short + size) * hyp.mark > self.max_position_notional():
+                        raise NeutralisError(f"Short-alvo ultrapassaria o limite total de US$ {self.max_position_notional():.2f}")
+                    limit_price = hyp_ioc_limit_price(hyp.mark, slippage, is_buy, hyp.decimals)
+                    response = self._exchange(hyp.dex).order(
+                        hyp.market,
+                        is_buy,
+                        float(size),
+                        float(limit_price),
+                        {"limit": {"tif": "Ioc"}},
+                        reduce_only=is_buy,
+                    )
+                filled = self._order_status(response)
+            except NeutralisError as error:
+                # A Hyp devolve mensagens diferentes para a mesma situação:
+                # IOC sem contraparte. Ambas devem seguir para o próximo
+                # limite mais agressivo, e não pausar o hedge de imediato.
+                error_text = str(error).upper()
+                insufficient_margin = "INSUFFICIENT MARGIN" in error_text
+                if insufficient_margin and not is_buy:
+                    # Não pause todo o monitor por falta de margem. Reduza a
+                    # ordem progressivamente até encontrar o tamanho aceito.
+                    # Se nem a ordem mínima couber, mantenha o robô vivo para
+                    # tentar novamente no próximo ciclo ou após novo depósito.
+                    margin_size_cap = (size / Decimal("2")).quantize(quantum, rounding=ROUND_DOWN)
+                    if margin_size_cap <= 0 or margin_size_cap * hyp.mark < AUTO_MIN_ORDER_NOTIONAL:
+                        self._event(
+                            "margin-limited",
+                            "Margem insuficiente; ajuste pendente e monitor mantido ativo",
+                            requestedSize=size,
+                            target=target,
+                            mark=hyp.mark,
+                            residualNotional=residual_notional,
+                        )
+                        if total_filled:
+                            return {
+                                "size": total_filled,
+                                "notional": total_fill_notional,
+                                "isBuy": last_direction,
+                                "filled": total_filled,
+                                "residualNotional": residual_notional,
+                                "currentShort": current_short,
+                                "target": target,
+                                "anchor": hyp.mark,
+                                "averageFillPrice": total_fill_notional / total_filled,
+                            }
+                        return None
+                    self._event(
+                        "margin-retry",
+                        f"Margem insuficiente; tentando ordem menor de {margin_size_cap} {position['hedgeSymbol']}",
+                        requestedSize=size,
+                        reducedSize=margin_size_cap,
+                        target=target,
+                        mark=hyp.mark,
+                    )
+                    if self.stop_event.wait(AUTO_RETRY_SECONDS):
+                        raise NeutralisError("Monitor interrompido durante o ajuste")
+                    continue
+                retryable = (
+                    "IOC" in error_text
+                    or "IOCCANCEL" in error_text
+                    or "COULD NOT IMMEDIATELY MATCH" in error_text
+                    or "RESTING ORDERS" in error_text
+                    or self._is_transient_network_error(error)
+                )
+                if not retryable:
+                    raise
+                attempt_number = attempt + 1
+                max_attempt = len(AUTO_RETRY_SLIPPAGES)
+                # Registra o escalonamento e, no patamar máximo, uma vez a
+                # cada dez tentativas para manter o histórico legível.
+                if attempt_number <= max_attempt or attempt_number % 10 == 0:
+                    suffix = (
+                        "conexão temporariamente indisponível; mantendo o monitor ativo"
+                        if self._is_transient_network_error(error)
+                        else f"tentando novamente com slippage máximo de {slippage * 100:.2f}%"
+                        if attempt_number >= max_attempt
+                        else f"nova tentativa {attempt_number + 1}/{max_attempt}"
+                    )
+                    self._event(
+                        "live-retry",
+                        f"IOC não executada; {suffix}",
+                        target=target,
+                        mark=hyp.mark,
+                        response=response,
+                        attempt=attempt_number,
+                        slippagePercent=slippage * 100,
+                    )
+                if self.stop_event.wait(AUTO_RETRY_SECONDS):
+                    raise NeutralisError("Monitor interrompido durante o ajuste")
                 continue
 
             filled_size = decimal(filled.get("totalSz", size), "quantidade executada")
