@@ -893,7 +893,7 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(server.MONITOR.state["snapshot"]["anchor"], 176.0)
         self.assertEqual(server.MONITOR.state["snapshot"]["virtualShort"], 2.74)
 
-    def test_live_monitor_reconciles_initial_delta_before_setting_anchor(self):
+    def test_live_monitor_preserves_existing_short_without_trusted_state(self):
         position = {
             "positionAddress": "position",
             "assetSymbol": "COINX",
@@ -901,17 +901,14 @@ class NeutralisTests(unittest.TestCase):
             "currentPrice": Decimal("176"),
         }
         initial = server.HypState("xyz:COIN", 3, Decimal("176"), Decimal("176"), Decimal("-2.740"), 0)
-        corrected = server.HypState("xyz:COIN", 3, Decimal("176.1"), Decimal("176.1"), Decimal("-2.600"), 0)
         before = (position, initial, Decimal("159"), Decimal("195"), Decimal("755"), Decimal("2.600"))
-        after = (position, corrected, Decimal("159"), Decimal("195"), Decimal("755"), Decimal("2.600"))
-        result = {"currentShort": Decimal("2.600"), "anchor": Decimal("176.1")}
         events = []
-        with patch.object(server.MONITOR, "_live_snapshot", side_effect=[before, after]), patch.object(server.MONITOR, "_execute_auto_adjustment", return_value=result) as adjustment, patch.object(server.MONITOR.stop_event, "wait", return_value=True), patch.object(server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)):
+        with patch.object(server.MONITOR, "_live_snapshot", return_value=before), patch.object(server.MONITOR, "_execute_auto_adjustment") as adjustment, patch.object(server.MONITOR.stop_event, "wait", return_value=True), patch.object(server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)):
             server.MONITOR._run(live=True)
-        adjustment.assert_called_once_with(position, initial, Decimal("2.600"))
-        self.assertEqual(events, ["initial-reconciliation", "start-live"])
+        adjustment.assert_not_called()
+        self.assertEqual(events, ["start-live"])
         self.assertEqual(server.MONITOR.state["snapshot"]["anchor"], 176.0)
-        self.assertEqual(server.MONITOR.state["snapshot"]["realShort"], 2.6)
+        self.assertEqual(server.MONITOR.state["snapshot"]["realShort"], 2.74)
 
     def test_arc_crcl_usdc_position_uses_crcl_units_for_hedge(self):
         result = server.concentrated_position_result(
@@ -1200,9 +1197,73 @@ class NeutralisTests(unittest.TestCase):
             "recoveryHigh": Decimal("101.25"),
         })
 
-        self.assertEqual(monitor.persisted_strategy["version"], 6)
+        self.assertEqual(monitor.persisted_strategy["version"], 7)
         self.assertEqual(monitor.persisted_strategy["hedgeLots"], [lot])
         self.assertEqual(monitor.persisted_strategy["recoveryHigh"], "101.25")
+
+    def test_avax_reference_migration_is_applied_only_once(self):
+        monitor = server.NeutralisMonitor("3")
+        monitor.reference_migration_file.unlink(missing_ok=True)
+        hyp = server.HypState("AVAX", 2, Decimal("11.10"), Decimal("11.10"), Decimal("-348.37"), 0)
+
+        self.assertEqual(
+            monitor._pending_reference_migration(hyp),
+            ("avax-20260921-1108", Decimal("11.08")),
+        )
+        monitor._complete_reference_migration("avax-20260921-1108")
+        self.assertIsNone(monitor._pending_reference_migration(hyp))
+
+    def test_existing_short_without_trusted_state_is_not_increased_at_start(self):
+        monitor = server.NeutralisMonitor("safe-existing-short")
+        monitor.persisted_strategy = None
+        monitor.config = {**monitor.config, "hedgeStrategy": "upside", "stepPercent": "1.25", "maxPositionNotional": "10000"}
+        position = {
+            "positionAddress": "position", "hedgeSymbol": "AVAX", "currentPrice": Decimal("11.10"),
+            "hedgeMode": "units",
+        }
+        initial = server.HypState("AVAX", 2, Decimal("11.10"), Decimal("11.10"), Decimal("-348.37"), 0, entry_price=Decimal("10.99"))
+        snapshot = (position, initial, Decimal("10.23"), Decimal("11.93"), Decimal("4500"), Decimal("402.88"))
+
+        with patch.object(monitor, "_retry_snapshot", return_value=snapshot), patch.object(
+            monitor.stop_event, "wait", return_value=True
+        ), patch.object(monitor, "_execute_auto_adjustment") as execute:
+            monitor._run(live=True)
+
+        execute.assert_not_called()
+        self.assertAlmostEqual(monitor.state["snapshot"]["targetShort"], 348.37, places=6)
+
+    def test_current_avax_migration_closes_short_and_enters_upside(self):
+        monitor = server.NeutralisMonitor("3")
+        monitor.reference_migration_file.unlink(missing_ok=True)
+        monitor.persisted_strategy = None
+        monitor.config = {**monitor.config, "hedgeStrategy": "upside", "stepPercent": "1.25", "maxPositionNotional": "10000"}
+        position = {
+            "positionAddress": "position", "hedgeSymbol": "AVAX", "currentPrice": Decimal("11.15"),
+            "hedgeMode": "units",
+        }
+        before = server.HypState("AVAX", 2, Decimal("11.10"), Decimal("11.10"), Decimal("-402.16"), 0, entry_price=Decimal("11.02"))
+        after = server.HypState("AVAX", 2, Decimal("11.10"), Decimal("11.10"), Decimal("0"), 0, entry_price=Decimal("0"))
+        snapshots = [
+            (position, before, Decimal("10.23"), Decimal("11.93"), Decimal("4500"), Decimal("402.88")),
+            (position, after, Decimal("10.23"), Decimal("11.93"), Decimal("4500"), Decimal("402.88")),
+        ]
+        execution = {
+            "size": Decimal("402.16"), "notional": Decimal("4463.976"), "isBuy": True,
+            "filled": Decimal("402.16"), "residualNotional": Decimal("0"),
+            "currentShort": Decimal("0"), "target": Decimal("0"), "anchor": Decimal("11.10"),
+            "averageFillPrice": Decimal("11.10"),
+        }
+
+        with patch.object(monitor, "_retry_snapshot", side_effect=snapshots), patch.object(
+            monitor.stop_event, "wait", return_value=True
+        ), patch.object(monitor, "_execute_auto_adjustment", return_value=execution) as execute:
+            monitor._run(live=True)
+
+        execute.assert_called_once()
+        self.assertEqual(execute.call_args.args[2], Decimal("0"))
+        self.assertEqual(monitor.state["snapshot"]["hedgeRegime"], "upside")
+        self.assertAlmostEqual(monitor.state["snapshot"]["protectionReference"], 11.08, places=6)
+        self.assertIsNone(monitor._pending_reference_migration(after))
 
     def test_lot_is_consumed_without_affecting_other_lots(self):
         lots = []
