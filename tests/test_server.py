@@ -942,10 +942,10 @@ class NeutralisTests(unittest.TestCase):
 
     def test_upside_strategy_returns_to_wait_at_reference_and_uses_half_step(self):
         step = Decimal("0.005")
-        self.assertIsNone(server.upside_hedge_signal("protected", Decimal("79.919"), Decimal("80"), step, Decimal("80")))
-        self.assertIsNone(server.upside_hedge_signal("protected", Decimal("79.92"), Decimal("80"), step, Decimal("80")))
-        self.assertEqual(server.upside_hedge_signal("protected", Decimal("79.92"), Decimal("80"), step, Decimal("80"), True), "close")
-        self.assertEqual(server.upside_hedge_signal("protected", Decimal("80.01"), Decimal("80"), step, Decimal("80"), True), "close")
+        # O preço médio do short não encerra mais a proteção-base.
+        self.assertIsNone(server.upside_hedge_signal("protected", Decimal("79.92"), Decimal("80"), step, Decimal("79"), True))
+        self.assertEqual(server.upside_hedge_signal("protected", Decimal("80"), Decimal("80"), step, Decimal("79")), "close")
+        self.assertEqual(server.upside_hedge_signal("protected", Decimal("80.01"), Decimal("80"), step, Decimal("81")), "close")
         self.assertIsNone(server.upside_hedge_signal("upside", Decimal("80.01"), Decimal("80"), step))
         self.assertEqual(server.upside_hedge_signal("upside", Decimal("80"), Decimal("80"), step), "wait")
         self.assertIsNone(server.upside_hedge_signal("initial_wait", Decimal("79.81"), Decimal("80"), step))
@@ -1283,14 +1283,60 @@ class NeutralisTests(unittest.TestCase):
         self.assertTrue(lot["recoveryArmed"])
         self.assertFalse(lot["recoveryForceClose"])
 
+    def test_lot_minimum_hold_blocks_early_close_and_expires_at_configured_time(self):
+        lot = {
+            "openedAt": "2026-09-22T12:00:00+00:00",
+            "size": "10",
+            "entryPrice": "10",
+        }
+        before = server.datetime.fromisoformat("2026-09-22T12:00:59+00:00")
+        at_limit = server.datetime.fromisoformat("2026-09-22T12:01:00+00:00")
+
+        self.assertFalse(server.lot_minimum_hold_elapsed(lot, Decimal("60"), before))
+        self.assertTrue(server.lot_minimum_hold_elapsed(lot, Decimal("60"), at_limit))
+
+    def test_lot_minimum_hold_is_saved_per_pool(self):
+        monitor = server.NeutralisMonitor("hold-config")
+        monitor.config_file = Path(TEST_DATA.name) / "hold-config.json"
+        result = monitor.save_config({
+            **monitor.config,
+            "source": "orca",
+            "solanaWallet": "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw",
+            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "lotMinHoldSeconds": "90",
+        })
+
+        self.assertEqual(result["lotMinHoldSeconds"], "90")
+        self.assertEqual(monitor.lot_min_hold_seconds(), Decimal("90"))
+
     def test_reentry_uses_one_global_half_trigger_and_does_not_accumulate(self):
         step = Decimal("0.01")
         high = Decimal("102")
-        self.assertFalse(server.recovery_reentry_signal(Decimal("101.50"), high, step))
-        self.assertTrue(server.recovery_reentry_signal(Decimal("101.49"), high, step))
+        self.assertFalse(server.recovery_reentry_signal("protected", Decimal("101.50"), high, step))
+        self.assertTrue(server.recovery_reentry_signal("protected", Decimal("101.49"), high, step))
         # Depois da recomposição o estado é zerado; quedas adicionais não
         # somam novas meias bandas sem uma nova parcela recuperada.
-        self.assertFalse(server.recovery_reentry_signal(Decimal("100"), Decimal("0"), step))
+        self.assertFalse(server.recovery_reentry_signal("protected", Decimal("100"), Decimal("0"), step))
+
+    def test_upside_regime_never_reopens_full_hedge_from_local_recovery_high(self):
+        # Reproduz o defeito do histórico: uma queda curta desde a máxima local
+        # ainda acima da referência inicial não pode abrir novamente 100% do hedge.
+        self.assertFalse(
+            server.recovery_reentry_signal(
+                "upside", Decimal("11.16"), Decimal("11.24"), Decimal("0.0125")
+            )
+        )
+
+    def test_base_short_is_not_treated_as_recoverable_lot(self):
+        step = Decimal("0.0125")
+        # Entrada média em 11,16 e pequena recuperação para 11,15. Como o
+        # ativo ainda está abaixo da referência inicial, o short-base continua.
+        self.assertIsNone(
+            server.upside_hedge_signal(
+                "protected", Decimal("11.15"), Decimal("11.20"), step,
+                Decimal("11.16"), True,
+            )
+        )
 
     def test_lot_recovery_crosses_exit_floor_only_on_the_way_up(self):
         entry = Decimal("3.9754")
@@ -1319,7 +1365,7 @@ class NeutralisTests(unittest.TestCase):
         original = dict(server.MONITOR.config)
         events = []
         try:
-            server.MONITOR.config = {**original, "hedgeStrategy": "upside", "stepPercent": "1"}
+            server.MONITOR.config = {**original, "hedgeStrategy": "upside", "stepPercent": "1", "lotMinHoldSeconds": "0"}
             with patch.object(server.MONITOR, "_retry_snapshot", side_effect=snapshots), patch.object(
                 server.MONITOR.stop_event, "wait", side_effect=[False, False, False, True]
             ), patch.object(
@@ -1329,6 +1375,39 @@ class NeutralisTests(unittest.TestCase):
             self.assertEqual(server.MONITOR.state["snapshot"]["openLotCount"], 0)
             self.assertTrue(server.MONITOR.state["snapshot"]["recoveryActive"])
             self.assertIn("lot-recovery", events)
+        finally:
+            server.MONITOR.config = original
+
+    def test_incremental_lot_does_not_close_before_minimum_time(self):
+        position = {
+            "positionAddress": "position", "hedgeSymbol": "NEAR", "currentPrice": Decimal("100"),
+            "hedgeMode": "units",
+        }
+        initial = server.HypState("NEAR", 3, Decimal("100"), Decimal("100"), Decimal("-10"), 0, entry_price=Decimal("100"))
+        falling = server.HypState("NEAR", 3, Decimal("99"), Decimal("99"), Decimal("-10"), 0, entry_price=Decimal("100"))
+        deeper = server.HypState("NEAR", 3, Decimal("98.5"), Decimal("98.5"), Decimal("-10"), 0, entry_price=Decimal("99"))
+        recovering = server.HypState("NEAR", 3, Decimal("99"), Decimal("99"), Decimal("-10"), 0, entry_price=Decimal("100"))
+        snapshots = [
+            (position, initial, Decimal("80"), Decimal("120"), Decimal("60"), Decimal("10")),
+            (position, falling, Decimal("80"), Decimal("120"), Decimal("60"), Decimal("12")),
+            (position, deeper, Decimal("80"), Decimal("120"), Decimal("60"), Decimal("12")),
+            (position, recovering, Decimal("80"), Decimal("120"), Decimal("60"), Decimal("10")),
+        ]
+        original = dict(server.MONITOR.config)
+        events = []
+        try:
+            server.MONITOR.config = {
+                **original, "hedgeStrategy": "upside", "stepPercent": "1", "lotMinHoldSeconds": "60"
+            }
+            with patch.object(server.MONITOR, "_retry_snapshot", side_effect=snapshots), patch.object(
+                server.MONITOR.stop_event, "wait", side_effect=[False, False, False, True]
+            ), patch.object(
+                server, "target_at_reference_price", side_effect=[Decimal("12"), Decimal("12"), Decimal("10")]
+            ), patch.object(server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)):
+                server.MONITOR._run(live=False)
+
+            self.assertEqual(server.MONITOR.state["snapshot"]["openLotCount"], 1)
+            self.assertNotIn("lot-recovery", events)
         finally:
             server.MONITOR.config = original
 
@@ -1362,7 +1441,7 @@ class NeutralisTests(unittest.TestCase):
         self.assertIsNone(restored)
         self.assertIn("state-reconciliation", events)
 
-    def test_dry_run_closes_armed_base_short_on_first_recovery(self):
+    def test_dry_run_keeps_base_short_on_small_recovery_below_reference(self):
         position = {
             "positionAddress": "position", "hedgeSymbol": "CRCL", "currentPrice": Decimal("80"),
             "hedgeMode": "units",
@@ -1383,14 +1462,14 @@ class NeutralisTests(unittest.TestCase):
                 server.MONITOR.stop_event, "wait", side_effect=[False, False, True]
             ), patch.object(server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)):
                 server.MONITOR._run(live=False)
-            self.assertEqual(server.MONITOR.state["snapshot"]["virtualShort"], 0)
-            self.assertEqual(server.MONITOR.state["snapshot"]["hedgeRegime"], "upside")
-            self.assertTrue(server.MONITOR.state["snapshot"]["recoveryActive"])
-            self.assertIn("upside-close", events)
+            self.assertEqual(server.MONITOR.state["snapshot"]["virtualShort"], 30)
+            self.assertEqual(server.MONITOR.state["snapshot"]["hedgeRegime"], "protected")
+            self.assertFalse(server.MONITOR.state["snapshot"]["recoveryActive"])
+            self.assertNotIn("upside-close", events)
         finally:
             server.MONITOR.config = original
 
-    def test_base_short_reopens_after_half_trigger_reversal_from_recovery_high(self):
+    def test_base_short_does_not_reopen_from_local_high_above_initial_reference(self):
         position = {
             "positionAddress": "position", "hedgeSymbol": "CRCL", "currentPrice": Decimal("80"),
             "hedgeMode": "units",
@@ -1414,10 +1493,10 @@ class NeutralisTests(unittest.TestCase):
                 side_effect=[False, False, False, True],
             ), patch.object(server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)):
                 server.MONITOR._run(live=False)
-            self.assertGreater(server.MONITOR.state["snapshot"]["virtualShort"], 0)
-            self.assertEqual(server.MONITOR.state["snapshot"]["hedgeRegime"], "protected")
+            self.assertEqual(server.MONITOR.state["snapshot"]["virtualShort"], 0)
+            self.assertEqual(server.MONITOR.state["snapshot"]["hedgeRegime"], "upside")
             self.assertFalse(server.MONITOR.state["snapshot"]["recoveryActive"])
-            self.assertIn("base-reentry", events)
+            self.assertNotIn("base-reentry", events)
         finally:
             server.MONITOR.config = original
 
