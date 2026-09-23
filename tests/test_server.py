@@ -1163,7 +1163,7 @@ class NeutralisTests(unittest.TestCase):
             ("protected", Decimal("11.24")),
         )
 
-    def test_manual_stop_clears_fixed_operation_reference(self):
+    def test_manual_stop_preserves_fixed_operation_reference(self):
         monitor = server.NeutralisMonitor("manual-reset")
         monitor._persist_strategy_state({
             "position": {"positionAddress": "position"},
@@ -1176,8 +1176,11 @@ class NeutralisTests(unittest.TestCase):
 
         monitor.stop()
 
-        self.assertIsNone(monitor.persisted_strategy)
-        self.assertFalse(monitor.strategy_state_file.exists())
+        self.assertEqual(monitor.persisted_strategy["protectionReference"], "4.12")
+        self.assertTrue(monitor.strategy_state_file.exists())
+
+        restarted = server.NeutralisMonitor("manual-reset")
+        self.assertEqual(restarted.persisted_strategy["protectionReference"], "4.12")
 
     def test_strategy_state_persists_lots_and_global_recovery_reference(self):
         monitor = server.NeutralisMonitor("lot-persistence")
@@ -1512,6 +1515,40 @@ class NeutralisTests(unittest.TestCase):
             self.assertIn("adjustment", events)
         finally:
             server.MONITOR.config = original
+
+    def test_target_deficit_opens_lot_before_price_trigger(self):
+        position = {
+            "positionAddress": "position", "hedgeSymbol": "SPCX", "currentPrice": Decimal("153.37"),
+            "hedgeMode": "units",
+        }
+        initial = server.HypState("xyz:SPCX", 3, Decimal("153.37"), Decimal("153.37"), Decimal("-76.77"), 0, entry_price=Decimal("153.37"))
+        small_drop = server.HypState("xyz:SPCX", 3, Decimal("153.03"), Decimal("153.03"), Decimal("-76.77"), 0, entry_price=Decimal("153.37"))
+        snapshots = [
+            (position, initial, Decimal("148.44"), Decimal("157.77"), Decimal("60"), Decimal("76.77")),
+            (position, small_drop, Decimal("148.44"), Decimal("157.77"), Decimal("60"), Decimal("119.367")),
+        ]
+        original = dict(server.MONITOR.config)
+        events = []
+        try:
+            server.MONITOR.config = {**original, "hedgeStrategy": "upside", "stepPercent": "0.5"}
+            with patch.object(server.MONITOR, "_retry_snapshot", side_effect=snapshots), patch.object(
+                server.MONITOR.stop_event, "wait", side_effect=[False, True]
+            ), patch.object(
+                server, "target_at_reference_price", return_value=Decimal("119.367")
+            ), patch.object(
+                server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)
+            ):
+                server.MONITOR._run(live=False)
+            self.assertEqual(server.MONITOR.state["snapshot"]["virtualShort"], 119.367)
+            self.assertEqual(server.MONITOR.state["snapshot"]["openLotCount"], 1)
+            self.assertIn("target-deficit", events)
+            self.assertIn("adjustment", events)
+        finally:
+            server.MONITOR.config = original
+
+    def test_target_deficit_never_authorizes_short_reduction(self):
+        self.assertEqual(server.target_short_deficit_ratio(Decimal("100"), Decimal("90")), Decimal("0.1"))
+        self.assertEqual(server.target_short_deficit_ratio(Decimal("100"), Decimal("110")), Decimal("0"))
 
     def test_dry_run_reopens_full_hedge_after_two_readings_below_band(self):
         position = {

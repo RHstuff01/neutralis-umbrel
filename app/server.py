@@ -23,6 +23,10 @@ from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 try:
+    from trigger_recommendation import TriggerRecommendationError, recommend_trigger
+except ModuleNotFoundError:  # importação usada pelos testes a partir da raiz
+    from app.trigger_recommendation import TriggerRecommendationError, recommend_trigger
+try:
     from eth_utils import keccak
 except ImportError:  # permite testes de leitura sem as deps de produção
     def keccak(*_: Any, **__: Any) -> bytes:
@@ -67,6 +71,10 @@ AUTO_RETRY_SECONDS = 1
 # Somente parcelas adicionais são recuperadas pouco abaixo do próprio preço
 # de execução. O short-base segue a referência inicial da operação.
 BASE_RECOVERY_EXIT_BUFFER = Decimal("0.001")
+# Segunda proteção do delta: se a composição da LP aumentar o short-alvo
+# rapidamente, não esperamos uma banda inteira de preço para recompor o hedge.
+# O limite é sempre medido contra o alvo atual e nunca autoriza reduções.
+TARGET_SHORT_DEFICIT_RATIO = Decimal("0.10")
 # Uma IOC que não encontra livro não deve abandonar o hedge. O preço-limite
 # vai ficando mais agressivo até este teto e depois continua tentando nele,
 # sempre podendo ser interrompido manualmente pelo usuário.
@@ -1595,6 +1603,13 @@ def recovery_reentry_signal(regime: str, mark: Decimal, recovery_high: Decimal, 
     )
 
 
+def target_short_deficit_ratio(target: Decimal, current_short: Decimal) -> Decimal:
+    """Percentual do alvo ainda desprotegido; excesso de short retorna zero."""
+    if target <= 0 or current_short >= target:
+        return Decimal("0")
+    return (target - max(Decimal("0"), current_short)) / target
+
+
 def json_safe(value: Any) -> Any:
     if isinstance(value, Decimal):
         return float(value)
@@ -1896,6 +1911,20 @@ class NeutralisMonitor:
 
     def lot_min_hold_seconds(self) -> Decimal:
         return decimal(self.config.get("lotMinHoldSeconds", "60"), "tempo mínimo da parcela")
+
+    def trigger_recommendation(self) -> dict[str, Any]:
+        """Calcula uma sugestão sem alterar configuração ou estado do hedge."""
+        with self.lock:
+            snapshot = dict(self.state.get("snapshot") or {})
+            current_percent = float(decimal(self.config.get("stepPercent", "0.5"), "gatilho de ajuste"))
+        market = str(snapshot.get("market") or "").strip()
+        if not market:
+            _, hyp, _, _, _, _ = self._live_snapshot()
+            market = hyp.market
+        try:
+            return recommend_trigger(market, current_percent, json_request, HYP_INFO_URL)
+        except TriggerRecommendationError as error:
+            raise NeutralisError(str(error)) from error
 
     def save_api_key(self, incoming: dict[str, Any]) -> dict[str, Any]:
         key = str(incoming.get("privateKey", "")).strip()
@@ -2369,9 +2398,11 @@ class NeutralisMonitor:
         self.stop_event.set()
         with self.lock:
             self.manual_stop_requested = True
-            # Parar manualmente encerra a operação estratégica. No próximo
-            # início, o mark daquele momento será a nova referência fixa.
-            self._clear_strategy_state()
+            # Parar interrompe apenas o processo. A operação econômica continua
+            # existindo na LP e na Hyperliquid, portanto referência, regime,
+            # short-base e parcelas precisam sobreviver ao próximo início.
+            # Uma mudança real de pool/posição continua limpando o estado em
+            # save_config(), e a restauração também valida a posição on-chain.
             self.state.update({"mode": "stopped", "message": "Monitor interrompido pelo usuário", "updatedAt": now_iso()})
         self._event("stop", "Monitor interrompido pelo usuário")
 
@@ -2904,7 +2935,11 @@ class NeutralisMonitor:
                     lp_anchor, hyp_anchor, anchor = projected_lp_price, hyp_now.mark, projected_lp_price
                     ratio_anchor, movement, basis_from_anchor = lp_price / hyp_anchor, Decimal("0"), Decimal("0")
                     projected_lp_price = lp_anchor
-                if abs(movement) >= step and (
+                adjustment_short = abs(min(hyp_now.signed_position, Decimal("0"))) if live else virtual_short
+                target_deficit = target_short_deficit_ratio(target, adjustment_short)
+                price_triggered = abs(movement) >= step
+                target_deficit_triggered = target_deficit >= TARGET_SHORT_DEFICIT_RATIO
+                if (price_triggered or target_deficit_triggered) and (
                     hedge_strategy == "neutral"
                     or (hedge_regime == "protected" and regime_confirmation_count == 0)
                 ) and not recovery_active and not lot_action_performed:
@@ -2918,6 +2953,16 @@ class NeutralisMonitor:
                     # perda repetida nas violinadas.
                     lot_managed_reduction = difference < 0 and bool(open_hedge_lots(hedge_lots))
                     if size > 0 and notional >= AUTO_MIN_ORDER_NOTIONAL and not lot_managed_reduction:
+                        if target_deficit_triggered and not price_triggered:
+                            self._event(
+                                "target-deficit",
+                                f"SHORT ABAIXO DO ALVO · recompor {size} {position_now['hedgeSymbol']}",
+                                currentShort=adjustment_short,
+                                target=target,
+                                deficitPercent=target_deficit * Decimal("100"),
+                                mark=hyp_now.mark,
+                                live=live,
+                            )
                         if live:
                             result = self._execute_auto_adjustment(position_now, hyp_now, target)
                             if result:
@@ -3122,6 +3167,9 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/config":
                 incoming = self.read_json()
                 return self.send_json({"config": monitor_for_slot(incoming.get("slot")).save_config(incoming)})
+            if path == "/api/trigger-recommendation":
+                incoming = self.read_json()
+                return self.send_json(monitor_for_slot(incoming.get("slot")).trigger_recommendation())
             if path == "/api/trading/key":
                 return self.send_json(MONITOR.save_api_key(self.read_json()))
             if path == "/api/alerts/telegram":
