@@ -1913,16 +1913,27 @@ class NeutralisMonitor:
         return decimal(self.config.get("lotMinHoldSeconds", "60"), "tempo mínimo da parcela")
 
     def trigger_recommendation(self) -> dict[str, Any]:
-        """Calcula uma sugestão sem alterar configuração ou estado do hedge."""
+        """Otimiza parâmetros com os dados atuais da LP selecionada."""
         with self.lock:
-            snapshot = dict(self.state.get("snapshot") or {})
             current_percent = float(decimal(self.config.get("stepPercent", "0.5"), "gatilho de ajuste"))
-        market = str(snapshot.get("market") or "").strip()
-        if not market:
-            _, hyp, _, _, _, _ = self._live_snapshot()
-            market = hyp.market
+            selected = str(self.config.get("positionAddress") or "").strip()
+        if not selected:
+            raise NeutralisError("Selecione e salve uma LP antes de calcular a recomendação")
+        position, hyp, lower, upper, liquidity, _ = self._live_snapshot()
+        lp_price = decimal(position.get("currentPrice") or hyp.mark, "preço da LP")
+        context = {
+            "valueUsd": decimal(position["liquidityUsd"], "liquidityUsd"),
+            "lower": lower,
+            "upper": upper,
+            "liquidity": liquidity,
+            "lpPrice": lp_price,
+            "hypMark": hyp.mark,
+        }
         try:
-            return recommend_trigger(market, current_percent, json_request, HYP_INFO_URL)
+            result = recommend_trigger(hyp.market, current_percent, json_request, HYP_INFO_URL, context)
+            result["assetSymbol"] = position.get("assetSymbol") or position.get("hedgeSymbol")
+            result["positionAddress"] = position.get("positionAddress")
+            return result
         except TriggerRecommendationError as error:
             raise NeutralisError(str(error)) from error
 

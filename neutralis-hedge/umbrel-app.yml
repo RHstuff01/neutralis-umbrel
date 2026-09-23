@@ -4,7 +4,7 @@ name: Neutralis Hedge
 tagline: Hedge dinâmico protegido para LPs RWA
 icon: https://neutralis-rwa-hedge.rafaelherzer.chatgpt.site/favicon.svg
 category: finance
-version: "0.8.53"
+version: "0.8.54"
 port: 8787
 description: >-
   Monitora uma posição de liquidez concentrada na Byreal, Raydium, Orca ou Uniswap V3/V4 e a posição
@@ -17,7 +17,7 @@ submission: https://github.com/RHstuff01/neutralis-umbrel
 repo: https://github.com/RHstuff01/neutralis-umbrel
 support: https://github.com/RHstuff01/neutralis-umbrel/issues
 gallery: []
-releaseNotes: Recomenda gatilho e tempo mínimo, recompõe déficits de hedge e preserva o estado ao parar e reiniciar.
+releaseNotes: Otimiza gatilho e tempo com o valor, a faixa, a liquidez e o ativo reais da LP selecionada.
 dependencies: []
 path: ""
 defaultUsername: ""
