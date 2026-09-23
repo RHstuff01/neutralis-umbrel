@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 import traceback
 from itertools import count
 from dataclasses import dataclass
@@ -1369,6 +1370,48 @@ def hyp_state(account: str, symbol: str) -> HypState:
     )
 
 
+def hyp_performance_since(account: str, market: str, started_at_ms: int) -> dict[str, Decimal]:
+    """Soma somente fills e funding do mercado desde a linha de base."""
+    if not EVM_PATTERN.fullmatch(account) or started_at_ms <= 0:
+        raise NeutralisError("Linha de base da Hyperliquid inválida")
+    market_upper = market.upper()
+    market_symbol = market_upper.rsplit(":", 1)[-1]
+
+    def matches(value: Any) -> bool:
+        candidate = str(value or "").upper()
+        return candidate == market_upper or candidate.rsplit(":", 1)[-1] == market_symbol
+
+    fills = json_request(HYP_INFO_URL, {
+        "type": "userFillsByTime",
+        "user": account,
+        "startTime": started_at_ms,
+        "aggregateByTime": True,
+    })
+    funding_rows = json_request(HYP_INFO_URL, {
+        "type": "userFunding",
+        "user": account,
+        "startTime": started_at_ms,
+    })
+    if not isinstance(fills, list) or not isinstance(funding_rows, list):
+        raise NeutralisError("A Hyperliquid não retornou o histórico econômico esperado")
+    realized = sum(
+        (decimal(row.get("closedPnl", 0), "PnL realizado") for row in fills if isinstance(row, dict) and matches(row.get("coin"))),
+        Decimal("0"),
+    )
+    fees = sum(
+        (abs(decimal(row.get("fee", 0), "taxa da Hyperliquid")) for row in fills if isinstance(row, dict) and matches(row.get("coin"))),
+        Decimal("0"),
+    )
+    funding = Decimal("0")
+    for row in funding_rows:
+        if not isinstance(row, dict):
+            continue
+        delta = row.get("delta") if isinstance(row.get("delta"), dict) else row
+        if matches(delta.get("coin")):
+            funding += decimal(delta.get("usdc", 0), "funding da Hyperliquid")
+    return {"realizedPnlUsd": realized, "feesUsd": fees, "fundingUsd": funding}
+
+
 def hyp_ioc_limit_price(mark: Decimal, slippage: Decimal, is_buy: bool, size_decimals: int) -> Decimal:
     """Preço IOC válido para as regras de precisão da Hyperliquid.
 
@@ -1629,6 +1672,7 @@ class NeutralisMonitor:
         self.config_file = CONFIG_FILE if slot == "1" else DATA_DIR / f"config-{slot}.json"
         self.log_file = LOG_FILE if slot == "1" else DATA_DIR / f"events-{slot}.jsonl"
         self.strategy_state_file = DATA_DIR / ("strategy-state.json" if slot == "1" else f"strategy-state-{slot}.json")
+        self.performance_state_file = DATA_DIR / ("performance-state.json" if slot == "1" else f"performance-state-{slot}.json")
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
@@ -1636,6 +1680,8 @@ class NeutralisMonitor:
         self.manual_stop_requested = False
         self.config = self._load_config()
         self.persisted_strategy = self._load_strategy_state()
+        self.performance_state = self._load_performance_state()
+        self.performance_cache: dict[str, Any] = {}
         self.state: dict[str, Any] = {
             "mode": "stopped",
             "message": "Pronto para iniciar",
@@ -1656,6 +1702,103 @@ class NeutralisMonitor:
             self.strategy_state_file.unlink()
         except FileNotFoundError:
             pass
+
+    def _load_performance_state(self) -> dict[str, Any] | None:
+        try:
+            stored = json.loads(self.performance_state_file.read_text(encoding="utf-8"))
+            return stored if isinstance(stored, dict) and stored.get("version") == 1 else None
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _clear_performance_state(self) -> None:
+        self.performance_state = None
+        self.performance_cache = {}
+        try:
+            self.performance_state_file.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _write_performance_state(self, state: dict[str, Any]) -> None:
+        temporary = self.performance_state_file.with_suffix(self.performance_state_file.suffix + ".tmp")
+        temporary.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, self.performance_state_file)
+        self.performance_state = state
+
+    def _performance_identity_matches(self, position: dict[str, Any], hyp: HypState) -> bool:
+        stored = self.performance_state or {}
+        return bool(
+            stored
+            and stored.get("source") == self.config.get("source")
+            and stored.get("positionAddress") == position.get("positionAddress")
+            and str(stored.get("market", "")).upper() == hyp.market.upper()
+            and str(stored.get("hyperliquidAccount", "")).lower() == self.config.get("hyperliquidAccount", "").lower()
+        )
+
+    def _ensure_performance_baseline(self, position: dict[str, Any], hyp: HypState) -> dict[str, Any]:
+        if self._performance_identity_matches(position, hyp):
+            return dict(self.performance_state or {})
+        started_at_ms = int(time.time() * 1000)
+        current_short = abs(min(hyp.signed_position, Decimal("0")))
+        open_pnl = (hyp.entry_price - hyp.mark) * current_short if hyp.entry_price > 0 else Decimal("0")
+        state = {
+            "version": 1,
+            "source": self.config.get("source"),
+            "positionAddress": position.get("positionAddress"),
+            "market": hyp.market,
+            "hyperliquidAccount": self.config.get("hyperliquidAccount"),
+            "startedAt": datetime.fromtimestamp(started_at_ms / 1000, timezone.utc).isoformat(),
+            "startedAtMs": started_at_ms,
+            "lpInitialUsd": str(decimal(position["liquidityUsd"], "saldo inicial acompanhado da LP")),
+            "hypInitialOpenPnlUsd": str(open_pnl),
+        }
+        self._write_performance_state(state)
+        self.performance_cache = {}
+        self._event("performance-baseline", "Acompanhamento do resultado real iniciado", market=hyp.market, lpInitialUsd=state["lpInitialUsd"])
+        return state
+
+    def _performance_metrics(self, position: dict[str, Any], hyp: HypState, live: bool) -> dict[str, Any]:
+        empty = {
+            "performanceStartedAt": None, "lpTrackedPnlUsd": None, "hypRealizedPnlUsd": None,
+            "hypOpenPnlUsd": None, "hypFundingUsd": None, "hypFeesUsd": None,
+            "hypTrackedPnlUsd": None, "combinedTrackedPnlUsd": None, "performanceError": None,
+        }
+        if not live:
+            return empty
+        try:
+            baseline = self._ensure_performance_baseline(position, hyp)
+        except (NeutralisError, KeyError, TypeError, ValueError) as error:
+            # O painel econômico nunca pode pausar nem interferir no hedge.
+            return {**empty, "performanceError": str(error)}
+        now = time.monotonic()
+        history = self.performance_cache.get("history")
+        if not history or now - float(self.performance_cache.get("at", 0)) >= 30:
+            try:
+                history = hyp_performance_since(
+                    self.config["hyperliquidAccount"], hyp.market, int(baseline["startedAtMs"])
+                )
+                self.performance_cache = {"at": now, "history": history}
+            except NeutralisError as error:
+                cached = self.performance_cache.get("history")
+                if not cached:
+                    return {**empty, "performanceStartedAt": baseline["startedAt"], "performanceError": str(error)}
+                history = cached
+        lp_pnl = decimal(position["liquidityUsd"], "saldo atual acompanhado da LP") - decimal(baseline["lpInitialUsd"], "saldo inicial acompanhado da LP")
+        current_short = abs(min(hyp.signed_position, Decimal("0")))
+        current_open = (hyp.entry_price - hyp.mark) * current_short if hyp.entry_price > 0 else Decimal("0")
+        tracked_open = current_open - decimal(baseline["hypInitialOpenPnlUsd"], "PnL aberto inicial")
+        hyp_total = history["realizedPnlUsd"] + tracked_open + history["fundingUsd"] - history["feesUsd"]
+        return {
+            "performanceStartedAt": baseline["startedAt"],
+            "lpTrackedPnlUsd": lp_pnl,
+            "hypRealizedPnlUsd": history["realizedPnlUsd"],
+            "hypOpenPnlUsd": tracked_open,
+            "hypFundingUsd": history["fundingUsd"],
+            "hypFeesUsd": history["feesUsd"],
+            "hypTrackedPnlUsd": hyp_total,
+            "combinedTrackedPnlUsd": lp_pnl + hyp_total,
+            "performanceError": None,
+        }
 
     def _persist_strategy_state(self, snapshot: dict[str, Any]) -> None:
         """Salva apenas o estado necessário para retomar a estratégia.
@@ -1897,6 +2040,7 @@ class NeutralisMonitor:
             )
             if current_identity != previous_identity:
                 self._clear_strategy_state()
+                self._clear_performance_state()
         return dict(self.config)
 
     def max_position_notional(self) -> Decimal:
@@ -2601,6 +2745,7 @@ class NeutralisMonitor:
                 "realShort": abs(min(hyp.signed_position, Decimal("0"))),
                 "virtualShort": virtual_short,
                 "targetShort": initial_target,
+                "fullTargetShort": target,
                 "anchor": anchor,
                 "lower": lower,
                 "upper": upper,
@@ -2610,6 +2755,7 @@ class NeutralisMonitor:
                 "protectionReference": protection_reference,
                 "protectionDistancePercent": (hyp.mark / protection_reference - Decimal("1")) * Decimal("100"),
                 **principal_metrics(position, self.config.get("initialPrincipalUsd", "")),
+                **self._performance_metrics(position, hyp, live),
                 "baseShort": base_short,
                 "baseRecoveryArmed": base_recovery_armed,
                 "baseRecoveryForceClose": base_recovery_force_close,
@@ -3032,6 +3178,7 @@ class NeutralisMonitor:
                     "realShort": abs(min(hyp_now.signed_position, Decimal("0"))),
                     "virtualShort": virtual_short,
                     "targetShort": target,
+                    "fullTargetShort": full_hedge_target,
                     "anchor": anchor,
                     "lower": lower,
                     "upper": upper,
@@ -3041,6 +3188,7 @@ class NeutralisMonitor:
                     "protectionReference": protection_reference,
                     "protectionDistancePercent": (hyp_now.mark / protection_reference - Decimal("1")) * Decimal("100"),
                     **principal_metrics(position_now, self.config.get("initialPrincipalUsd", "")),
+                    **self._performance_metrics(position_now, hyp_now, live),
                     "baseShort": base_short,
                     "baseRecoveryArmed": base_recovery_armed,
                     "baseRecoveryForceClose": base_recovery_force_close,

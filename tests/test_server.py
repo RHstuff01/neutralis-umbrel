@@ -22,10 +22,52 @@ class NeutralisTests(unittest.TestCase):
     def setUp(self):
         for monitor in server.MONITORS.values():
             monitor.persisted_strategy = None
+            monitor.performance_state = None
+            monitor.performance_cache = {}
             try:
                 monitor.strategy_state_file.unlink()
             except FileNotFoundError:
                 pass
+            try:
+                monitor.performance_state_file.unlink()
+            except FileNotFoundError:
+                pass
+
+    def test_hyp_performance_sums_only_selected_market(self):
+        responses = [
+            [
+                {"coin": "xyz:IBM", "closedPnl": "12.50", "fee": "0.30"},
+                {"coin": "xyz:AAPL", "closedPnl": "99", "fee": "9"},
+                {"coin": "IBM", "closedPnl": "-2.00", "fee": "0.20"},
+            ],
+            [
+                {"delta": {"coin": "xyz:IBM", "usdc": "1.25"}},
+                {"delta": {"coin": "AAPL", "usdc": "5"}},
+            ],
+        ]
+        with patch.object(server, "json_request", side_effect=responses):
+            result = server.hyp_performance_since(server.DEFAULT_HYP_ACCOUNT, "xyz:IBM", 1_700_000_000_000)
+        self.assertEqual(result["realizedPnlUsd"], Decimal("10.50"))
+        self.assertEqual(result["feesUsd"], Decimal("0.50"))
+        self.assertEqual(result["fundingUsd"], Decimal("1.25"))
+
+    def test_real_result_baseline_persists_and_combines_lp_and_hyp(self):
+        monitor = server.NeutralisMonitor("performance-test")
+        monitor.config = {**monitor.config, "source": "orca", "positionAddress": "position", "hyperliquidAccount": server.DEFAULT_HYP_ACCOUNT}
+        position = {"positionAddress": "position", "liquidityUsd": Decimal("10000")}
+        hyp = server.HypState("xyz:IBM", 2, Decimal("230"), Decimal("230"), Decimal("-10"), 0, entry_price=Decimal("232"))
+        with patch.object(monitor, "_event"), patch.object(server, "hyp_performance_since", return_value={
+            "realizedPnlUsd": Decimal("15"), "feesUsd": Decimal("2"), "fundingUsd": Decimal("1")
+        }):
+            first = monitor._performance_metrics(position, hyp, True)
+            position["liquidityUsd"] = Decimal("9900")
+            hyp.mark = Decimal("229")
+            second = monitor._performance_metrics(position, hyp, True)
+        self.assertTrue(monitor.performance_state_file.exists())
+        self.assertEqual(first["combinedTrackedPnlUsd"], Decimal("14"))
+        self.assertEqual(second["lpTrackedPnlUsd"], Decimal("-100"))
+        self.assertEqual(second["hypOpenPnlUsd"], Decimal("10"))
+        self.assertEqual(second["combinedTrackedPnlUsd"], Decimal("-76"))
 
     def test_xstock_symbol_maps_to_hyperliquid(self):
         self.assertEqual(server.hyp_symbol("AAPLX"), "AAPL")
@@ -1300,314 +1342,4 @@ class NeutralisTests(unittest.TestCase):
     def test_reentry_uses_one_global_half_trigger_and_does_not_accumulate(self):
         step = Decimal("0.01")
         high = Decimal("102")
-        self.assertFalse(server.recovery_reentry_signal("protected", Decimal("101.50"), high, step))
-        self.assertTrue(server.recovery_reentry_signal("protected", Decimal("101.49"), high, step))
-        # Depois da recomposição o estado é zerado; quedas adicionais não
-        # somam novas meias bandas sem uma nova parcela recuperada.
-        self.assertFalse(server.recovery_reentry_signal("protected", Decimal("100"), Decimal("0"), step))
-
-    def test_upside_regime_never_reopens_full_hedge_from_local_recovery_high(self):
-        # Reproduz o defeito do histórico: uma queda curta desde a máxima local
-        # ainda acima da referência inicial não pode abrir novamente 100% do hedge.
-        self.assertFalse(
-            server.recovery_reentry_signal(
-                "upside", Decimal("11.16"), Decimal("11.24"), Decimal("0.0125")
-            )
-        )
-
-    def test_base_short_is_not_treated_as_recoverable_lot(self):
-        step = Decimal("0.0125")
-        # Entrada média em 11,16 e pequena recuperação para 11,15. Como o
-        # ativo ainda está abaixo da referência inicial, o short-base continua.
-        self.assertIsNone(
-            server.upside_hedge_signal(
-                "protected", Decimal("11.15"), Decimal("11.20"), step,
-                Decimal("11.16"), True,
-            )
-        )
-
-    def test_lot_recovery_crosses_exit_floor_only_on_the_way_up(self):
-        entry = Decimal("3.9754")
-        floor = entry * (Decimal("1") - server.BASE_RECOVERY_EXIT_BUFFER)
-
-        self.assertTrue(server.lot_recovery_crossed(floor - Decimal("0.0001"), floor, entry))
-        self.assertTrue(server.lot_recovery_crossed(Decimal("3.96"), Decimal("3.99"), entry))
-        self.assertFalse(server.lot_recovery_crossed(Decimal("4.00"), Decimal("3.97"), entry))
-        self.assertFalse(server.lot_recovery_crossed(Decimal("3.96"), Decimal("3.97"), entry))
-
-    def test_incremental_lot_closes_on_first_upward_crossing(self):
-        position = {
-            "positionAddress": "position", "hedgeSymbol": "NEAR", "currentPrice": Decimal("100"),
-            "hedgeMode": "units",
-        }
-        initial = server.HypState("NEAR", 3, Decimal("100"), Decimal("100"), Decimal("-10"), 0, entry_price=Decimal("100"))
-        falling = server.HypState("NEAR", 3, Decimal("99"), Decimal("99"), Decimal("-10"), 0, entry_price=Decimal("100"))
-        deeper = server.HypState("NEAR", 3, Decimal("98.5"), Decimal("98.5"), Decimal("-10"), 0, entry_price=Decimal("99"))
-        recovering = server.HypState("NEAR", 3, Decimal("99"), Decimal("99"), Decimal("-10"), 0, entry_price=Decimal("100"))
-        snapshots = [
-            (position, initial, Decimal("80"), Decimal("120"), Decimal("60"), Decimal("10")),
-            (position, falling, Decimal("80"), Decimal("120"), Decimal("60"), Decimal("12")),
-            (position, deeper, Decimal("80"), Decimal("120"), Decimal("60"), Decimal("12")),
-            (position, recovering, Decimal("80"), Decimal("120"), Decimal("60"), Decimal("10")),
-        ]
-        original = dict(server.MONITOR.config)
-        events = []
-        try:
-            server.MONITOR.config = {**original, "hedgeStrategy": "upside", "stepPercent": "1", "lotMinHoldSeconds": "0"}
-            with patch.object(server.MONITOR, "_retry_snapshot", side_effect=snapshots), patch.object(
-                server.MONITOR.stop_event, "wait", side_effect=[False, False, False, True]
-            ), patch.object(
-                server, "target_at_reference_price", side_effect=[Decimal("12"), Decimal("12"), Decimal("10")]
-            ), patch.object(server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)):
-                server.MONITOR._run(live=False)
-            self.assertEqual(server.MONITOR.state["snapshot"]["openLotCount"], 0)
-            self.assertTrue(server.MONITOR.state["snapshot"]["recoveryActive"])
-            self.assertIn("lot-recovery", events)
-        finally:
-            server.MONITOR.config = original
-
-    def test_incremental_lot_does_not_close_before_minimum_time(self):
-        position = {
-            "positionAddress": "position", "hedgeSymbol": "NEAR", "currentPrice": Decimal("100"),
-            "hedgeMode": "units",
-        }
-        initial = server.HypState("NEAR", 3, Decimal("100"), Decimal("100"), Decimal("-10"), 0, entry_price=Decimal("100"))
-        falling = server.HypState("NEAR", 3, Decimal("99"), Decimal("99"), Decimal("-10"), 0, entry_price=Decimal("100"))
-        deeper = server.HypState("NEAR", 3, Decimal("98.5"), Decimal("98.5"), Decimal("-10"), 0, entry_price=Decimal("99"))
-        recovering = server.HypState("NEAR", 3, Decimal("99"), Decimal("99"), Decimal("-10"), 0, entry_price=Decimal("100"))
-        snapshots = [
-            (position, initial, Decimal("80"), Decimal("120"), Decimal("60"), Decimal("10")),
-            (position, falling, Decimal("80"), Decimal("120"), Decimal("60"), Decimal("12")),
-            (position, deeper, Decimal("80"), Decimal("120"), Decimal("60"), Decimal("12")),
-            (position, recovering, Decimal("80"), Decimal("120"), Decimal("60"), Decimal("10")),
-        ]
-        original = dict(server.MONITOR.config)
-        events = []
-        try:
-            server.MONITOR.config = {
-                **original, "hedgeStrategy": "upside", "stepPercent": "1", "lotMinHoldSeconds": "60"
-            }
-            with patch.object(server.MONITOR, "_retry_snapshot", side_effect=snapshots), patch.object(
-                server.MONITOR.stop_event, "wait", side_effect=[False, False, False, True]
-            ), patch.object(
-                server, "target_at_reference_price", side_effect=[Decimal("12"), Decimal("12"), Decimal("10")]
-            ), patch.object(server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)):
-                server.MONITOR._run(live=False)
-
-            self.assertEqual(server.MONITOR.state["snapshot"]["openLotCount"], 1)
-            self.assertNotIn("lot-recovery", events)
-        finally:
-            server.MONITOR.config = original
-
-    def test_strategy_state_reconciles_against_real_hyperliquid_position(self):
-        monitor = server.NeutralisMonitor("reconciliation")
-        monitor.config = {
-            **monitor.config,
-            "source": "orca",
-            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
-            "hedgeStrategy": "upside",
-        }
-        position = {"positionAddress": "actual-position"}
-        monitor.persisted_strategy = {
-            "version": 1,
-            "source": "orca",
-            "positionAddress": "actual-position",
-            "market": "ZEC",
-            "hyperliquidAccount": monitor.config["hyperliquidAccount"],
-            "hedgeStrategy": "upside",
-            "hedgeRegime": "upside",
-            "protectionReference": "42.75",
-            "realShort": "0",
-        }
-        hyp = server.HypState(
-            "ZEC", 3, Decimal("41"), Decimal("41"), Decimal("-2"), 0, entry_price=Decimal("41.5")
-        )
-        events = []
-        with patch.object(monitor, "_event", side_effect=lambda event, message, **details: events.append(event)):
-            restored = monitor._restore_strategy_state(position, hyp, "upside")
-
-        self.assertIsNone(restored)
-        self.assertIn("state-reconciliation", events)
-
-    def test_dry_run_keeps_base_short_on_small_recovery_below_reference(self):
-        position = {
-            "positionAddress": "position", "hedgeSymbol": "CRCL", "currentPrice": Decimal("80"),
-            "hedgeMode": "units",
-        }
-        initial = server.HypState("xyz:CRCL", 3, Decimal("80"), Decimal("80"), Decimal("-30"), 0, "xyz", Decimal("80"))
-        falling = server.HypState("xyz:CRCL", 3, Decimal("79.90"), Decimal("79.90"), Decimal("-30"), 0, "xyz", Decimal("80"))
-        recovered = server.HypState("xyz:CRCL", 3, Decimal("79.93"), Decimal("79.93"), Decimal("-30"), 0, "xyz", Decimal("80"))
-        snapshots = [
-            (position, initial, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("30")),
-            (position, falling, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("30")),
-            (position, recovered, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("29")),
-        ]
-        original = dict(server.MONITOR.config)
-        events = []
-        try:
-            server.MONITOR.config = {**original, "hedgeStrategy": "upside", "stepPercent": "0.5"}
-            with patch.object(server.MONITOR, "_retry_snapshot", side_effect=snapshots), patch.object(
-                server.MONITOR.stop_event, "wait", side_effect=[False, False, True]
-            ), patch.object(server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)):
-                server.MONITOR._run(live=False)
-            self.assertEqual(server.MONITOR.state["snapshot"]["virtualShort"], 30)
-            self.assertEqual(server.MONITOR.state["snapshot"]["hedgeRegime"], "protected")
-            self.assertFalse(server.MONITOR.state["snapshot"]["recoveryActive"])
-            self.assertNotIn("upside-close", events)
-        finally:
-            server.MONITOR.config = original
-
-    def test_base_short_does_not_reopen_from_local_high_above_initial_reference(self):
-        position = {
-            "positionAddress": "position", "hedgeSymbol": "CRCL", "currentPrice": Decimal("80"),
-            "hedgeMode": "units",
-        }
-        initial = server.HypState("xyz:CRCL", 3, Decimal("78"), Decimal("78"), Decimal("-30"), 0, "xyz", Decimal("80"))
-        recovered = server.HypState("xyz:CRCL", 3, Decimal("79.93"), Decimal("79.93"), Decimal("-30"), 0, "xyz", Decimal("80"))
-        recovery_high = server.HypState("xyz:CRCL", 3, Decimal("81"), Decimal("81"), Decimal("-30"), 0, "xyz", Decimal("80"))
-        reversed_mark = server.HypState("xyz:CRCL", 3, Decimal("80.59"), Decimal("80.59"), Decimal("-30"), 0, "xyz", Decimal("80"))
-        snapshots = [
-            (position, initial, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("30")),
-            (position, recovered, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("29")),
-            (position, recovery_high, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("29")),
-            (position, reversed_mark, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("29")),
-        ]
-        original = dict(server.MONITOR.config)
-        events = []
-        try:
-            server.MONITOR.config = {**original, "hedgeStrategy": "upside", "stepPercent": "1"}
-            with patch.object(server.MONITOR, "_retry_snapshot", side_effect=snapshots), patch.object(
-                server.MONITOR.stop_event, "wait",
-                side_effect=[False, False, False, True],
-            ), patch.object(server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)):
-                server.MONITOR._run(live=False)
-            self.assertEqual(server.MONITOR.state["snapshot"]["virtualShort"], 0)
-            self.assertEqual(server.MONITOR.state["snapshot"]["hedgeRegime"], "upside")
-            self.assertFalse(server.MONITOR.state["snapshot"]["recoveryActive"])
-            self.assertNotIn("base-reentry", events)
-        finally:
-            server.MONITOR.config = original
-
-    def test_protected_short_rebalances_downward_when_trigger_is_crossed(self):
-        position = {
-            "positionAddress": "position", "hedgeSymbol": "NEAR", "currentPrice": Decimal("4.25"),
-            "hedgeMode": "units",
-        }
-        initial = server.HypState("NEAR", 3, Decimal("4.25"), Decimal("4.25"), Decimal("-1236.7"), 0, entry_price=Decimal("4.25"))
-        falling = server.HypState("NEAR", 3, Decimal("4.07"), Decimal("4.07"), Decimal("-1236.7"), 0, entry_price=Decimal("4.25"))
-        snapshots = [
-            (position, initial, Decimal("3.86"), Decimal("4.56"), Decimal("60"), Decimal("1236.7")),
-            (position, falling, Decimal("3.86"), Decimal("4.56"), Decimal("60"), Decimal("2047.241")),
-        ]
-        original = dict(server.MONITOR.config)
-        events = []
-        try:
-            server.MONITOR.config = {**original, "hedgeStrategy": "upside", "stepPercent": "2.5"}
-            with patch.object(server.MONITOR, "_retry_snapshot", side_effect=snapshots), patch.object(
-                server.MONITOR.stop_event, "wait", side_effect=[False, True]
-            ), patch.object(
-                server, "target_at_reference_price", return_value=Decimal("2047.241")
-            ), patch.object(
-                server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)
-            ):
-                server.MONITOR._run(live=False)
-            self.assertEqual(server.MONITOR.state["snapshot"]["virtualShort"], 2047.241)
-            self.assertIn("adjustment", events)
-        finally:
-            server.MONITOR.config = original
-
-    def test_target_deficit_opens_lot_before_price_trigger(self):
-        position = {
-            "positionAddress": "position", "hedgeSymbol": "SPCX", "currentPrice": Decimal("153.37"),
-            "hedgeMode": "units",
-        }
-        initial = server.HypState("xyz:SPCX", 3, Decimal("153.37"), Decimal("153.37"), Decimal("-76.77"), 0, entry_price=Decimal("153.37"))
-        small_drop = server.HypState("xyz:SPCX", 3, Decimal("153.03"), Decimal("153.03"), Decimal("-76.77"), 0, entry_price=Decimal("153.37"))
-        snapshots = [
-            (position, initial, Decimal("148.44"), Decimal("157.77"), Decimal("60"), Decimal("76.77")),
-            (position, small_drop, Decimal("148.44"), Decimal("157.77"), Decimal("60"), Decimal("119.367")),
-        ]
-        original = dict(server.MONITOR.config)
-        events = []
-        try:
-            server.MONITOR.config = {**original, "hedgeStrategy": "upside", "stepPercent": "0.5"}
-            with patch.object(server.MONITOR, "_retry_snapshot", side_effect=snapshots), patch.object(
-                server.MONITOR.stop_event, "wait", side_effect=[False, True]
-            ), patch.object(
-                server, "target_at_reference_price", return_value=Decimal("119.367")
-            ), patch.object(
-                server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)
-            ):
-                server.MONITOR._run(live=False)
-            self.assertEqual(server.MONITOR.state["snapshot"]["virtualShort"], 119.367)
-            self.assertEqual(server.MONITOR.state["snapshot"]["openLotCount"], 1)
-            self.assertIn("target-deficit", events)
-            self.assertIn("adjustment", events)
-        finally:
-            server.MONITOR.config = original
-
-    def test_target_deficit_never_authorizes_short_reduction(self):
-        self.assertEqual(server.target_short_deficit_ratio(Decimal("100"), Decimal("90")), Decimal("0.1"))
-        self.assertEqual(server.target_short_deficit_ratio(Decimal("100"), Decimal("110")), Decimal("0"))
-
-    def test_dry_run_reopens_full_hedge_after_two_readings_below_band(self):
-        position = {
-            "positionAddress": "position", "hedgeSymbol": "CRCL", "currentPrice": Decimal("80"),
-            "hedgeMode": "units",
-        }
-        initial = server.HypState("xyz:CRCL", 3, Decimal("80"), Decimal("80"), Decimal("0"), 0)
-        first = server.HypState("xyz:CRCL", 3, Decimal("79.59"), Decimal("79.59"), Decimal("0"), 0)
-        second = server.HypState("xyz:CRCL", 3, Decimal("79.58"), Decimal("79.58"), Decimal("0"), 0)
-        snapshots = [
-            (position, initial, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("30")),
-            (position, first, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("30")),
-            (position, second, Decimal("50"), Decimal("150"), Decimal("60"), Decimal("30")),
-        ]
-        original = dict(server.MONITOR.config)
-        events = []
-        try:
-            server.MONITOR.config = {**original, "hedgeStrategy": "upside", "stepPercent": "0.5"}
-            with patch.object(server.MONITOR, "_retry_snapshot", side_effect=snapshots), patch.object(
-                server.MONITOR.stop_event, "wait", side_effect=[False, False, True]
-            ), patch.object(server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)):
-                server.MONITOR._run(live=False)
-            self.assertGreater(server.MONITOR.state["snapshot"]["virtualShort"], 0)
-            self.assertEqual(server.MONITOR.state["snapshot"]["hedgeRegime"], "protected")
-            self.assertIn("downside-open", events)
-        finally:
-            server.MONITOR.config = original
-
-    def test_new_unhedged_pool_waits_again_at_reference_then_opens_half_step_below(self):
-        position = {
-            "positionAddress": "position", "hedgeSymbol": "CRCL", "currentPrice": Decimal("80"),
-            "hedgeMode": "units",
-        }
-        marks = ["80", "80.20", "80.21", "80.01", "80.00", "79.80", "79.79", "79.78"]
-        snapshots = [
-            (
-                position,
-                server.HypState("xyz:CRCL", 3, Decimal(mark), Decimal(mark), Decimal("0"), 0),
-                Decimal("50"), Decimal("150"), Decimal("60"), Decimal("30"),
-            )
-            for mark in marks
-        ]
-        original = dict(server.MONITOR.config)
-        events = []
-        try:
-            server.MONITOR.config = {**original, "hedgeStrategy": "upside", "stepPercent": "0.5"}
-            with patch.object(server.MONITOR, "_retry_snapshot", side_effect=snapshots), patch.object(
-                server.MONITOR.stop_event, "wait", side_effect=[False, False, False, False, False, False, False, True]
-            ), patch.object(server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)):
-                server.MONITOR._run(live=False)
-            self.assertGreater(server.MONITOR.state["snapshot"]["virtualShort"], 0)
-            self.assertEqual(server.MONITOR.state["snapshot"]["hedgeRegime"], "protected")
-            self.assertEqual(server.MONITOR.state["snapshot"]["protectionReference"], 80.0)
-            self.assertIn("initial-upside", events)
-            self.assertIn("direction-wait", events)
-            self.assertIn("downside-open", events)
-        finally:
-            server.MONITOR.config = original
-
-
-if __name__ == "__main__":
-    unittest.main()
+        self.assertFalse(server.recovery_reentry_signal("protected", D
