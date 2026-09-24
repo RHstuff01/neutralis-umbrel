@@ -30,6 +30,12 @@ class TriggerRecommendationTests(unittest.TestCase):
         self.assertEqual([p["name"] for p in result["profiles"]], ["Mais protegido", "Equilibrado", "Menos operações"])
         self.assertIn(result["recommendedPercent"], {0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0})
         self.assertIn(result["recommendedHoldSeconds"], {60, 120, 180, 300, 600})
+        self.assertIn(result["recommendedExitMode"], {"timer", "cross_emergency", "timer_emergency"})
+        self.assertEqual(len(result["exitScenarios"]), 3)
+        self.assertEqual(
+            {item["exitMode"] for item in result["exitScenarios"]},
+            {"timer", "cross_emergency", "timer_emergency"},
+        )
         self.assertTrue(all("combinedResultUsd" in profile for profile in result["profiles"]))
 
     def test_invalid_lp_economics_are_rejected(self):

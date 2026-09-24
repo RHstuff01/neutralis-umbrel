@@ -75,6 +75,7 @@ BASE_RECOVERY_EXIT_BUFFER = Decimal("0.001")
 # Uma alta muito rápida não pode manter a parcela presa durante o tempo
 # mínimo. Acima deste limite, a parcela adicional é encerrada imediatamente.
 LOT_EMERGENCY_EXIT_RISE = Decimal("0.004")
+LOT_EXIT_MODES = {"timer", "cross_emergency", "timer_emergency"}
 # Segunda proteção do delta: se a composição da LP aumentar o short-alvo
 # rapidamente, não esperamos uma banda inteira de preço para recompor o hedge.
 # O limite é sempre medido contra o alvo atual e nunca autoriza reduções.
@@ -1643,6 +1644,7 @@ def lot_close_reason(
     mark: Decimal,
     entry_price: Decimal,
     hold_elapsed: bool,
+    exit_mode: str = "cross_emergency",
 ) -> str | None:
     """Decide a saída de uma parcela sem transformar o prazo em gatilho.
 
@@ -1652,9 +1654,14 @@ def lot_close_reason(
     """
     if mark <= 0 or entry_price <= 0:
         return None
-    if mark >= entry_price * (Decimal("1") + LOT_EMERGENCY_EXIT_RISE):
+    if exit_mode not in LOT_EXIT_MODES:
+        return None
+    if exit_mode != "timer" and mark >= entry_price * (Decimal("1") + LOT_EMERGENCY_EXIT_RISE):
         return "emergency"
-    if hold_elapsed and lot_recovery_crossed(previous_mark, mark, entry_price):
+    close_floor = entry_price * (Decimal("1") - BASE_RECOVERY_EXIT_BUFFER)
+    if hold_elapsed and exit_mode in {"timer", "timer_emergency"} and mark >= close_floor:
+        return "timer"
+    if hold_elapsed and exit_mode == "cross_emergency" and lot_recovery_crossed(previous_mark, mark, entry_price):
         return "recovery"
     return None
 
@@ -2004,6 +2011,7 @@ class NeutralisMonitor:
             "maxPositionNotional": "600",
             "stepPercent": "0.5",
             "lotMinHoldSeconds": "60",
+            "lotExitMode": "cross_emergency",
             "initialPrincipalUsd": "",
             "hedgeStrategy": "upside",
         }
@@ -2033,6 +2041,7 @@ class NeutralisMonitor:
             incoming.get("lotMinHoldSeconds", self.config.get("lotMinHoldSeconds", "60")),
             "tempo mínimo da parcela",
         )
+        lot_exit_mode = str(incoming.get("lotExitMode", self.config.get("lotExitMode", "cross_emergency"))).lower()
         initial_principal_raw = str(incoming.get("initialPrincipalUsd", self.config.get("initialPrincipalUsd", ""))).strip()
         initial_principal = decimal(initial_principal_raw, "saldo inicial da LP") if initial_principal_raw else None
         hedge_strategy = str(incoming.get("hedgeStrategy", self.config.get("hedgeStrategy", "upside"))).lower()
@@ -2061,6 +2070,8 @@ class NeutralisMonitor:
             raise NeutralisError("O gatilho de ajuste deve ficar entre 0,05% e 5,00%")
         if not Decimal("0") <= lot_min_hold_seconds <= Decimal("3600"):
             raise NeutralisError("O tempo mínimo da parcela deve ficar entre 0 e 3.600 segundos")
+        if lot_exit_mode not in LOT_EXIT_MODES:
+            raise NeutralisError("Método de saída das parcelas inválido")
         if initial_principal is not None and not Decimal("1") <= initial_principal <= Decimal("100000000"):
             raise NeutralisError("O saldo inicial da LP deve ficar entre US$ 1 e US$ 100.000.000")
         if hedge_strategy not in {"neutral", "upside"}:
@@ -2072,7 +2083,7 @@ class NeutralisMonitor:
                 self.config.get(key, "")
                 for key in ("source", "solanaWallet", "evmWallet", "uniswapTokenId", "hyperliquidAccount", "positionAddress")
             )
-            self.config = {"source": source, "solanaWallet": wallet, "evmWallet": evm_wallet, "uniswapTokenId": uniswap_token_id, "hyperliquidAccount": account, "positionAddress": position, "maxPositionNotional": str(max_notional), "stepPercent": str(step_percent), "lotMinHoldSeconds": str(lot_min_hold_seconds), "initialPrincipalUsd": str(initial_principal) if initial_principal is not None else "", "hedgeStrategy": hedge_strategy}
+            self.config = {"source": source, "solanaWallet": wallet, "evmWallet": evm_wallet, "uniswapTokenId": uniswap_token_id, "hyperliquidAccount": account, "positionAddress": position, "maxPositionNotional": str(max_notional), "stepPercent": str(step_percent), "lotMinHoldSeconds": str(lot_min_hold_seconds), "lotExitMode": lot_exit_mode, "initialPrincipalUsd": str(initial_principal) if initial_principal is not None else "", "hedgeStrategy": hedge_strategy}
             self.config_file.write_text(json.dumps(self.config, indent=2), encoding="utf-8")
             os.chmod(self.config_file, 0o600)
             current_identity = tuple(
@@ -2096,6 +2107,10 @@ class NeutralisMonitor:
 
     def lot_min_hold_seconds(self) -> Decimal:
         return decimal(self.config.get("lotMinHoldSeconds", "60"), "tempo mínimo da parcela")
+
+    def lot_exit_mode(self) -> str:
+        mode = str(self.config.get("lotExitMode", "cross_emergency")).lower()
+        return mode if mode in LOT_EXIT_MODES else "cross_emergency"
 
     def trigger_recommendation(self) -> dict[str, Any]:
         """Otimiza parâmetros com os dados atuais da LP selecionada."""
@@ -2803,6 +2818,7 @@ class NeutralisMonitor:
                 "hedgeLots": hedge_lots,
                 "openLotCount": len(open_hedge_lots(hedge_lots)),
                 "lotMinHoldSeconds": self.lot_min_hold_seconds(),
+                "lotExitMode": self.lot_exit_mode(),
                 "recoveryActive": recovery_active,
                 "recoveryHigh": recovery_high,
                 "closeThreshold": (
@@ -2990,7 +3006,7 @@ class NeutralisMonitor:
                     minimum_hold = self.lot_min_hold_seconds()
                     hold_elapsed = lot_minimum_hold_elapsed(newest_lot, minimum_hold)
                     close_reason = lot_close_reason(
-                        previous_hyp_mark, hyp_now.mark, lot_entry, hold_elapsed
+                        previous_hyp_mark, hyp_now.mark, lot_entry, hold_elapsed, self.lot_exit_mode()
                     )
                     lot_id = str(newest_lot.get("id", ""))
                     if close_reason:
@@ -3005,13 +3021,17 @@ class NeutralisMonitor:
                         else:
                             consume_hedge_lot(newest_lot, lot_size)
                             virtual_short = close_target
+                        event_name = "lot-emergency" if close_reason == "emergency" else "lot-timer" if close_reason == "timer" else "lot-recovery"
+                        event_message = (
+                            f"SAÍDA EMERGENCIAL +0,40% · reduzir short {lot_size} {position_now['hedgeSymbol']}"
+                            if close_reason == "emergency"
+                            else f"PRAZO CONCLUÍDO · reduzir short {lot_size} {position_now['hedgeSymbol']}"
+                            if close_reason == "timer"
+                            else f"PARCELA RECUPERADA · reduzir short {lot_size} {position_now['hedgeSymbol']}"
+                        )
                         self._event(
-                            "lot-emergency" if close_reason == "emergency" else "lot-recovery",
-                            (
-                                f"SAÍDA EMERGENCIAL +0,40% · reduzir short {lot_size} {position_now['hedgeSymbol']}"
-                                if close_reason == "emergency"
-                                else f"PARCELA RECUPERADA · reduzir short {lot_size} {position_now['hedgeSymbol']}"
-                            ),
+                            event_name,
+                            event_message,
                             size=lot_size,
                             entryPrice=lot_entry,
                             mark=hyp_now.mark,
@@ -3244,6 +3264,7 @@ class NeutralisMonitor:
                     "hedgeLots": hedge_lots,
                     "openLotCount": len(open_hedge_lots(hedge_lots)),
                     "lotMinHoldSeconds": self.lot_min_hold_seconds(),
+                    "lotExitMode": self.lot_exit_mode(),
                     "recoveryActive": recovery_active,
                     "recoveryHigh": recovery_high,
                     "closeThreshold": (

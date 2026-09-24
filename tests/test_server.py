@@ -1339,6 +1339,27 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(result["lotMinHoldSeconds"], "90")
         self.assertEqual(monitor.lot_min_hold_seconds(), Decimal("90"))
 
+    def test_lot_exit_mode_is_saved_per_pool(self):
+        monitor = server.NeutralisMonitor("exit-mode-config")
+        monitor.config_file = Path(TEST_DATA.name) / "exit-mode-config.json"
+        result = monitor.save_config({
+            **monitor.config,
+            "source": "orca",
+            "solanaWallet": "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw",
+            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "lotExitMode": "timer_emergency",
+        })
+
+        self.assertEqual(result["lotExitMode"], "timer_emergency")
+        self.assertEqual(monitor.lot_exit_mode(), "timer_emergency")
+
+    def test_invalid_lot_exit_mode_is_rejected(self):
+        monitor = server.NeutralisMonitor("invalid-exit-mode")
+        monitor.config_file = Path(TEST_DATA.name) / "invalid-exit-mode.json"
+
+        with self.assertRaisesRegex(server.NeutralisError, "Método de saída"):
+            monitor.save_config({**monitor.config, "lotExitMode": "invalido"})
+
     def test_reentry_uses_one_global_half_trigger_and_does_not_accumulate(self):
         step = Decimal("0.01")
         high = Decimal("102")
@@ -1405,6 +1426,27 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(
             server.lot_close_reason(Decimal("100.30"), emergency, entry, False),
             "emergency",
+        )
+
+    def test_timer_mode_closes_at_expiration_without_emergency(self):
+        entry = Decimal("100")
+        self.assertIsNone(
+            server.lot_close_reason(Decimal("100"), Decimal("100.50"), entry, False, "timer")
+        )
+        self.assertEqual(
+            server.lot_close_reason(Decimal("100"), Decimal("100.50"), entry, True, "timer"),
+            "timer",
+        )
+
+    def test_timer_emergency_mode_combines_both_exits(self):
+        entry = Decimal("100")
+        self.assertEqual(
+            server.lot_close_reason(Decimal("100"), Decimal("100.40"), entry, False, "timer_emergency"),
+            "emergency",
+        )
+        self.assertEqual(
+            server.lot_close_reason(Decimal("99.80"), Decimal("99.95"), entry, True, "timer_emergency"),
+            "timer",
         )
 
     def test_incremental_lot_closes_on_first_upward_crossing(self):

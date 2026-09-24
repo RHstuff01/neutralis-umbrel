@@ -17,6 +17,12 @@ TRIGGERS = (0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00, 2.50, 3.00)
 HOLDS = (60, 120, 180, 300, 600)
 TRADE_COST = 0.0003  # taxa mais slippage conservador por execução
 RECOVERY_BUFFER = 0.001
+EMERGENCY_RISE = 0.004
+EXIT_MODES = {
+    "timer": "Somente prazo mínimo",
+    "cross_emergency": "Cruzamento após o prazo + emergência",
+    "timer_emergency": "Prazo mínimo + emergência",
+}
 
 
 def _normalize(candles: list[dict[str, Any]]) -> list[tuple[int, float]]:
@@ -64,7 +70,8 @@ def _target_and_value(price: float, context: dict[str, float]) -> tuple[float, f
 
 
 def _simulate_window(
-    candles: list[tuple[int, float]], trigger_percent: float, hold_seconds: int, context: dict[str, float]
+    candles: list[tuple[int, float]], trigger_percent: float, hold_seconds: int,
+    exit_mode: str, context: dict[str, float]
 ) -> dict[str, float]:
     ratio = context["lpPrice"] / context["hypMark"]
     reference_hyp = candles[0][1]
@@ -90,6 +97,7 @@ def _simulate_window(
         costs += abs(delta) * price * TRADE_COST
         trades += 1
 
+    previous_price = candles[0][1]
     for timestamp, price in candles[1:]:
         lp_price = price * ratio
         target, lp_value = _target_and_value(lp_price, context)
@@ -111,19 +119,22 @@ def _simulate_window(
                 trade(-short, price)
                 base_short, lots, regime = 0.0, [], "upside"
             else:
-                # Recupera apenas parcelas adicionais, depois do tempo mínimo.
-                kept: list[dict[str, float]] = []
-                for lot in lots:
-                    if timestamp - lot["openedAt"] >= hold_seconds * 1000 and price >= lot["entry"] * (1 - RECOVERY_BUFFER):
+                # Replica a saída LIFO do robô e compara os três métodos.
+                if lots:
+                    lot = lots[-1]
+                    floor = lot["entry"] * (1 - RECOVERY_BUFFER)
+                    hold_elapsed = timestamp - lot["openedAt"] >= hold_seconds * 1000
+                    emergency = exit_mode != "timer" and price >= lot["entry"] * (1 + EMERGENCY_RISE)
+                    timer_exit = exit_mode in {"timer", "timer_emergency"} and hold_elapsed and price >= floor
+                    crossed_exit = exit_mode == "cross_emergency" and hold_elapsed and previous_price < floor <= price
+                    if emergency or timer_exit or crossed_exit:
                         pnl = (lot["entry"] - price) * lot["size"]
                         realized += pnl
                         trade(-lot["size"], price)
+                        lots.pop()
                         if pnl < 0:
                             losing_exits += 1
                             whipsaw_loss += abs(pnl)
-                    else:
-                        kept.append(lot)
-                lots = kept
                 deficit = max(0.0, target - short)
                 moved = price <= anchor * (1 - trigger)
                 target_deficit = deficit / target if target > 0 else 0.0
@@ -140,6 +151,7 @@ def _simulate_window(
         combined = lp_pnl + realized + open_pnl - costs
         worst_lp = min(worst_lp, lp_pnl)
         worst_combined = min(worst_combined, combined)
+        previous_price = price
 
     final_price = candles[-1][1]
     final_lp = _target_and_value(final_price * ratio, context)[1] - initial_lp_value
@@ -152,10 +164,11 @@ def _simulate_window(
             "losingExits": float(losing_exits), "whipsaw": whipsaw_loss, "costs": costs}
 
 
-def simulate_candidate(values: list[tuple[int, float]], trigger: float, hold: int, context: dict[str, float]) -> dict[str, Any]:
-    samples = [_simulate_window(window, trigger, hold, context) for window in _windows(values)]
+def simulate_candidate(values: list[tuple[int, float]], trigger: float, hold: int, exit_mode: str, context: dict[str, float]) -> dict[str, Any]:
+    samples = [_simulate_window(window, trigger, hold, exit_mode, context) for window in _windows(values)]
     principal = context["valueUsd"]
-    result = {"triggerPercent": trigger, "holdSeconds": hold,
+    result = {"triggerPercent": trigger, "holdSeconds": hold, "exitMode": exit_mode,
+              "exitModeLabel": EXIT_MODES[exit_mode],
               "combinedResultUsd": mean(x["combined"] for x in samples),
               "lpResultUsd": mean(x["lp"] for x in samples), "hedgeResultUsd": mean(x["hedge"] for x in samples),
               "worstResultUsd": min(x["worst"] for x in samples),
@@ -191,22 +204,30 @@ def build_recommendation(candles: list[dict[str, Any]], current_percent: float, 
             and economic["lpPrice"] > 0 and economic["hypMark"] > 0):
         raise TriggerRecommendationError("Os dados econômicos da LP selecionada são inválidos")
     values = _normalize(candles)
-    candidates = [simulate_candidate(values, trigger, hold, economic) for trigger in TRIGGERS for hold in HOLDS]
+    candidates = [simulate_candidate(values, trigger, hold, exit_mode, economic)
+                  for trigger in TRIGGERS for hold in HOLDS for exit_mode in EXIT_MODES]
     eligible = [item for item in candidates if item["protectionPercent"] >= 90] or candidates
     balanced = max(eligible, key=lambda x: (x["score"], -x["averageTrades"]))
     protected = max(candidates, key=lambda x: (x["protectionPercent"], x["score"]))
     floor = max(x["score"] for x in eligible) - economic["valueUsd"] * 0.0025
     economical = min((x for x in eligible if x["score"] >= floor), key=lambda x: (x["averageTrades"], -x["score"]))
+    exit_scenarios = []
+    for exit_mode, label in EXIT_MODES.items():
+        mode_candidates = [item for item in candidates if item["exitMode"] == exit_mode]
+        mode_eligible = [item for item in mode_candidates if item["protectionPercent"] >= 90] or mode_candidates
+        exit_scenarios.append(_profile(label, max(mode_eligible, key=lambda x: (x["score"], -x["averageTrades"]))))
     first_at, last_at = values[0][0], values[-1][0]
     days = max(0.0, (last_at - first_at) / 86_400_000)
     return {"recommendedPercent": balanced["triggerPercent"], "recommendedHoldSeconds": balanced["holdSeconds"],
+            "recommendedExitMode": balanced["exitMode"], "recommendedExitModeLabel": balanced["exitModeLabel"],
             "currentPercent": round(float(current_percent), 2), "lpValueUsd": round(economic["valueUsd"], 2),
             "candleCount": len(values), "coverageDays": round(days, 1),
             "confidence": "alta" if days >= 21 else "média" if days >= 7 else "baixa",
             "sampleStart": datetime.fromtimestamp(first_at / 1000, timezone.utc).isoformat(),
             "sampleEnd": datetime.fromtimestamp(last_at / 1000, timezone.utc).isoformat(),
             "profiles": [_profile("Mais protegido", protected), _profile("Equilibrado", balanced), _profile("Menos operações", economical)],
-            "method": "Otimização econômica da LP selecionada em janelas móveis de 24 h, com custos e proteção mínima de 90%"}
+            "exitScenarios": exit_scenarios,
+            "method": "Otimização econômica da LP em janelas móveis de 24 h, comparando gatilho, prazo e os três métodos de saída"}
 
 
 def fetch_candles(market: str, requester: Callable[[str, dict[str, Any]], Any], info_url: str, *, days: int = 30, now_ms: int | None = None) -> list[dict[str, Any]]:
