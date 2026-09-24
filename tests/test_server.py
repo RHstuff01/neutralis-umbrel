@@ -1377,6 +1377,36 @@ class NeutralisTests(unittest.TestCase):
         self.assertFalse(server.lot_recovery_crossed(Decimal("4.00"), Decimal("3.97"), entry))
         self.assertFalse(server.lot_recovery_crossed(Decimal("3.96"), Decimal("3.97"), entry))
 
+    def test_lot_minimum_time_does_not_close_by_itself(self):
+        entry = Decimal("100")
+        self.assertIsNone(
+            server.lot_close_reason(Decimal("100.10"), Decimal("100.20"), entry, True)
+        )
+
+    def test_lot_normal_recovery_requires_hold_and_upward_crossing(self):
+        entry = Decimal("100")
+        floor = entry * (Decimal("1") - server.BASE_RECOVERY_EXIT_BUFFER)
+
+        self.assertIsNone(
+            server.lot_close_reason(floor - Decimal("0.01"), floor, entry, False)
+        )
+        self.assertEqual(
+            server.lot_close_reason(floor - Decimal("0.01"), floor, entry, True),
+            "recovery",
+        )
+
+    def test_lot_emergency_exit_ignores_minimum_time_at_four_tenths_percent(self):
+        entry = Decimal("100")
+        emergency = entry * (Decimal("1") + server.LOT_EMERGENCY_EXIT_RISE)
+
+        self.assertIsNone(
+            server.lot_close_reason(Decimal("100.30"), Decimal("100.399"), entry, False)
+        )
+        self.assertEqual(
+            server.lot_close_reason(Decimal("100.30"), emergency, entry, False),
+            "emergency",
+        )
+
     def test_incremental_lot_closes_on_first_upward_crossing(self):
         position = {
             "positionAddress": "position", "hedgeSymbol": "NEAR", "currentPrice": Decimal("100"),
@@ -1591,6 +1621,28 @@ class NeutralisTests(unittest.TestCase):
     def test_target_deficit_never_authorizes_short_reduction(self):
         self.assertEqual(server.target_short_deficit_ratio(Decimal("100"), Decimal("90")), Decimal("0.1"))
         self.assertEqual(server.target_short_deficit_ratio(Decimal("100"), Decimal("110")), Decimal("0"))
+
+    def test_target_deficit_overrides_recovery_wait_only_to_increase_short(self):
+        self.assertTrue(
+            server.target_deficit_adjustment_allowed(
+                Decimal("81.958"), Decimal("67.270"), True, False
+            )
+        )
+        self.assertFalse(
+            server.target_deficit_adjustment_allowed(
+                Decimal("100"), Decimal("91"), True, False
+            )
+        )
+        self.assertFalse(
+            server.target_deficit_adjustment_allowed(
+                Decimal("90"), Decimal("100"), True, False
+            )
+        )
+        self.assertFalse(
+            server.target_deficit_adjustment_allowed(
+                Decimal("81.958"), Decimal("67.270"), True, True
+            )
+        )
 
     def test_dry_run_reopens_full_hedge_after_two_readings_below_band(self):
         position = {

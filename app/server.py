@@ -72,6 +72,9 @@ AUTO_RETRY_SECONDS = 1
 # Somente parcelas adicionais são recuperadas pouco abaixo do próprio preço
 # de execução. O short-base segue a referência inicial da operação.
 BASE_RECOVERY_EXIT_BUFFER = Decimal("0.001")
+# Uma alta muito rápida não pode manter a parcela presa durante o tempo
+# mínimo. Acima deste limite, a parcela adicional é encerrada imediatamente.
+LOT_EMERGENCY_EXIT_RISE = Decimal("0.004")
 # Segunda proteção do delta: se a composição da LP aumentar o short-alvo
 # rapidamente, não esperamos uma banda inteira de preço para recompor o hedge.
 # O limite é sempre medido contra o alvo atual e nunca autoriza reduções.
@@ -1635,6 +1638,27 @@ def lot_recovery_crossed(previous_mark: Decimal, mark: Decimal, entry_price: Dec
     return previous_mark < close_floor <= mark
 
 
+def lot_close_reason(
+    previous_mark: Decimal,
+    mark: Decimal,
+    entry_price: Decimal,
+    hold_elapsed: bool,
+) -> str | None:
+    """Decide a saída de uma parcela sem transformar o prazo em gatilho.
+
+    A recuperação normal só vale após o tempo mínimo e no cruzamento
+    ascendente de 0,10% abaixo da entrada. A emergência de +0,40% ignora o
+    prazo para limitar a perda em uma alta rápida.
+    """
+    if mark <= 0 or entry_price <= 0:
+        return None
+    if mark >= entry_price * (Decimal("1") + LOT_EMERGENCY_EXIT_RISE):
+        return "emergency"
+    if hold_elapsed and lot_recovery_crossed(previous_mark, mark, entry_price):
+        return "recovery"
+    return None
+
+
 def recovery_reentry_signal(regime: str, mark: Decimal, recovery_high: Decimal, step: Decimal) -> bool:
     """Recompõe parcelas recuperadas; nunca reabre o short-base no modo de alta."""
     return (
@@ -1651,6 +1675,23 @@ def target_short_deficit_ratio(target: Decimal, current_short: Decimal) -> Decim
     if target <= 0 or current_short >= target:
         return Decimal("0")
     return (target - max(Decimal("0"), current_short)) / target
+
+
+def target_deficit_adjustment_allowed(
+    target: Decimal,
+    current_short: Decimal,
+    recovery_active: bool,
+    lot_action_performed: bool,
+) -> bool:
+    """Mantém a trava da recuperação, exceto para recompor déficit crítico.
+
+    A exceção só autoriza aumento de short. Uma redução continua esperando a
+    lógica própria das parcelas e nunca usa o limite de déficit.
+    """
+    if lot_action_performed or target <= current_short:
+        return False
+    deficit_triggered = target_short_deficit_ratio(target, current_short) >= TARGET_SHORT_DEFICIT_RATIO
+    return not recovery_active or deficit_triggered
 
 
 def json_safe(value: Any) -> Any:
@@ -2946,22 +2987,13 @@ class NeutralisMonitor:
                             open_lot["recoveryArmed"] = True
                     newest_lot = open_hedge_lots(hedge_lots)[-1]
                     lot_entry = decimal(newest_lot["entryPrice"], "entrada da parcela")
-                    lot_close_floor = lot_entry * (Decimal("1") - BASE_RECOVERY_EXIT_BUFFER)
-                    crossed_recovery = lot_recovery_crossed(previous_hyp_mark, hyp_now.mark, lot_entry)
                     minimum_hold = self.lot_min_hold_seconds()
                     hold_elapsed = lot_minimum_hold_elapsed(newest_lot, minimum_hold)
-                    # Compatibilidade após reinício: se o processo voltar já
-                    # dentro da faixa lucrativa, encerre a parcela sem esperar
-                    # um novo mergulho. Acima da entrada, somente um cruzamento
-                    # observado nesta execução autoriza a saída.
-                    eligible = hold_elapsed and bool(newest_lot.get("recoveryArmed")) and hyp_now.mark >= lot_close_floor and (
-                        bool(newest_lot.get("recoveryForceClose"))
-                        or hyp_now.mark > previous_hyp_mark
-                        or minimum_hold > 0
+                    close_reason = lot_close_reason(
+                        previous_hyp_mark, hyp_now.mark, lot_entry, hold_elapsed
                     )
-                    eligible = eligible or (hold_elapsed and crossed_recovery)
                     lot_id = str(newest_lot.get("id", ""))
-                    if eligible:
+                    if close_reason:
                         lot_size = decimal(newest_lot["size"], "parcela")
                         current_for_lots = abs(min(hyp_now.signed_position, Decimal("0"))) if live else virtual_short
                         close_target = max(Decimal("0"), current_for_lots - lot_size)
@@ -2974,11 +3006,16 @@ class NeutralisMonitor:
                             consume_hedge_lot(newest_lot, lot_size)
                             virtual_short = close_target
                         self._event(
-                            "lot-recovery",
-                            f"PARCELA RECUPERADA · reduzir short {lot_size} {position_now['hedgeSymbol']}",
+                            "lot-emergency" if close_reason == "emergency" else "lot-recovery",
+                            (
+                                f"SAÍDA EMERGENCIAL +0,40% · reduzir short {lot_size} {position_now['hedgeSymbol']}"
+                                if close_reason == "emergency"
+                                else f"PARCELA RECUPERADA · reduzir short {lot_size} {position_now['hedgeSymbol']}"
+                            ),
                             size=lot_size,
                             entryPrice=lot_entry,
                             mark=hyp_now.mark,
+                            closeReason=close_reason,
                             live=live,
                         )
                         recovery_active = True
@@ -3096,10 +3133,16 @@ class NeutralisMonitor:
                 target_deficit = target_short_deficit_ratio(target, adjustment_short)
                 price_triggered = abs(movement) >= step
                 target_deficit_triggered = target_deficit >= TARGET_SHORT_DEFICIT_RATIO
+                deficit_adjustment_allowed = target_deficit_adjustment_allowed(
+                    target, adjustment_short, recovery_active, lot_action_performed
+                )
                 if (price_triggered or target_deficit_triggered) and (
                     hedge_strategy == "neutral"
                     or (hedge_regime == "protected" and regime_confirmation_count == 0)
-                ) and not recovery_active and not lot_action_performed:
+                ) and (
+                    (not recovery_active and not lot_action_performed)
+                    or (target_deficit_triggered and deficit_adjustment_allowed)
+                ):
                     current_short = abs(min(hyp_now.signed_position, Decimal("0")))
                     difference = target - (current_short if live else virtual_short)
                     size = abs(difference).quantize(quantum, rounding=ROUND_DOWN)
@@ -3133,6 +3176,9 @@ class NeutralisMonitor:
                                 else:
                                     base_short = result["currentShort"]
                                 virtual_short = result["currentShort"]
+                                if target_deficit_triggered and difference > 0:
+                                    recovery_active = False
+                                    recovery_high = Decimal("0")
                                 # Conserva o preço projetado no próximo
                                 # degrau, mesmo que o tick Orca ainda esteja
                                 # temporariamente atrasado em relação à Hyp.
@@ -3149,6 +3195,9 @@ class NeutralisMonitor:
                             virtual_short = virtual_short + size if difference > 0 else max(Decimal("0"), virtual_short - size)
                             if difference > 0:
                                 add_hedge_lot(hedge_lots, size, hyp_now.mark)
+                                if target_deficit_triggered:
+                                    recovery_active = False
+                                    recovery_high = Decimal("0")
                             else:
                                 base_short = virtual_short
                             self._event("adjustment", f"SIMULAR {action} {size} {position['hedgeSymbol']}", size=size, before=before, after=virtual_short, target=target, mark=hyp_now.mark)
