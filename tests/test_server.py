@@ -19,6 +19,13 @@ SPEC.loader.exec_module(server)
 
 
 class NeutralisTests(unittest.TestCase):
+    def test_new_installation_does_not_ship_with_wallet_addresses(self):
+        monitor = server.NeutralisMonitor("blank-wallet-defaults")
+
+        self.assertEqual(monitor.config["solanaWallet"], "")
+        self.assertEqual(monitor.config["evmWallet"], "")
+        self.assertEqual(monitor.config["hyperliquidAccount"], "")
+
     def setUp(self):
         for monitor in server.MONITORS.values():
             monitor.persisted_strategy = None
@@ -46,14 +53,14 @@ class NeutralisTests(unittest.TestCase):
             ],
         ]
         with patch.object(server, "json_request", side_effect=responses):
-            result = server.hyp_performance_since(server.DEFAULT_HYP_ACCOUNT, "xyz:IBM", 1_700_000_000_000)
+            result = server.hyp_performance_since("0x1111111111111111111111111111111111111111", "xyz:IBM", 1_700_000_000_000)
         self.assertEqual(result["realizedPnlUsd"], Decimal("10.50"))
         self.assertEqual(result["feesUsd"], Decimal("0.50"))
         self.assertEqual(result["fundingUsd"], Decimal("1.25"))
 
     def test_real_result_baseline_persists_and_combines_lp_and_hyp(self):
         monitor = server.NeutralisMonitor("performance-test")
-        monitor.config = {**monitor.config, "source": "orca", "positionAddress": "position", "hyperliquidAccount": server.DEFAULT_HYP_ACCOUNT}
+        monitor.config = {**monitor.config, "source": "orca", "positionAddress": "position", "hyperliquidAccount": "0x1111111111111111111111111111111111111111"}
         position = {"positionAddress": "position", "liquidityUsd": Decimal("10000")}
         hyp = server.HypState("xyz:IBM", 2, Decimal("230"), Decimal("230"), Decimal("-10"), 0, entry_price=Decimal("232"))
         with patch.object(monitor, "_event"), patch.object(server, "hyp_performance_since", return_value={
@@ -185,7 +192,7 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(server.hyp_symbol("ZEC"), "ZEC")
 
     def test_orca_discovers_classic_and_token_2022_position_nfts(self):
-        wallet = "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw"
+        wallet = "11111111111111111111111111111111"
         classic = "6cHCWbDnkHehmYh8LcfwKTDdq9ncHGnVuTAVNAQ5kPEw"
         token_2022 = "CNJt5jfTNps9HxE6CRgefvFCTrNdYAcetJSEosaLHzq4"
         def payload(mint):
@@ -215,7 +222,7 @@ class NeutralisTests(unittest.TestCase):
         )
 
     def test_orca_discovers_positions_inside_bundle(self):
-        wallet = "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw"
+        wallet = "11111111111111111111111111111111"
         mint = "6sf6fSK6tTubFA2LMCeTzt4c6DeNVyA6WpDDgtWs7a5p"
         bundle = server.orca_position_bundle_pda(mint)
         bundled_position = server.orca_bundled_position_pda(bundle, 0)
@@ -236,7 +243,7 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(positions[0]["bundleIndex"], 0)
 
     def test_orca_ignores_non_nft_token_accounts(self):
-        wallet = "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw"
+        wallet = "11111111111111111111111111111111"
         mint = "3obGz9gF9MTcvyebAofE1bS21fTA1sfV9KFBJMsfvfTK"
         empty = {"result": {"value": []}}
         account = server.base58_decode(mint) + bytes(32) + (2).to_bytes(8, "little") + bytes(93)
@@ -334,7 +341,7 @@ class NeutralisTests(unittest.TestCase):
 
     def test_byreal_position_normalization(self):
         position = {
-            "positionAddress": "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw",
+            "positionAddress": "11111111111111111111111111111111",
             "poolAddress": "pool",
             "lowerTick": 56000,
             "upperTick": 57000,
@@ -409,16 +416,16 @@ class NeutralisTests(unittest.TestCase):
         self.assertGreater(target, 0)
 
     def test_byreal_mint_price_requires_exact_mint(self):
-        mint = "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw"
+        mint = "11111111111111111111111111111111"
         payload = {"result": {"data": {"records": [
-            {"mintAddress": "11111111111111111111111111111111", "priceUsd": "999"},
+            {"mintAddress": "21111111111111111111111111111111", "priceUsd": "999"},
             {"mintAddress": mint, "priceUsd": "177.73"},
         ]}}}
         with patch.object(server, "json_request", return_value=payload):
             self.assertEqual(server.byreal_mint_price(mint), 177.73)
 
     def test_byreal_positions_enriches_price_from_mint_catalog(self):
-        wallet = "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw"
+        wallet = "11111111111111111111111111111111"
         asset_mint = "CNJt5jfTNps9HxE6CRgefvFCTrNdYAcetJSEosaLHzq4"
         position_payload = {"result": {"data": {
             "positions": [{"positionAddress": "position", "poolAddress": "pool", "lowerTick": 51000, "upperTick": 53000, "liquidityUsd": "1000"}],
@@ -439,7 +446,7 @@ class NeutralisTests(unittest.TestCase):
             }
         }
         with patch.object(server, "json_request", return_value=payload):
-            positions = server.byreal_positions("6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw")
+            positions = server.byreal_positions("11111111111111111111111111111111")
         self.assertEqual(len(positions), 1)
         self.assertEqual(positions[0]["hedgeSymbol"], "CRCL")
 
@@ -541,8 +548,8 @@ class NeutralisTests(unittest.TestCase):
         pool_id = "0x6fd1e411116a0d3df88e6fec47ade148941e6e43ab886e43eb7f59b166e1ef0f"
         result = monitor.save_config({
             "source": "uniswap",
-            "evmWallet": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
-            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "evmWallet": "0x1111111111111111111111111111111111111111",
+            "hyperliquidAccount": "0x1111111111111111111111111111111111111111",
             "positionAddress": pool_id,
             "uniswapTokenId": "42",
             "maxPositionNotional": "1000",
@@ -558,8 +565,8 @@ class NeutralisTests(unittest.TestCase):
         pool = "0x34D0dC122CF9A8Eb296fC5e0D3A233625D7d19b7"
         result = monitor.save_config({
             "source": "uniswap",
-            "evmWallet": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
-            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "evmWallet": "0x1111111111111111111111111111111111111111",
+            "hyperliquidAccount": "0x1111111111111111111111111111111111111111",
             "positionAddress": pool,
             "uniswapTokenId": "729115",
             "maxPositionNotional": "1000",
@@ -627,7 +634,7 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(request.call_count, 2)
 
     def test_uniswap_nft_discovery_uses_blockscout_not_alchemy_logs(self):
-        wallet = "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF"
+        wallet = "0x1111111111111111111111111111111111111111"
         payload = {"items": [{"token": {"address": server.UNISWAP_V4_POSITION_MANAGER}, "token_instances": [{"id": "42"}, {"token_id": "43"}]}]}
         with patch.object(server, "json_request", return_value=payload) as request:
             self.assertEqual(server.uniswap_v4_owner_tokens(wallet), [42, 43])
@@ -668,7 +675,7 @@ class NeutralisTests(unittest.TestCase):
         self.assertTrue(normalized["importable"])
 
     def test_main_hyperliquid_market_is_queried_without_dex(self):
-        account = "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF"
+        account = "0x1111111111111111111111111111111111111111"
         metadata = {"universe": [{"name": "ZEC", "szDecimals": 3}]}
         contexts = [{"markPx": "42", "oraclePx": "42"}]
         clearinghouse = {"assetPositions": [{"position": {"coin": "ZEC", "szi": "-1.2", "entryPx": "41.75"}}]}
@@ -680,7 +687,7 @@ class NeutralisTests(unittest.TestCase):
         self.assertTrue(all("dex" not in call.args[1] for call in request.call_args_list))
 
     def test_ibm_uses_active_hyperliquid_catalog_name(self):
-        account = "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF"
+        account = "0x1111111111111111111111111111111111111111"
         metadata = {"universe": [{"name": "IBM", "szDecimals": 2}]}
         contexts = [{"markPx": "240", "oraclePx": "240"}]
         with patch.object(server, "json_request", side_effect=[(metadata, contexts), {"assetPositions": []}, []]):
@@ -689,7 +696,7 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(server.HYP_MARKET_ALTERNATIVES["IBM"], ("IBM",))
 
     def test_aapl_uses_usd_suffix_when_that_is_the_active_catalog_name(self):
-        account = "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF"
+        account = "0x1111111111111111111111111111111111111111"
         metadata = {"universe": [{"name": "AAPLUSD", "szDecimals": 2}]}
         contexts = [{"markPx": "240", "oraclePx": "240"}]
         with patch.object(server, "json_request", side_effect=[(metadata, contexts), {"assetPositions": []}, []]):
@@ -697,7 +704,7 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(hyp.market, "xyz:AAPLUSD")
 
     def test_hyp_finds_stock_after_it_moves_to_another_perp_dex(self):
-        account = "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF"
+        account = "0x1111111111111111111111111111111111111111"
         empty_meta, empty_contexts = {"universe": []}, []
         active_meta, active_contexts = {"universe": [{"name": "AAPL", "szDecimals": 2}]}, [{"markPx": "240", "oraclePx": "240"}]
         with patch.object(server, "json_request", side_effect=[(empty_meta, empty_contexts), [{"name": "other"}], (active_meta, active_contexts), {"assetPositions": []}, []]):
@@ -705,7 +712,7 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(hyp.market, "other:AAPL")
 
     def test_hyp_accepts_fully_qualified_hip3_catalog_name(self):
-        account = "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF"
+        account = "0x1111111111111111111111111111111111111111"
         metadata = {"universe": [{"name": "xyz:AAPL", "szDecimals": 2}]}
         contexts = [{"markPx": "240", "oraclePx": "240"}]
         clearinghouse = {"assetPositions": [{"position": {"coin": "xyz:AAPL", "szi": "-2"}}]}
@@ -715,7 +722,7 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(hyp.signed_position, Decimal("-2"))
 
     def test_hyp_finds_spacex_nvidia_and_google_contracts(self):
-        account = "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF"
+        account = "0x1111111111111111111111111111111111111111"
         metadata = {"universe": [
             {"name": "xyz:NVDA", "szDecimals": 3},
             {"name": "xyz:SPCX", "szDecimals": 2},
@@ -748,7 +755,7 @@ class NeutralisTests(unittest.TestCase):
         metadata = {"universe": [{"name": "xyz:AMZN", "szDecimals": 3}]}
         contexts = [{"markPx": "245.50", "oraclePx": "245.45"}]
         with patch.object(server, "json_request", side_effect=[(metadata, contexts), {"assetPositions": []}, []]):
-            hyp = server.hyp_state("0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF", "AMZNx")
+            hyp = server.hyp_state("0x1111111111111111111111111111111111111111", "AMZNx")
         self.assertEqual(hyp.market, "xyz:AMZN")
         self.assertEqual(hyp.decimals, 3)
 
@@ -972,9 +979,9 @@ class NeutralisTests(unittest.TestCase):
         monitor.config_file = Path(TEST_DATA.name) / "arc-test-config.json"
         saved = monitor.save_config({
             "source": "uniswap_arc",
-            "evmWallet": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "evmWallet": "0x1111111111111111111111111111111111111111",
             "uniswapTokenId": "57757",
-            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "hyperliquidAccount": "0x1111111111111111111111111111111111111111",
             "positionAddress": "",
             "maxPositionNotional": "5000",
             "stepPercent": "0.5",
@@ -1015,7 +1022,7 @@ class NeutralisTests(unittest.TestCase):
             **monitor.config,
             "source": "orca",
             "positionAddress": "actual-position",
-            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "hyperliquidAccount": "0x1111111111111111111111111111111111111111",
             "hedgeStrategy": "upside",
         }
         position = {"positionAddress": "actual-position"}
@@ -1044,7 +1051,7 @@ class NeutralisTests(unittest.TestCase):
             **monitor.config,
             "source": "orca",
             "positionAddress": "actual-position",
-            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "hyperliquidAccount": "0x1111111111111111111111111111111111111111",
             "hedgeStrategy": "upside",
         }
         position = {"positionAddress": "actual-position"}
@@ -1069,7 +1076,7 @@ class NeutralisTests(unittest.TestCase):
             **monitor.config,
             "source": "byreal",
             "positionAddress": "near-position",
-            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "hyperliquidAccount": "0x1111111111111111111111111111111111111111",
             "hedgeStrategy": "upside",
         }
         position = {"positionAddress": "near-position"}
@@ -1099,7 +1106,7 @@ class NeutralisTests(unittest.TestCase):
             **monitor.config,
             "source": "byreal",
             "positionAddress": "near-position",
-            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "hyperliquidAccount": "0x1111111111111111111111111111111111111111",
             "hedgeStrategy": "upside",
         }
         position = {"positionAddress": "near-position"}
@@ -1126,7 +1133,7 @@ class NeutralisTests(unittest.TestCase):
             **monitor.config,
             "source": "orca",
             "positionAddress": "avax-position",
-            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "hyperliquidAccount": "0x1111111111111111111111111111111111111111",
             "hedgeStrategy": "upside",
         }
         position = {"positionAddress": "avax-position"}
@@ -1155,7 +1162,7 @@ class NeutralisTests(unittest.TestCase):
             **monitor.config,
             "source": "byreal",
             "positionAddress": "near-position",
-            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "hyperliquidAccount": "0x1111111111111111111111111111111111111111",
             "hedgeStrategy": "upside",
         }
         position = {"positionAddress": "near-position"}
@@ -1184,7 +1191,7 @@ class NeutralisTests(unittest.TestCase):
             **monitor.config,
             "source": "orca",
             "positionAddress": "avax-position",
-            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "hyperliquidAccount": "0x1111111111111111111111111111111111111111",
             "hedgeStrategy": "upside",
         }
         position = {"positionAddress": "avax-position"}
@@ -1229,7 +1236,7 @@ class NeutralisTests(unittest.TestCase):
         monitor.config = {
             **monitor.config,
             "source": "orca",
-            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "hyperliquidAccount": "0x1111111111111111111111111111111111111111",
             "hedgeStrategy": "upside",
         }
         lot = {"id": "lot-1", "size": "2.5", "entryPrice": "99", "openedAt": "now", "closedAt": None}
@@ -1331,8 +1338,8 @@ class NeutralisTests(unittest.TestCase):
         result = monitor.save_config({
             **monitor.config,
             "source": "orca",
-            "solanaWallet": "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw",
-            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "solanaWallet": "11111111111111111111111111111111",
+            "hyperliquidAccount": "0x1111111111111111111111111111111111111111",
             "lotMinHoldSeconds": "90",
         })
 
@@ -1345,8 +1352,8 @@ class NeutralisTests(unittest.TestCase):
         result = monitor.save_config({
             **monitor.config,
             "source": "orca",
-            "solanaWallet": "6BYJDhDgA73eGbLQCPvkvwrJLLi5w1yvBeqzCAnJRmfw",
-            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "solanaWallet": "11111111111111111111111111111111",
+            "hyperliquidAccount": "0x1111111111111111111111111111111111111111",
             "lotExitMode": "timer_emergency",
         })
 
@@ -1358,7 +1365,12 @@ class NeutralisTests(unittest.TestCase):
         monitor.config_file = Path(TEST_DATA.name) / "invalid-exit-mode.json"
 
         with self.assertRaisesRegex(server.NeutralisError, "Método de saída"):
-            monitor.save_config({**monitor.config, "lotExitMode": "invalido"})
+            monitor.save_config({
+                **monitor.config,
+                "solanaWallet": "11111111111111111111111111111111",
+                "hyperliquidAccount": "0x1111111111111111111111111111111111111111",
+                "lotExitMode": "invalido",
+            })
 
     def test_reentry_uses_one_global_half_trigger_and_does_not_accumulate(self):
         step = Decimal("0.01")
@@ -1518,7 +1530,7 @@ class NeutralisTests(unittest.TestCase):
         monitor.config = {
             **monitor.config,
             "source": "orca",
-            "hyperliquidAccount": "0x622dF631Bb769123FC7b8FEd0d2C363045aceDCF",
+            "hyperliquidAccount": "0x1111111111111111111111111111111111111111",
             "hedgeStrategy": "upside",
         }
         position = {"positionAddress": "actual-position"}
