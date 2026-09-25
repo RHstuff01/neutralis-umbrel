@@ -80,6 +80,9 @@ LOT_EXIT_MODES = {"timer", "cross_emergency", "timer_emergency"}
 # rapidamente, não esperamos uma banda inteira de preço para recompor o hedge.
 # O limite é sempre medido contra o alvo atual e nunca autoriza reduções.
 TARGET_SHORT_DEFICIT_RATIO = Decimal("0.10")
+# Mesmo durante a recuperação, no máximo 15% do alvo pode ficar deliberadamente
+# sem hedge. O excedente volta a ser tratado como déficit real de proteção.
+RECOVERY_RELEASE_CAP_RATIO = Decimal("0.15")
 # Uma IOC que não encontra livro não deve abandonar o hedge. O preço-limite
 # vai ficando mais agressivo até este teto e depois continua tentando nele,
 # sempre podendo ser interrompido manualmente pelo usuário.
@@ -1677,6 +1680,21 @@ def recovery_reentry_signal(regime: str, mark: Decimal, recovery_high: Decimal, 
     )
 
 
+def hedge_open_threshold(
+    regime: str,
+    protection_reference: Decimal,
+    step: Decimal,
+    recovery_active: bool = False,
+    recovery_high: Decimal = Decimal("0"),
+) -> Decimal:
+    """Exibe o próximo preço que realmente pode abrir ou recompor o hedge."""
+    if recovery_active and recovery_high > 0:
+        return recovery_high * (Decimal("1") - step / Decimal("2"))
+    if regime in {"initial_wait", "direction_wait"}:
+        return protection_reference * (Decimal("1") - step / Decimal("2"))
+    return protection_reference
+
+
 def target_short_deficit_ratio(target: Decimal, current_short: Decimal) -> Decimal:
     """Percentual do alvo ainda desprotegido; excesso de short retorna zero."""
     if target <= 0 or current_short >= target:
@@ -1690,14 +1708,28 @@ def target_unintended_deficit_ratio(
     """Déficit real, descontando o short liberado intencionalmente na recuperação."""
     if target <= 0 or current_short >= target:
         return Decimal("0")
-    released = min(max(Decimal("0"), recovery_released_size), target)
+    released = recovery_release_reserve(target, recovery_released_size)
     missing = max(Decimal("0"), target - max(Decimal("0"), current_short) - released)
     return missing / target
 
 
 def target_preserving_recovery_release(target: Decimal, recovery_released_size: Decimal) -> Decimal:
     """Alvo de segurança que não recompõe parcelas liberadas de propósito."""
-    return max(Decimal("0"), target - max(Decimal("0"), recovery_released_size))
+    return max(Decimal("0"), target - recovery_release_reserve(target, recovery_released_size))
+
+
+def recovery_release_reserve(target: Decimal, recovery_released_size: Decimal) -> Decimal:
+    """Parte intencional do gap, limitada a 15% do short-alvo atual."""
+    if target <= 0:
+        return Decimal("0")
+    return min(max(Decimal("0"), recovery_released_size), target * RECOVERY_RELEASE_CAP_RATIO)
+
+
+def recovery_release_allowance(target: Decimal, recovery_released_size: Decimal) -> Decimal:
+    """Quanto ainda pode ser liberado sem ultrapassar o limite de recuperação."""
+    if target <= 0:
+        return Decimal("0")
+    return max(Decimal("0"), target * RECOVERY_RELEASE_CAP_RATIO - max(Decimal("0"), recovery_released_size))
 
 
 def target_deficit_adjustment_allowed(
@@ -2941,6 +2973,11 @@ class NeutralisMonitor:
                 "recoveryActive": recovery_active,
                 "recoveryHigh": recovery_high,
                 "recoveryReleasedSize": recovery_released_size,
+                "intentionalRecoveryRelease": recovery_release_reserve(initial_target, recovery_released_size),
+                "unintendedDeficitPercent": target_unintended_deficit_ratio(
+                    initial_target, abs(min(hyp.signed_position, Decimal("0"))), recovery_released_size
+                ) * Decimal("100"),
+                "recoveryReleaseCapPercent": RECOVERY_RELEASE_CAP_RATIO * Decimal("100"),
                 "closeThreshold": (
                     protection_reference * (Decimal("1") + step / Decimal("2"))
                     if hedge_regime in {"initial_wait", "direction_wait"}
@@ -2948,10 +2985,8 @@ class NeutralisMonitor:
                     if hedge_regime == "protected" and hyp.entry_price > 0
                     else protection_reference
                 ),
-                "openThreshold": protection_reference * (
-                    Decimal("1") - step / Decimal("2")
-                    if hedge_regime in {"initial_wait", "direction_wait"}
-                    else Decimal("1")
+                "openThreshold": hedge_open_threshold(
+                    hedge_regime, protection_reference, step, recovery_active, recovery_high
                 ),
                 "live": live,
                 "pendingNotional": abs(initial_target - virtual_short) * hyp.mark,
@@ -3133,10 +3168,16 @@ class NeutralisMonitor:
                     )
                     lot_id = str(newest_lot.get("id", ""))
                     if close_reason:
-                        lot_size = decimal(newest_lot["size"], "parcela")
+                        requested_lot_size = decimal(newest_lot["size"], "parcela")
+                        lot_size = min(
+                            requested_lot_size,
+                            recovery_release_allowance(full_hedge_target, recovery_released_size),
+                        )
                         current_for_lots = abs(min(hyp_now.signed_position, Decimal("0"))) if live else virtual_short
                         close_target = max(Decimal("0"), current_for_lots - lot_size)
-                        if live:
+                        if lot_size * hyp_now.mark < AUTO_MIN_ORDER_NOTIONAL:
+                            released_size = Decimal("0")
+                        elif live:
                             result = self._execute_auto_adjustment(position_now, hyp_now, close_target)
                             if result:
                                 released_size = decimal(result["filled"], "execução da parcela")
@@ -3148,27 +3189,30 @@ class NeutralisMonitor:
                             consume_hedge_lot(newest_lot, lot_size)
                             virtual_short = close_target
                             released_size = lot_size
-                        event_name = "lot-emergency" if close_reason == "emergency" else "lot-timer" if close_reason == "timer" else "lot-recovery"
-                        event_message = (
-                            f"SAÍDA EMERGENCIAL +0,40% · reduzir short {lot_size} {position_now['hedgeSymbol']}"
-                            if close_reason == "emergency"
-                            else f"PRAZO CONCLUÍDO · reduzir short {lot_size} {position_now['hedgeSymbol']}"
-                            if close_reason == "timer"
-                            else f"PARCELA RECUPERADA · reduzir short {lot_size} {position_now['hedgeSymbol']}"
-                        )
-                        self._event(
-                            event_name,
-                            event_message,
-                            size=lot_size,
-                            entryPrice=lot_entry,
-                            mark=hyp_now.mark,
-                            closeReason=close_reason,
-                            live=live,
-                        )
-                        recovery_active = True
-                        recovery_high = hyp_now.mark
-                        recovery_released_size += released_size
-                        lot_action_performed = True
+                        if released_size > 0:
+                            event_name = "lot-emergency" if close_reason == "emergency" else "lot-timer" if close_reason == "timer" else "lot-recovery"
+                            event_message = (
+                                f"SAÍDA EMERGENCIAL +0,40% · reduzir short {released_size} {position_now['hedgeSymbol']}"
+                                if close_reason == "emergency"
+                                else f"PRAZO CONCLUÍDO · reduzir short {released_size} {position_now['hedgeSymbol']}"
+                                if close_reason == "timer"
+                                else f"PARCELA RECUPERADA · reduzir short {released_size} {position_now['hedgeSymbol']}"
+                            )
+                            self._event(
+                                event_name,
+                                event_message,
+                                size=released_size,
+                                requestedSize=requested_lot_size,
+                                releaseCapPercent=RECOVERY_RELEASE_CAP_RATIO * Decimal("100"),
+                                entryPrice=lot_entry,
+                                mark=hyp_now.mark,
+                                closeReason=close_reason,
+                                live=live,
+                            )
+                            recovery_active = True
+                            recovery_high = hyp_now.mark
+                            recovery_released_size += released_size
+                            lot_action_performed = True
 
                 # Depois de reduzir uma ou mais parcelas, uma reversão de
                 # metade do gatilho a partir da máxima da recuperação recompõe
@@ -3337,6 +3381,10 @@ class NeutralisMonitor:
                                 else:
                                     base_short = result["currentShort"]
                                 virtual_short = result["currentShort"]
+                                if recovery_active and target_deficit_triggered and difference > 0:
+                                    recovery_released_size = recovery_release_reserve(
+                                        target, recovery_released_size
+                                    )
                                 # Conserva o preço projetado no próximo
                                 # degrau, mesmo que o tick Orca ainda esteja
                                 # temporariamente atrasado em relação à Hyp.
@@ -3353,6 +3401,10 @@ class NeutralisMonitor:
                             virtual_short = virtual_short + size if difference > 0 else max(Decimal("0"), virtual_short - size)
                             if difference > 0:
                                 add_hedge_lot(hedge_lots, size, hyp_now.mark)
+                                if recovery_active and target_deficit_triggered:
+                                    recovery_released_size = recovery_release_reserve(
+                                        target, recovery_released_size
+                                    )
                             else:
                                 base_short = virtual_short
                             self._event("adjustment", f"SIMULAR {action} {size} {position['hedgeSymbol']}", size=size, before=before, after=virtual_short, target=adjustment_target, mark=hyp_now.mark)
@@ -3403,6 +3455,13 @@ class NeutralisMonitor:
                     "recoveryActive": recovery_active,
                     "recoveryHigh": recovery_high,
                     "recoveryReleasedSize": recovery_released_size,
+                    "intentionalRecoveryRelease": recovery_release_reserve(target, recovery_released_size),
+                    "unintendedDeficitPercent": target_unintended_deficit_ratio(
+                        target,
+                        abs(min(hyp_now.signed_position, Decimal("0"))) if live else virtual_short,
+                        recovery_released_size,
+                    ) * Decimal("100"),
+                    "recoveryReleaseCapPercent": RECOVERY_RELEASE_CAP_RATIO * Decimal("100"),
                     "closeThreshold": (
                         protection_reference * (Decimal("1") + step / Decimal("2"))
                         if hedge_regime in {"initial_wait", "direction_wait"}
@@ -3412,10 +3471,8 @@ class NeutralisMonitor:
                     ),
                     "live": live,
                     "pendingNotional": abs(target - (abs(min(hyp_now.signed_position, Decimal('0'))) if live else virtual_short)) * hyp_now.mark,
-                    "openThreshold": protection_reference * (
-                        Decimal("1") - step / Decimal("2")
-                        if hedge_regime in {"initial_wait", "direction_wait"}
-                        else Decimal("1")
+                    "openThreshold": hedge_open_threshold(
+                        hedge_regime, protection_reference, step, recovery_active, recovery_high
                     ),
                 }
                 with self.lock:

@@ -1528,8 +1528,9 @@ class NeutralisTests(unittest.TestCase):
                 server, "target_at_reference_price", side_effect=[Decimal("12"), Decimal("12"), Decimal("10")]
             ), patch.object(server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)):
                 server.MONITOR._run(live=False)
-            self.assertEqual(server.MONITOR.state["snapshot"]["openLotCount"], 0)
+            self.assertEqual(server.MONITOR.state["snapshot"]["openLotCount"], 1)
             self.assertTrue(server.MONITOR.state["snapshot"]["recoveryActive"])
+            self.assertEqual(server.MONITOR.state["snapshot"]["intentionalRecoveryRelease"], 1.5)
             self.assertIn("lot-recovery", events)
         finally:
             server.MONITOR.config = original
@@ -1718,6 +1719,18 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(server.target_short_deficit_ratio(Decimal("100"), Decimal("90")), Decimal("0.1"))
         self.assertEqual(server.target_short_deficit_ratio(Decimal("100"), Decimal("110")), Decimal("0"))
 
+    def test_displayed_open_threshold_uses_recovery_reentry_level(self):
+        self.assertEqual(
+            server.hedge_open_threshold(
+                "protected", Decimal("233.07"), Decimal("0.0075"), True, Decimal("227.82")
+            ),
+            Decimal("226.965675"),
+        )
+        self.assertEqual(
+            server.hedge_open_threshold("initial_wait", Decimal("233.07"), Decimal("0.0075")),
+            Decimal("232.1959875"),
+        )
+
     def test_target_deficit_overrides_recovery_wait_only_to_increase_short(self):
         self.assertTrue(
             server.target_deficit_adjustment_allowed(
@@ -1743,7 +1756,7 @@ class NeutralisTests(unittest.TestCase):
     def test_intentional_recovery_release_is_not_treated_as_target_deficit(self):
         self.assertEqual(
             server.target_unintended_deficit_ratio(Decimal("100"), Decimal("80"), Decimal("20")),
-            Decimal("0"),
+            Decimal("0.05"),
         )
         self.assertFalse(
             server.target_deficit_adjustment_allowed(
@@ -1751,11 +1764,21 @@ class NeutralisTests(unittest.TestCase):
             )
         )
         self.assertEqual(
-            server.target_preserving_recovery_release(Decimal("120"), Decimal("20")), Decimal("100")
+            server.target_preserving_recovery_release(Decimal("120"), Decimal("20")), Decimal("102")
         )
         self.assertEqual(
             server.target_unintended_deficit_ratio(Decimal("120"), Decimal("80"), Decimal("20")),
-            Decimal("1") / Decimal("6"),
+            Decimal("22") / Decimal("120"),
+        )
+
+    def test_recovery_release_is_capped_at_fifteen_percent_of_target(self):
+        self.assertEqual(server.recovery_release_reserve(Decimal("100"), Decimal("30")), Decimal("15"))
+        self.assertEqual(server.recovery_release_allowance(Decimal("100"), Decimal("12")), Decimal("3"))
+        self.assertEqual(server.recovery_release_allowance(Decimal("100"), Decimal("20")), Decimal("0"))
+        self.assertTrue(
+            server.target_deficit_adjustment_allowed(
+                Decimal("94.503"), Decimal("67.270"), True, False, Decimal("24.17")
+            )
         )
         self.assertTrue(
             server.target_deficit_adjustment_allowed(
