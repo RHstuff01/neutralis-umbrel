@@ -4,7 +4,7 @@ name: Neutralis Hedge
 tagline: Hedge dinâmico protegido para LPs RWA
 icon: https://raw.githubusercontent.com/RHstuff01/neutralis-umbrel/main/neutralis-hedge/icon.png
 category: finance
-version: "0.8.60"
+version: "0.8.61"
 port: 8787
 description: >-
   Monitora uma posição de liquidez concentrada na Byreal, Raydium, Orca ou Uniswap V3/V4 e a posição
@@ -17,7 +17,7 @@ submission: https://github.com/RHstuff01/neutralis-umbrel
 repo: https://github.com/RHstuff01/neutralis-umbrel
 support: https://github.com/RHstuff01/neutralis-umbrel/issues
 gallery: []
-releaseNotes: Adiciona ícone próprio, limita a 15% o hedge liberado na recuperação e mostra o déficit real e o preço de recomposição.
+releaseNotes: Ao voltar à referência inicial HYP, zera imediatamente todo o short e libera a participação na alta.
 dependencies: []
 path: ""
 defaultUsername: ""

@@ -3047,11 +3047,11 @@ class NeutralisMonitor:
                         base_recovery_armed
                         and (base_recovery_force_close or hyp_now.mark > previous_hyp_mark),
                     )
-                    # As parcelas adicionais são recuperadas primeiro, em
-                    # ordem LIFO. O short-base só pode ser zerado depois que
-                    # nenhuma parcela adicional continuar aberta.
-                    if signal == "close" and open_hedge_lots(hedge_lots):
-                        signal = None
+                    # Voltar à referência inicial tem prioridade absoluta.
+                    # Nesse ponto todo o short deve ser zerado, inclusive as
+                    # parcelas adicionais ainda abertas; mantê-las bloquearia
+                    # a participação na alta e poderia devolver o resultado
+                    # acumulado durante a queda.
                     if signal is None:
                         # Ausência de troca de regime não é uma confirmação.
                         # O contador precisa ficar zerado para que o ajuste

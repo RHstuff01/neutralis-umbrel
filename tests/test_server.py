@@ -1568,6 +1568,43 @@ class NeutralisTests(unittest.TestCase):
         finally:
             server.MONITOR.config = original
 
+    def test_return_to_initial_reference_closes_entire_short_even_with_open_lot(self):
+        position = {
+            "positionAddress": "position", "hedgeSymbol": "NEAR", "currentPrice": Decimal("100"),
+            "hedgeMode": "units",
+        }
+        initial = server.HypState("NEAR", 3, Decimal("100"), Decimal("100"), Decimal("-10"), 0, entry_price=Decimal("100"))
+        falling = server.HypState("NEAR", 3, Decimal("99"), Decimal("99"), Decimal("-10"), 0, entry_price=Decimal("100"))
+        deeper = server.HypState("NEAR", 3, Decimal("98.5"), Decimal("98.5"), Decimal("-10"), 0, entry_price=Decimal("99"))
+        at_reference = server.HypState("NEAR", 3, Decimal("100"), Decimal("100"), Decimal("-10"), 0, entry_price=Decimal("100"))
+        snapshots = [
+            (position, initial, Decimal("80"), Decimal("120"), Decimal("60"), Decimal("10")),
+            (position, falling, Decimal("80"), Decimal("120"), Decimal("60"), Decimal("12")),
+            (position, deeper, Decimal("80"), Decimal("120"), Decimal("60"), Decimal("12")),
+            (position, at_reference, Decimal("80"), Decimal("120"), Decimal("60"), Decimal("10")),
+        ]
+        original = dict(server.MONITOR.config)
+        events = []
+        try:
+            server.MONITOR.config = {
+                **original, "hedgeStrategy": "upside", "stepPercent": "1", "lotMinHoldSeconds": "600"
+            }
+            with patch.object(server.MONITOR, "_retry_snapshot", side_effect=snapshots), patch.object(
+                server.MONITOR.stop_event, "wait", side_effect=[False, False, False, True]
+            ), patch.object(
+                server, "target_at_reference_price", side_effect=[Decimal("12"), Decimal("12"), Decimal("10")]
+            ), patch.object(server.MONITOR, "_event", side_effect=lambda event, message, **details: events.append(event)):
+                server.MONITOR._run(live=False)
+
+            snapshot = server.MONITOR.state["snapshot"]
+            self.assertEqual(snapshot["virtualShort"], 0)
+            self.assertEqual(snapshot["openLotCount"], 0)
+            self.assertEqual(snapshot["hedgeRegime"], "upside")
+            self.assertFalse(snapshot["recoveryActive"])
+            self.assertIn("upside-close", events)
+        finally:
+            server.MONITOR.config = original
+
     def test_strategy_state_reconciles_against_real_hyperliquid_position(self):
         monitor = server.NeutralisMonitor("reconciliation")
         monitor.config = {
