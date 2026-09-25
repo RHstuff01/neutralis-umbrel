@@ -76,6 +76,46 @@ class NeutralisTests(unittest.TestCase):
         self.assertEqual(second["hypOpenPnlUsd"], Decimal("10"))
         self.assertEqual(second["combinedTrackedPnlUsd"], Decimal("-76"))
 
+    def test_performance_decomposes_lp_fees_rebalancing_and_benchmarks(self):
+        monitor = server.NeutralisMonitor("performance-decomposition")
+        monitor.config = {**monitor.config, "source": "byreal", "positionAddress": "position", "hyperliquidAccount": "0x1111111111111111111111111111111111111111"}
+        position = {
+            "positionAddress": "position", "liquidityUsd": Decimal("10000"),
+            "currentPrice": Decimal("100"), "lowerPrice": Decimal("90"),
+            "upperPrice": Decimal("110"), "earnedUsd": Decimal("50"),
+        }
+        hyp = server.HypState("xyz:IBM", 2, Decimal("100"), Decimal("100"), Decimal("0"), 0)
+        history = {"realizedPnlUsd": Decimal("0"), "feesUsd": Decimal("0"), "fundingUsd": Decimal("0")}
+        with patch.object(monitor, "_event"), patch.object(server, "hyp_performance_since", return_value=history):
+            monitor._performance_metrics(position, hyp, True)
+            position.update({"liquidityUsd": Decimal("9800"), "currentPrice": Decimal("90"), "earnedUsd": Decimal("60")})
+            hyp.mark = Decimal("90")
+            result = monitor._performance_metrics(position, hyp, True)
+
+        self.assertEqual(result["lpPrincipalPnlUsd"], Decimal("-200"))
+        self.assertEqual(result["lpFeesPnlUsd"], Decimal("10"))
+        self.assertEqual(result["lpTrackedPnlUsd"], Decimal("-190"))
+        self.assertIsNotNone(result["lpPassiveMixPnlUsd"])
+        self.assertEqual(
+            result["lpRebalancingEffectUsd"],
+            result["lpPrincipalPnlUsd"] - result["lpPassiveMixPnlUsd"],
+        )
+        self.assertEqual(result["assetBuyHoldPnlUsd"], Decimal("-1000"))
+        self.assertEqual(result["advantageVsLpUsd"], Decimal("0"))
+        self.assertEqual(result["advantageVsBuyHoldUsd"], Decimal("810"))
+        self.assertTrue(result["lpFeesAvailable"])
+
+    def test_execution_slippage_is_attribution_and_persists(self):
+        monitor = server.NeutralisMonitor("performance-slippage")
+        monitor.performance_state = {"version": 1, "hypExecutionSlippageUsd": "0"}
+        monitor.performance_state_file = Path(TEST_DATA.name) / "performance-slippage.json"
+
+        monitor._record_execution_slippage(Decimal("100"), Decimal("101"), Decimal("10"), True)
+        monitor._record_execution_slippage(Decimal("100"), Decimal("99"), Decimal("5"), False)
+
+        self.assertEqual(Decimal(monitor.performance_state["hypExecutionSlippageUsd"]), Decimal("15"))
+        self.assertTrue(monitor.performance_state_file.exists())
+
     def test_xstock_symbol_maps_to_hyperliquid(self):
         self.assertEqual(server.hyp_symbol("AAPLX"), "AAPL")
         self.assertEqual(server.hyp_symbol("AMZNx"), "AMZN")
@@ -1251,11 +1291,13 @@ class NeutralisTests(unittest.TestCase):
             "hedgeLots": [lot],
             "recoveryActive": True,
             "recoveryHigh": Decimal("101.25"),
+            "recoveryReleasedSize": Decimal("2.5"),
         })
 
         self.assertEqual(monitor.persisted_strategy["version"], 8)
         self.assertEqual(monitor.persisted_strategy["hedgeLots"], [lot])
         self.assertEqual(monitor.persisted_strategy["recoveryHigh"], "101.25")
+        self.assertEqual(monitor.persisted_strategy["recoveryReleasedSize"], "2.5")
 
     def test_contaminated_avax_reference_is_replaced_by_current_operation(self):
         monitor = server.NeutralisMonitor("3")
@@ -1695,6 +1737,29 @@ class NeutralisTests(unittest.TestCase):
         self.assertFalse(
             server.target_deficit_adjustment_allowed(
                 Decimal("81.958"), Decimal("67.270"), True, True
+            )
+        )
+
+    def test_intentional_recovery_release_is_not_treated_as_target_deficit(self):
+        self.assertEqual(
+            server.target_unintended_deficit_ratio(Decimal("100"), Decimal("80"), Decimal("20")),
+            Decimal("0"),
+        )
+        self.assertFalse(
+            server.target_deficit_adjustment_allowed(
+                Decimal("100"), Decimal("80"), True, False, Decimal("20")
+            )
+        )
+        self.assertEqual(
+            server.target_preserving_recovery_release(Decimal("120"), Decimal("20")), Decimal("100")
+        )
+        self.assertEqual(
+            server.target_unintended_deficit_ratio(Decimal("120"), Decimal("80"), Decimal("20")),
+            Decimal("1") / Decimal("6"),
+        )
+        self.assertTrue(
+            server.target_deficit_adjustment_allowed(
+                Decimal("120"), Decimal("80"), True, False, Decimal("20")
             )
         )
 

@@ -1684,11 +1684,28 @@ def target_short_deficit_ratio(target: Decimal, current_short: Decimal) -> Decim
     return (target - max(Decimal("0"), current_short)) / target
 
 
+def target_unintended_deficit_ratio(
+    target: Decimal, current_short: Decimal, recovery_released_size: Decimal
+) -> Decimal:
+    """Déficit real, descontando o short liberado intencionalmente na recuperação."""
+    if target <= 0 or current_short >= target:
+        return Decimal("0")
+    released = min(max(Decimal("0"), recovery_released_size), target)
+    missing = max(Decimal("0"), target - max(Decimal("0"), current_short) - released)
+    return missing / target
+
+
+def target_preserving_recovery_release(target: Decimal, recovery_released_size: Decimal) -> Decimal:
+    """Alvo de segurança que não recompõe parcelas liberadas de propósito."""
+    return max(Decimal("0"), target - max(Decimal("0"), recovery_released_size))
+
+
 def target_deficit_adjustment_allowed(
     target: Decimal,
     current_short: Decimal,
     recovery_active: bool,
     lot_action_performed: bool,
+    recovery_released_size: Decimal = Decimal("0"),
 ) -> bool:
     """Mantém a trava da recuperação, exceto para recompor déficit crítico.
 
@@ -1697,7 +1714,12 @@ def target_deficit_adjustment_allowed(
     """
     if lot_action_performed or target <= current_short:
         return False
-    deficit_triggered = target_short_deficit_ratio(target, current_short) >= TARGET_SHORT_DEFICIT_RATIO
+    deficit_ratio = (
+        target_unintended_deficit_ratio(target, current_short, recovery_released_size)
+        if recovery_active
+        else target_short_deficit_ratio(target, current_short)
+    )
+    deficit_triggered = deficit_ratio >= TARGET_SHORT_DEFICIT_RATIO
     return not recovery_active or deficit_triggered
 
 
@@ -1789,6 +1811,25 @@ class NeutralisMonitor:
         started_at_ms = int(time.time() * 1000)
         current_short = abs(min(hyp.signed_position, Decimal("0")))
         open_pnl = (hyp.entry_price - hyp.mark) * current_short if hyp.entry_price > 0 else Decimal("0")
+        lp_value = decimal(position["liquidityUsd"], "saldo inicial acompanhado da LP")
+        lp_price = decimal(position.get("currentPrice") or hyp.mark, "preço inicial da LP")
+        fee_value = position.get("earnedUsd")
+        initial_fees = decimal(fee_value, "taxas iniciais da LP") if fee_value is not None else None
+        initial_asset = initial_quote = None
+        try:
+            lower = decimal(position["lowerPrice"], "limite inferior da LP")
+            upper = decimal(position["upperPrice"], "limite superior da LP")
+            liquidity = (
+                decimal(position["normalizedLiquidity"], "liquidez normalizada")
+                if position.get("normalizedLiquidity") is not None
+                else lp_liquidity(lp_value, lp_price, lower, upper)
+            )
+            initial_asset = base_target(liquidity, lp_price, lower, upper)
+            initial_quote = lp_value - initial_asset * lp_price
+        except (NeutralisError, KeyError, TypeError, ValueError):
+            # Alguns agregadores entregam apenas o valor total da posição.
+            # Nesses casos o benchmark da composição inicial fica indisponível.
+            pass
         state = {
             "version": 1,
             "source": self.config.get("source"),
@@ -1797,8 +1838,14 @@ class NeutralisMonitor:
             "hyperliquidAccount": self.config.get("hyperliquidAccount"),
             "startedAt": datetime.fromtimestamp(started_at_ms / 1000, timezone.utc).isoformat(),
             "startedAtMs": started_at_ms,
-            "lpInitialUsd": str(decimal(position["liquidityUsd"], "saldo inicial acompanhado da LP")),
+            "lpInitialUsd": str(lp_value),
+            "lpInitialPrice": str(lp_price),
+            "lpInitialFeesUsd": str(initial_fees) if initial_fees is not None else None,
+            "lpInitialAssetUnits": str(initial_asset) if initial_asset is not None else None,
+            "lpInitialQuoteUsd": str(initial_quote) if initial_quote is not None else None,
+            "hypInitialMark": str(hyp.mark),
             "hypInitialOpenPnlUsd": str(open_pnl),
+            "hypExecutionSlippageUsd": "0",
         }
         self._write_performance_state(state)
         self.performance_cache = {}
@@ -1807,9 +1854,13 @@ class NeutralisMonitor:
 
     def _performance_metrics(self, position: dict[str, Any], hyp: HypState, live: bool) -> dict[str, Any]:
         empty = {
-            "performanceStartedAt": None, "lpTrackedPnlUsd": None, "hypRealizedPnlUsd": None,
+            "performanceStartedAt": None, "lpPrincipalPnlUsd": None, "lpFeesPnlUsd": None,
+            "lpTrackedPnlUsd": None, "lpPassiveMixPnlUsd": None, "lpRebalancingEffectUsd": None,
+            "assetBuyHoldPnlUsd": None, "hypRealizedPnlUsd": None,
             "hypOpenPnlUsd": None, "hypFundingUsd": None, "hypFeesUsd": None,
-            "hypTrackedPnlUsd": None, "combinedTrackedPnlUsd": None, "performanceError": None,
+            "hypSlippageUsd": None, "hypTrackedPnlUsd": None, "combinedTrackedPnlUsd": None,
+            "advantageVsLpUsd": None, "advantageVsBuyHoldUsd": None,
+            "lpFeesAvailable": False, "performanceError": None,
         }
         if not live:
             return empty
@@ -1831,22 +1882,79 @@ class NeutralisMonitor:
                 if not cached:
                     return {**empty, "performanceStartedAt": baseline["startedAt"], "performanceError": str(error)}
                 history = cached
-        lp_pnl = decimal(position["liquidityUsd"], "saldo atual acompanhado da LP") - decimal(baseline["lpInitialUsd"], "saldo inicial acompanhado da LP")
+        initial_lp = decimal(baseline["lpInitialUsd"], "saldo inicial acompanhado da LP")
+        current_lp = decimal(position["liquidityUsd"], "saldo atual acompanhado da LP")
+        lp_principal_pnl = current_lp - initial_lp
+        current_fee_raw = position.get("earnedUsd")
+        initial_fee_raw = baseline.get("lpInitialFeesUsd")
+        lp_fees = None
+        if current_fee_raw is not None and initial_fee_raw is not None:
+            lp_fees = decimal(current_fee_raw, "taxas atuais da LP") - decimal(initial_fee_raw, "taxas iniciais da LP")
+        lp_net = lp_principal_pnl + (lp_fees or Decimal("0"))
+
+        passive_mix = rebalancing_effect = None
+        initial_asset_raw, initial_quote_raw = baseline.get("lpInitialAssetUnits"), baseline.get("lpInitialQuoteUsd")
+        current_lp_price_raw = position.get("currentPrice")
+        if initial_asset_raw is not None and initial_quote_raw is not None and current_lp_price_raw is not None:
+            passive_value = (
+                decimal(initial_asset_raw, "ativo inicial da LP") * decimal(current_lp_price_raw, "preço atual da LP")
+                + decimal(initial_quote_raw, "cotação inicial da LP")
+            )
+            passive_mix = passive_value - initial_lp
+            rebalancing_effect = lp_principal_pnl - passive_mix
+
+        buy_hold = None
+        if baseline.get("hypInitialMark") is not None:
+            initial_mark = decimal(baseline["hypInitialMark"], "mark HYP inicial")
+            if initial_mark > 0:
+                buy_hold = initial_lp * (hyp.mark / initial_mark - Decimal("1"))
         current_short = abs(min(hyp.signed_position, Decimal("0")))
         current_open = (hyp.entry_price - hyp.mark) * current_short if hyp.entry_price > 0 else Decimal("0")
         tracked_open = current_open - decimal(baseline["hypInitialOpenPnlUsd"], "PnL aberto inicial")
         hyp_total = history["realizedPnlUsd"] + tracked_open + history["fundingUsd"] - history["feesUsd"]
+        slippage = decimal(baseline.get("hypExecutionSlippageUsd", 0), "slippage de execução")
+        combined = lp_net + hyp_total
         return {
             "performanceStartedAt": baseline["startedAt"],
-            "lpTrackedPnlUsd": lp_pnl,
+            "lpPrincipalPnlUsd": lp_principal_pnl,
+            "lpFeesPnlUsd": lp_fees,
+            "lpTrackedPnlUsd": lp_net,
+            "lpPassiveMixPnlUsd": passive_mix,
+            "lpRebalancingEffectUsd": rebalancing_effect,
+            "assetBuyHoldPnlUsd": buy_hold,
             "hypRealizedPnlUsd": history["realizedPnlUsd"],
             "hypOpenPnlUsd": tracked_open,
             "hypFundingUsd": history["fundingUsd"],
             "hypFeesUsd": history["feesUsd"],
+            "hypSlippageUsd": slippage,
             "hypTrackedPnlUsd": hyp_total,
-            "combinedTrackedPnlUsd": lp_pnl + hyp_total,
+            "combinedTrackedPnlUsd": combined,
+            "advantageVsLpUsd": combined - lp_net,
+            "advantageVsBuyHoldUsd": combined - buy_hold if buy_hold is not None else None,
+            "lpFeesAvailable": lp_fees is not None,
             "performanceError": None,
         }
+
+    def _record_execution_slippage(
+        self, reference_mark: Decimal, fill_price: Decimal, filled_size: Decimal, is_buy: bool
+    ) -> None:
+        """Registra atribuição de execução sem descontá-la duas vezes do P&L.
+
+        O P&L realizado da Hyperliquid já incorpora o preço executado. Este
+        valor existe apenas para decompor quanto veio da diferença entre o
+        mark observado imediatamente antes da IOC e o preço médio do fill.
+        """
+        if not self.performance_state or filled_size <= 0 or reference_mark <= 0 or fill_price <= 0:
+            return
+        execution_cost = (
+            (fill_price - reference_mark) * filled_size
+            if is_buy
+            else (reference_mark - fill_price) * filled_size
+        )
+        stored = dict(self.performance_state)
+        previous = decimal(stored.get("hypExecutionSlippageUsd", 0), "slippage acumulado")
+        stored["hypExecutionSlippageUsd"] = str(previous + execution_cost)
+        self._write_performance_state(stored)
 
     def _persist_strategy_state(self, snapshot: dict[str, Any]) -> None:
         """Salva apenas o estado necessário para retomar a estratégia.
@@ -1877,6 +1985,7 @@ class NeutralisMonitor:
             "hedgeLots": snapshot.get("hedgeLots", []),
             "recoveryActive": bool(snapshot.get("recoveryActive", False)),
             "recoveryHigh": str(snapshot.get("recoveryHigh", 0)),
+            "recoveryReleasedSize": str(snapshot.get("recoveryReleasedSize", 0)),
         }
         previous = self.persisted_strategy or {}
         if all(previous.get(key) == value for key, value in payload.items()):
@@ -2397,6 +2506,7 @@ class NeutralisMonitor:
 
             filled_size = decimal(filled.get("totalSz", size), "quantidade executada")
             fill_price = decimal(filled.get("avgPx", hyp.mark), "preço executado")
+            self._record_execution_slippage(hyp.mark, fill_price, filled_size, is_buy)
             total_filled += filled_size
             total_fill_notional += filled_size * fill_price
             last_direction = is_buy
@@ -2665,6 +2775,7 @@ class NeutralisMonitor:
             hedge_lots: list[dict[str, Any]] = []
             recovery_active = False
             recovery_high = Decimal("0")
+            recovery_released_size = Decimal("0")
             base_recovery_armed = False
             base_recovery_force_close = False
             if live and restored_strategy and self.persisted_strategy:
@@ -2714,6 +2825,12 @@ class NeutralisMonitor:
                     recovery_high = decimal(self.persisted_strategy.get("recoveryHigh", 0), "máxima da recuperação")
                 except NeutralisError:
                     recovery_high = Decimal("0")
+                try:
+                    recovery_released_size = decimal(
+                        self.persisted_strategy.get("recoveryReleasedSize", 0), "short liberado na recuperação"
+                    )
+                except NeutralisError:
+                    recovery_released_size = Decimal("0")
             lots_total = sum((decimal(lot["size"], "parcela") for lot in open_hedge_lots(hedge_lots)), Decimal("0"))
             # A posição real é a fonte de verdade. Uma diferença após execução
             # manual ou migração fica incorporada ao short-base, nunca cria uma
@@ -2724,6 +2841,7 @@ class NeutralisMonitor:
                 base_short = current_short
                 recovery_active = False
                 recovery_high = Decimal("0")
+                recovery_released_size = Decimal("0")
                 self._event("lot-reconciliation", "Parcelas salvas divergiam do short real; posição real preservada como base")
             regime_confirmation: str | None = None
             regime_confirmation_count = 0
@@ -2781,6 +2899,7 @@ class NeutralisMonitor:
                     hedge_lots = []
                     recovery_active = False
                     recovery_high = Decimal("0")
+                    recovery_released_size = Decimal("0")
             initial_signed = hyp.signed_position
             virtual_short = abs(min(initial_signed, Decimal("0")))
             quantum = Decimal(1).scaleb(-hyp.decimals)
@@ -2821,6 +2940,7 @@ class NeutralisMonitor:
                 "lotExitMode": self.lot_exit_mode(),
                 "recoveryActive": recovery_active,
                 "recoveryHigh": recovery_high,
+                "recoveryReleasedSize": recovery_released_size,
                 "closeThreshold": (
                     protection_reference * (Decimal("1") + step / Decimal("2"))
                     if hedge_regime in {"initial_wait", "direction_wait"}
@@ -2944,6 +3064,7 @@ class NeutralisMonitor:
                             hedge_lots = []
                             recovery_active = False
                             recovery_high = Decimal("0")
+                            recovery_released_size = Decimal("0")
                         elif signal == "open":
                             base_short = abs(min(hyp_now.signed_position, Decimal("0"))) if live else virtual_short
                             base_recovery_armed = True
@@ -2951,9 +3072,11 @@ class NeutralisMonitor:
                             hedge_lots = []
                             recovery_active = False
                             recovery_high = Decimal("0")
+                            recovery_released_size = Decimal("0")
                         elif signal in {"confirm_upside", "wait"}:
                             recovery_active = False
                             recovery_high = Decimal("0")
+                            recovery_released_size = Decimal("0")
                         hedge_regime = (
                             "upside"
                             if signal in {"close", "confirm_upside"}
@@ -3016,11 +3139,15 @@ class NeutralisMonitor:
                         if live:
                             result = self._execute_auto_adjustment(position_now, hyp_now, close_target)
                             if result:
-                                consume_hedge_lot(newest_lot, decimal(result["filled"], "execução da parcela"))
+                                released_size = decimal(result["filled"], "execução da parcela")
+                                consume_hedge_lot(newest_lot, released_size)
                                 virtual_short = result["currentShort"]
+                            else:
+                                released_size = Decimal("0")
                         else:
                             consume_hedge_lot(newest_lot, lot_size)
                             virtual_short = close_target
+                            released_size = lot_size
                         event_name = "lot-emergency" if close_reason == "emergency" else "lot-timer" if close_reason == "timer" else "lot-recovery"
                         event_message = (
                             f"SAÍDA EMERGENCIAL +0,40% · reduzir short {lot_size} {position_now['hedgeSymbol']}"
@@ -3040,6 +3167,7 @@ class NeutralisMonitor:
                         )
                         recovery_active = True
                         recovery_high = hyp_now.mark
+                        recovery_released_size += released_size
                         lot_action_performed = True
 
                 # Depois de reduzir uma ou mais parcelas, uma reversão de
@@ -3075,6 +3203,7 @@ class NeutralisMonitor:
                             )
                         recovery_active = False
                         recovery_high = Decimal("0")
+                        recovery_released_size = Decimal("0")
                         lot_action_performed = True
                 # A saída inferior deixa a LP 100% no ativo. O hedge segue
                 # normalmente, mas o aviso é útil para o usuário reavaliar a
@@ -3111,6 +3240,7 @@ class NeutralisMonitor:
                         hedge_lots = []
                         recovery_active = False
                         recovery_high = Decimal("0")
+                        recovery_released_size = Decimal("0")
                         if hedge_strategy == "upside":
                             hedge_regime = "upside"
                         self._event(
@@ -3150,11 +3280,15 @@ class NeutralisMonitor:
                     ratio_anchor, movement, basis_from_anchor = lp_price / hyp_anchor, Decimal("0"), Decimal("0")
                     projected_lp_price = lp_anchor
                 adjustment_short = abs(min(hyp_now.signed_position, Decimal("0"))) if live else virtual_short
-                target_deficit = target_short_deficit_ratio(target, adjustment_short)
+                target_deficit = (
+                    target_unintended_deficit_ratio(target, adjustment_short, recovery_released_size)
+                    if recovery_active
+                    else target_short_deficit_ratio(target, adjustment_short)
+                )
                 price_triggered = abs(movement) >= step
                 target_deficit_triggered = target_deficit >= TARGET_SHORT_DEFICIT_RATIO
                 deficit_adjustment_allowed = target_deficit_adjustment_allowed(
-                    target, adjustment_short, recovery_active, lot_action_performed
+                    target, adjustment_short, recovery_active, lot_action_performed, recovery_released_size
                 )
                 if (price_triggered or target_deficit_triggered) and (
                     hedge_strategy == "neutral"
@@ -3164,7 +3298,12 @@ class NeutralisMonitor:
                     or (target_deficit_triggered and deficit_adjustment_allowed)
                 ):
                     current_short = abs(min(hyp_now.signed_position, Decimal("0")))
-                    difference = target - (current_short if live else virtual_short)
+                    adjustment_target = (
+                        target_preserving_recovery_release(target, recovery_released_size)
+                        if recovery_active and target_deficit_triggered
+                        else target
+                    )
+                    difference = adjustment_target - (current_short if live else virtual_short)
                     size = abs(difference).quantize(quantum, rounding=ROUND_DOWN)
                     notional = size * hyp_now.mark
                     # Uma redução correspondente a parcelas abertas espera a
@@ -3178,13 +3317,15 @@ class NeutralisMonitor:
                                 "target-deficit",
                                 f"SHORT ABAIXO DO ALVO · recompor {size} {position_now['hedgeSymbol']}",
                                 currentShort=adjustment_short,
-                                target=target,
+                                target=adjustment_target,
+                                fullTarget=target,
+                                intentionalRecoveryRelease=recovery_released_size,
                                 deficitPercent=target_deficit * Decimal("100"),
                                 mark=hyp_now.mark,
                                 live=live,
                             )
                         if live:
-                            result = self._execute_auto_adjustment(position_now, hyp_now, target)
+                            result = self._execute_auto_adjustment(position_now, hyp_now, adjustment_target)
                             if result:
                                 if difference > 0:
                                     add_hedge_lot(
@@ -3196,9 +3337,6 @@ class NeutralisMonitor:
                                 else:
                                     base_short = result["currentShort"]
                                 virtual_short = result["currentShort"]
-                                if target_deficit_triggered and difference > 0:
-                                    recovery_active = False
-                                    recovery_high = Decimal("0")
                                 # Conserva o preço projetado no próximo
                                 # degrau, mesmo que o tick Orca ainda esteja
                                 # temporariamente atrasado em relação à Hyp.
@@ -3215,12 +3353,9 @@ class NeutralisMonitor:
                             virtual_short = virtual_short + size if difference > 0 else max(Decimal("0"), virtual_short - size)
                             if difference > 0:
                                 add_hedge_lot(hedge_lots, size, hyp_now.mark)
-                                if target_deficit_triggered:
-                                    recovery_active = False
-                                    recovery_high = Decimal("0")
                             else:
                                 base_short = virtual_short
-                            self._event("adjustment", f"SIMULAR {action} {size} {position['hedgeSymbol']}", size=size, before=before, after=virtual_short, target=target, mark=hyp_now.mark)
+                            self._event("adjustment", f"SIMULAR {action} {size} {position['hedgeSymbol']}", size=size, before=before, after=virtual_short, target=adjustment_target, mark=hyp_now.mark)
                             lp_anchor = projected_lp_price
                             hyp_anchor = hyp_now.mark
                             ratio_anchor = lp_price / hyp_anchor
@@ -3267,6 +3402,7 @@ class NeutralisMonitor:
                     "lotExitMode": self.lot_exit_mode(),
                     "recoveryActive": recovery_active,
                     "recoveryHigh": recovery_high,
+                    "recoveryReleasedSize": recovery_released_size,
                     "closeThreshold": (
                         protection_reference * (Decimal("1") + step / Decimal("2"))
                         if hedge_regime in {"initial_wait", "direction_wait"}
