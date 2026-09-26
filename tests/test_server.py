@@ -1482,6 +1482,25 @@ class NeutralisTests(unittest.TestCase):
             "emergency",
         )
 
+    def test_lot_emergency_follows_half_trigger_with_safety_limits(self):
+        self.assertEqual(server.lot_emergency_exit_rise(Decimal("0.0175")), Decimal("0.00875"))
+        self.assertEqual(server.lot_emergency_exit_rise(Decimal("0.002")), Decimal("0.0025"))
+        self.assertEqual(server.lot_emergency_exit_rise(Decimal("0.05")), Decimal("0.015"))
+
+        entry = Decimal("100")
+        dynamic_rise = server.lot_emergency_exit_rise(Decimal("0.0175"))
+        self.assertIsNone(
+            server.lot_close_reason(
+                Decimal("100.70"), Decimal("100.87"), entry, False, "cross_emergency", dynamic_rise
+            )
+        )
+        self.assertEqual(
+            server.lot_close_reason(
+                Decimal("100.70"), Decimal("100.875"), entry, False, "cross_emergency", dynamic_rise
+            ),
+            "emergency",
+        )
+
     def test_timer_mode_closes_at_expiration_without_emergency(self):
         entry = Decimal("100")
         self.assertIsNone(

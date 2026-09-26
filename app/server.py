@@ -73,8 +73,11 @@ AUTO_RETRY_SECONDS = 1
 # de execução. O short-base segue a referência inicial da operação.
 BASE_RECOVERY_EXIT_BUFFER = Decimal("0.001")
 # Uma alta muito rápida não pode manter a parcela presa durante o tempo
-# mínimo. Acima deste limite, a parcela adicional é encerrada imediatamente.
+# mínimo. O valor legado é usado apenas como fallback; na operação normal a
+# emergência equivale à metade do gatilho, respeitando os limites abaixo.
 LOT_EMERGENCY_EXIT_RISE = Decimal("0.004")
+LOT_EMERGENCY_MIN_RISE = Decimal("0.0025")
+LOT_EMERGENCY_MAX_RISE = Decimal("0.015")
 LOT_EXIT_MODES = {"timer", "cross_emergency", "timer_emergency"}
 # Segunda proteção do delta: se a composição da LP aumentar o short-alvo
 # rapidamente, não esperamos uma banda inteira de preço para recompor o hedge.
@@ -1642,24 +1645,32 @@ def lot_recovery_crossed(previous_mark: Decimal, mark: Decimal, entry_price: Dec
     return previous_mark < close_floor <= mark
 
 
+def lot_emergency_exit_rise(step: Decimal) -> Decimal:
+    """Emergência proporcional ao gatilho, limitada entre 0,25% e 1,50%."""
+    if step <= 0:
+        return LOT_EMERGENCY_EXIT_RISE
+    return min(LOT_EMERGENCY_MAX_RISE, max(LOT_EMERGENCY_MIN_RISE, step / Decimal("2")))
+
+
 def lot_close_reason(
     previous_mark: Decimal,
     mark: Decimal,
     entry_price: Decimal,
     hold_elapsed: bool,
     exit_mode: str = "cross_emergency",
+    emergency_rise: Decimal = LOT_EMERGENCY_EXIT_RISE,
 ) -> str | None:
     """Decide a saída de uma parcela sem transformar o prazo em gatilho.
 
     A recuperação normal só vale após o tempo mínimo e no cruzamento
-    ascendente de 0,10% abaixo da entrada. A emergência de +0,40% ignora o
-    prazo para limitar a perda em uma alta rápida.
+    ascendente de 0,10% abaixo da entrada. A emergência proporcional ao
+    gatilho ignora o prazo para limitar a perda em uma alta rápida.
     """
     if mark <= 0 or entry_price <= 0:
         return None
     if exit_mode not in LOT_EXIT_MODES:
         return None
-    if exit_mode != "timer" and mark >= entry_price * (Decimal("1") + LOT_EMERGENCY_EXIT_RISE):
+    if exit_mode != "timer" and mark >= entry_price * (Decimal("1") + emergency_rise):
         return "emergency"
     close_floor = entry_price * (Decimal("1") - BASE_RECOVERY_EXIT_BUFFER)
     if hold_elapsed and exit_mode in {"timer", "timer_emergency"} and mark >= close_floor:
@@ -2970,6 +2981,7 @@ class NeutralisMonitor:
                 "openLotCount": len(open_hedge_lots(hedge_lots)),
                 "lotMinHoldSeconds": self.lot_min_hold_seconds(),
                 "lotExitMode": self.lot_exit_mode(),
+                "emergencyExitPercent": lot_emergency_exit_rise(step) * Decimal("100"),
                 "recoveryActive": recovery_active,
                 "recoveryHigh": recovery_high,
                 "recoveryReleasedSize": recovery_released_size,
@@ -3164,7 +3176,12 @@ class NeutralisMonitor:
                     minimum_hold = self.lot_min_hold_seconds()
                     hold_elapsed = lot_minimum_hold_elapsed(newest_lot, minimum_hold)
                     close_reason = lot_close_reason(
-                        previous_hyp_mark, hyp_now.mark, lot_entry, hold_elapsed, self.lot_exit_mode()
+                        previous_hyp_mark,
+                        hyp_now.mark,
+                        lot_entry,
+                        hold_elapsed,
+                        self.lot_exit_mode(),
+                        lot_emergency_exit_rise(step),
                     )
                     lot_id = str(newest_lot.get("id", ""))
                     if close_reason:
@@ -3192,7 +3209,7 @@ class NeutralisMonitor:
                         if released_size > 0:
                             event_name = "lot-emergency" if close_reason == "emergency" else "lot-timer" if close_reason == "timer" else "lot-recovery"
                             event_message = (
-                                f"SAÍDA EMERGENCIAL +0,40% · reduzir short {released_size} {position_now['hedgeSymbol']}"
+                                f"SAÍDA EMERGENCIAL +{lot_emergency_exit_rise(step) * Decimal('100'):.3f}% · reduzir short {released_size} {position_now['hedgeSymbol']}"
                                 if close_reason == "emergency"
                                 else f"PRAZO CONCLUÍDO · reduzir short {released_size} {position_now['hedgeSymbol']}"
                                 if close_reason == "timer"
@@ -3452,6 +3469,7 @@ class NeutralisMonitor:
                     "openLotCount": len(open_hedge_lots(hedge_lots)),
                     "lotMinHoldSeconds": self.lot_min_hold_seconds(),
                     "lotExitMode": self.lot_exit_mode(),
+                    "emergencyExitPercent": lot_emergency_exit_rise(step) * Decimal("100"),
                     "recoveryActive": recovery_active,
                     "recoveryHigh": recovery_high,
                     "recoveryReleasedSize": recovery_released_size,
