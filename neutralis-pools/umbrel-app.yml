@@ -4,7 +4,7 @@ name: Neutralis Pools
 tagline: Evolução diária, liquidez e taxas das suas LPs
 icon: https://raw.githubusercontent.com/RHstuff01/neutralis-pools/main/neutralis-pools/icon.svg
 category: finance
-version: "1.1.3"
+version: "1.1.4"
 port: 8788
 description: >-
   Acompanha posições de liquidez diariamente, consolida liquidez, taxas, PnL e APR,
@@ -16,7 +16,7 @@ submission: https://github.com/RHstuff01/neutralis-pools
 repo: https://github.com/RHstuff01/neutralis-pools
 support: https://github.com/RHstuff01/neutralis-pools/issues
 gallery: []
-releaseNotes: Corrige as taxas da Orca calculando o crescimento pendente da posição e importa a liquidez e as taxas atuais no primeiro registro.
+releaseNotes: Corrige todos os gráficos para incluir a leitura atual e identifica as taxas coletadas antes de 24 horas como período parcial.
 dependencies: []
 path: ""
 defaultUsername: ""
