@@ -4,7 +4,7 @@ name: BTC Sinais Semanais
 tagline: Preço, EMA50 e alertas por rede
 icon: https://raw.githubusercontent.com/RHstuff01/neutralis-umbrel/main/neutralis-btc-alerta/icon.png
 category: finance
-version: "0.1.0"
+version: "0.1.1"
 port: 8080
 description: >-
   Monitora o BTC/USD e a EMA50 semanal. Alerta sobre venda de 70% das quantidades

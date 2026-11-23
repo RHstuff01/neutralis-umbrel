@@ -33,6 +33,6 @@ jobs:
           file: neutralis-btc-alerta/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ghcr.io/rhstuff01/neutralis-btc-alerta:0.1.0
+          tags: ghcr.io/rhstuff01/neutralis-btc-alerta:0.1.1
           provenance: mode=max
           sbom: true
