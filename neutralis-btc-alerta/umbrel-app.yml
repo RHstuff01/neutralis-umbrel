@@ -4,7 +4,7 @@ name: Sinais Semanais BTC ETH SOL
 tagline: EMA50 e alertas para BTC, ETH e SOL
 icon: https://raw.githubusercontent.com/RHstuff01/neutralis-umbrel/main/neutralis-btc-alerta/icon.png
 category: finance
-version: "0.2.0"
+version: "0.2.1"
 port: 8080
 description: >-
   Monitora BTC/USD, ETH/USD e SOL/USD e suas EMA50 semanais. Alerta sobre venda de 70% das quantidades

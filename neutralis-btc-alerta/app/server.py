@@ -79,11 +79,13 @@ def telegram(message):
 
 def refresh_symbol(symbol):
     try:
-        new_rows, price, quote_time = fetch_market(symbol, full_history=len(daily[symbol]) < 3000)
+        history_file = DATA / f'history-{symbol.lower()}.json'
+        needs_history = len(daily[symbol]) < 3000 and not history_file.exists()
+        new_rows, price, quote_time = fetch_market(symbol, full_history=needs_history)
         with lock:
             daily[symbol].update(new_rows)
             if new_rows:
-                (DATA / f'history-{symbol.lower()}.json').write_text(json.dumps(daily[symbol]))
+                history_file.write_text(json.dumps(daily[symbol]))
             snap = market_snapshot(daily[symbol], price, quote_time,
                                    state['top_overrides'].get(symbol), symbol)
             latest[symbol] = snap
