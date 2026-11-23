@@ -12,6 +12,7 @@ from pathlib import Path
 from engine import read_seed, fetch_market, market_snapshot, event_scan, sale_lines
 
 SYMBOLS = ('BTC', 'ETH', 'SOL')
+TABS = ('TOTAL',) + SYMBOLS
 DATA = Path(os.environ.get('APP_DATA_DIR', '/data'))
 DATA.mkdir(parents=True, exist_ok=True)
 STATE_FILE = DATA / 'state.json'
@@ -131,7 +132,45 @@ def chart_svg(weeks, symbol):
     return f'<svg viewBox="0 0 {w} {h}" role="img" aria-label="Preço semanal {symbol} em laranja e EMA50 em azul">{guides}<polyline points="{ema}" fill="none" stroke="#75baff" stroke-width="3"/><polyline points="{price}" fill="none" stroke="#f6b65d" stroke-width="3"/></svg>'
 
 
+def total_page():
+    with lock:
+        saved = json.loads(json.dumps(state))
+        snapshots = json.loads(json.dumps(latest))
+        current_errors = dict(errors)
+    esc = html.escape
+    totals = {}
+    rows = []
+    missing = []
+    for symbol in SYMBOLS:
+        positions = [p for p in saved['locations'] if p['symbol'] == symbol]
+        known = sum(p['quantity'] for p in positions if p['quantity'] is not None)
+        absent = sum(p['quantity'] is None for p in positions)
+        snap = snapshots.get(symbol)
+        fresh = snap is not None and current_errors[symbol] is None
+        price = snap['price'] if fresh else None
+        value = known * price if price is not None else None
+        totals[symbol] = {'quantity': known, 'value': value, 'missing': absent}
+        if absent:
+            missing.append(f'{symbol}: {absent} posição(ões) sem quantidade')
+        if price is None:
+            missing.append(f'{symbol}: cotação indisponível')
+        ema = snap['week']['ema'] if fresh else None
+        gap = ((price / ema - 1) * 100) if ema else None
+        status = ('Acima' if snap['week']['above'] else 'Abaixo') if fresh else '—'
+        rows.append(f'''<tr><td><a href="/?asset={symbol}">{symbol}</a></td><td>{known:.8f}</td><td>{'—' if price is None else f'US$ {price:,.2f}'}</td><td>{'—' if value is None else f'US$ {value:,.2f}'}</td><td>{'—' if gap is None else f'{gap:+.2f}%'}</td><td>{status}</td><td>{known*.7:.8f}</td><td>{'—' if value is None else f'US$ {value*.7:,.2f}'}</td></tr>''')
+    portfolio_usd = sum(x['value'] for x in totals.values() if x['value'] is not None)
+    portfolio_70 = portfolio_usd * .7
+    nav = ''.join(f'<a class="tab {"active" if x == "TOTAL" else ""}" href="/?asset={x}">{"Total" if x == "TOTAL" else x}</a>' for x in TABS)
+    alerts = [a for a in saved['alerts'] if a.get('symbol') in SYMBOLS]
+    alert_html = ''.join(f'''<div class="alert"><strong>{esc(a.get('symbol',''))}: {esc(a['title'])}</strong><span>{esc(a.get('time','')[:16])} UTC</span></div>''' for a in alerts[:5]) or '<p>Nenhum alerta novo desde a instalação.</p>'
+    notes = '<br>'.join(esc(x) for x in missing) if missing else 'Todas as posições cadastradas têm quantidade e cotação.'
+    completeness = 'Total parcial' if missing else 'Total completo'
+    return f'''<!doctype html><html lang="pt-BR"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Total · Sinais semanais</title><style>:root{{color-scheme:dark;font-family:system-ui,sans-serif;background:#0a1220;color:#e8eef7}}body{{max-width:1100px;margin:0 auto;padding:30px 20px}}h1{{font-size:2rem;margin-bottom:4px}}p,small,span{{color:#aab9ce}}.tabs{{display:flex;gap:8px;margin:22px 0}}.tab{{padding:10px 20px;border-radius:9px;background:#18283e;color:#c6d8eb;text-decoration:none}}.tab.active{{background:#70aff4;color:#081321;font-weight:700}}.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin:24px 0}}.card,.panel,.alert{{background:#121f31;border:1px solid #27354c;border-radius:16px;padding:20px}}.card strong{{display:block;font-size:1.7rem;margin:8px 0}}.panel{{margin:20px 0}}.table-wrap{{overflow-x:auto}}table{{width:100%;border-collapse:collapse;min-width:900px}}td,th{{padding:12px;border-bottom:1px solid #27354c;text-align:left}}a{{color:#70aff4}}.notice{{color:#f4be70}}.alert{{margin:8px 0}}.alert strong{{display:block;margin-bottom:5px}}</style><body><header><h1>Resumo total</h1><p>BTC, ETH e SOL · quantidades cadastradas manualmente</p><nav class="tabs">{nav}</nav></header><section class="cards"><div class="card"><small>Patrimônio informado</small><strong>US$ {portfolio_usd:,.2f}</strong><span>Estimativa com as cotações disponíveis</span></div><div class="card"><small>70% do patrimônio informado</small><strong>US$ {portfolio_70:,.2f}</strong><span>Referência para os alertas de venda</span></div><div class="card"><small>Ativos acompanhados</small><strong>3</strong><span>BTC · ETH · SOL</span></div></section><section class="panel"><h2>Resumo por ativo</h2><div class="table-wrap"><table><thead><tr><th>Ativo</th><th>Quantidade</th><th>Preço</th><th>Valor em USD</th><th>Distância EMA50</th><th>Semana</th><th>70% em unidades</th><th>70% em USD</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div><p class="notice">{completeness}: {notes}</p><p>Valores estimados pela Bitstamp. BTC, ETH e SOL não são somados em unidades; o total do patrimônio usa USD.</p></section><section class="panel"><h2>Alertas recentes</h2>{alert_html}</section><footer><p>Para editar quantidades e ver o gráfico, abra a aba de cada ativo. O app não movimenta fundos.</p></footer></body></html>'''
+
+
 def page(symbol='BTC'):
+    if symbol == 'TOTAL':
+        return total_page()
     with lock:
         saved = json.loads(json.dumps(state))
         snap = json.loads(json.dumps(latest.get(symbol))) if symbol in latest else None
@@ -156,7 +195,7 @@ def page(symbol='BTC'):
     selected_alerts = [a for a in saved['alerts'] if a.get('symbol', 'BTC') in (symbol, 'ALL')]
     alert_html = ''.join(f'''<article class="alert"><small>{esc(a.get('time','')[:16])} UTC</small><strong>{esc(a['title'])}</strong><p>{esc(a.get('detail',''))}</p>{''.join(f"<div>{esc(x['network'])}: {x['sell_70']:.8f} {esc(x['asset'])}</div>" for x in a.get('lines',[]))}</article>''' for a in selected_alerts[:20]) or '<p>Nenhum alerta novo desde a instalação.</p>'
     config_rows = ''.join(f'''<div class="position"><input name="network_{i}" value="{esc(p['network'], quote=True)}" aria-label="Rede {i+1}"><input name="asset_{i}" value="{esc(p['asset'], quote=True)}" aria-label="Ativo {i+1}"><input name="quantity_{i}" value="{'' if p['quantity'] is None else p['quantity']}" type="number" min="0" step="any" placeholder="{symbol}" aria-label="Quantidade {i+1}"></div>''' for i,p in enumerate(positions))
-    tabs = ''.join(f'<a class="tab {"active" if x == symbol else ""}" href="/?asset={x}">{x}</a>' for x in SYMBOLS)
+    tabs = ''.join(f'<a class="tab {"active" if x == symbol else ""}" href="/?asset={x}">{"Total" if x == "TOTAL" else x}</a>' for x in TABS)
     default_top = {'BTC': 69000, 'ETH': 4868.79, 'SOL': 260}[symbol]
     top_text = f'US$ {top:,.2f}' if top is not None else f'US$ {default_top:,.2f} (inicial)'
     top_override = saved['top_overrides'].get(symbol) or ''
@@ -173,8 +212,8 @@ class Handler(BaseHTTPRequestHandler):
         query = urllib.parse.urlparse(self.path)
         if query.path != '/':
             self.send_error(404); return
-        symbol = urllib.parse.parse_qs(query.query).get('asset', ['BTC'])[0].upper()
-        if symbol not in SYMBOLS:
+        symbol = urllib.parse.parse_qs(query.query).get('asset', ['TOTAL'])[0].upper()
+        if symbol not in TABS:
             self.send_error(400); return
         body = page(symbol).encode()
         self.send_response(200); self.send_header('Content-Type', 'text/html; charset=utf-8')
