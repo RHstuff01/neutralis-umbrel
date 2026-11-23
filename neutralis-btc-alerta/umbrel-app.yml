@@ -1,0 +1,24 @@
+manifestVersion: 1
+id: neutralis-btc-alerta
+name: BTC Sinais Semanais
+tagline: Preço, EMA50 e alertas por rede
+icon: https://raw.githubusercontent.com/RHstuff01/neutralis-umbrel/main/neutralis-btc-alerta/icon.png
+category: finance
+version: "0.1.0"
+port: 8080
+description: >-
+  Monitora o BTC/USD e a EMA50 semanal. Alerta sobre venda de 70% das quantidades
+  de BTC cadastradas manualmente por rede e sobre recompra na região do ciclo
+  anterior ou após recuperação da EMA50. Telegram opcional.
+developer: Neutralis
+website: https://github.com/RHstuff01/neutralis-umbrel
+submitter: Neutralis
+submission: https://github.com/RHstuff01/neutralis-umbrel
+repo: https://github.com/RHstuff01/neutralis-umbrel
+support: https://github.com/RHstuff01/neutralis-umbrel/issues
+gallery: []
+releaseNotes: Primeira versão com gráfico, EMA50, posições manuais por rede e alertas.
+dependencies: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
