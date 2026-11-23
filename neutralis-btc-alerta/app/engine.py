@@ -16,7 +16,9 @@ def request_json(url, timeout=15):
         return json.load(response)
 
 
-def read_seed():
+def read_seed(symbol='BTC'):
+    if symbol != 'BTC':
+        return {}
     if not SEED.exists():
         return {}
     with SEED.open(newline='') as f:
@@ -25,13 +27,15 @@ def read_seed():
                 'close': float(r['close'])} for r in csv.DictReader(f)}
 
 
-def fetch_market(full_history=False):
+def fetch_market(symbol='BTC', full_history=False):
+    market = {'BTC': 'btcusd', 'ETH': 'ethusd', 'SOL': 'solusd'}[symbol]
     today = dt.datetime.now(dt.timezone.utc).date()
     # Fetch completed daily candles only. The ticker is used for intraday region alerts.
     rows = {}
     end = None
-    while True:
-        url = f'{BITSTAMP}/ohlc/btcusd/?step=86400&limit=1000&exclude_current_candle=true'
+    previous_oldest = None
+    for _ in range(12):
+        url = f'{BITSTAMP}/ohlc/{market}/?step=86400&limit=1000&exclude_current_candle=true'
         if end:
             url += f'&end={end}'
         payload = request_json(url)
@@ -44,10 +48,13 @@ def fetch_market(full_history=False):
                 rows[day.isoformat()] = {'date': day.isoformat(), **{
                     k: float(r[k]) for k in ('open', 'high', 'low', 'close')}}
         oldest = min(int(r['timestamp']) for r in candles)
+        if previous_oldest is not None and oldest >= previous_oldest:
+            raise ValueError('Paginação de histórico não avançou')
         if not full_history or oldest <= int(dt.datetime(2011, 8, 18, tzinfo=dt.timezone.utc).timestamp()):
             break
+        previous_oldest = oldest
         end = oldest - 1
-    ticker = request_json(f'{BITSTAMP}/ticker/btcusd/')
+    ticker = request_json(f'{BITSTAMP}/ticker/{market}/')
     ticker_time = dt.datetime.fromtimestamp(int(ticker['timestamp']), dt.timezone.utc)
     if (dt.datetime.now(dt.timezone.utc) - ticker_time).total_seconds() > 900:
         raise ValueError('Cotação da Bitstamp está atrasada mais de 15 minutos')
@@ -71,15 +78,19 @@ def weekly_ema(daily, period=50):
     return result
 
 
-def previous_cycle_top(daily):
+def previous_cycle_top(daily, symbol='BTC'):
     # Use the 2020-2021 bull peak, excluding the pre-halving 2024 rally.
+    if symbol == 'SOL':
+        # Bitstamp's SOL/USD history does not cover the full 2021 bull peak.
+        return 260.0
     vals = [r['high'] for d, r in daily.items() if '2020-05-11' <= d < '2023-01-01']
-    return max(vals) if vals else 69000.0
+    fallback = {'BTC': 69000.0, 'ETH': 4868.79, 'SOL': 260.0}[symbol]
+    return max(vals) if vals else fallback
 
 
-def market_snapshot(daily, price, quote_time, top_override=None):
+def market_snapshot(daily, price, quote_time, top_override=None, symbol='BTC'):
     weeks = weekly_ema(daily)
-    top = float(top_override) if top_override else previous_cycle_top(daily)
+    top = float(top_override) if top_override else previous_cycle_top(daily, symbol)
     return {'price': price, 'quote_time': quote_time, 'week': weeks[-1],
             'prev_week': weeks[-2], 'previous_top': top,
             'zone_low': top * .80, 'zone_high': top * .95,
@@ -113,7 +124,7 @@ def event_scan(snapshot, memory):
     return events
 
 
-def sale_lines(locations):
+def sale_lines(locations, symbol='BTC'):
     return [{'network': p['network'], 'asset': p['asset'],
              'quantity': p['quantity'], 'sell_70': round(p['quantity'] * .7, 8)}
-            for p in locations if p.get('quantity') is not None]
+            for p in locations if p.get('symbol', 'BTC') == symbol and p.get('quantity') is not None]
